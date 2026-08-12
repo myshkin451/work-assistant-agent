@@ -1,0 +1,57 @@
+name: work-assistant-agent
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: work_assistant
+      POSTGRES_USER: work_assistant
+      POSTGRES_PASSWORD: work_assistant
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U work_assistant -d work_assistant"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - work-assistant-postgres:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgresql+psycopg://work_assistant:work_assistant@postgres:5432/work_assistant
+      CHECKPOINT_DATABASE_URL: postgresql://work_assistant:work_assistant@postgres:5432/work_assistant
+      MODEL_MODE: ${MODEL_MODE:-fake}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL:-https://api.deepseek.com}
+      DEEPSEEK_MODEL: ${DEEPSEEK_MODEL:-deepseek-v4-flash}
+      ALLOWED_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+      FAKE_STEP_DELAY_SECONDS: ${FAKE_STEP_DELAY_SECONDS:-0.02}
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  frontend:
+    build:
+      context: ./frontend
+      target: development
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  work-assistant-postgres:
