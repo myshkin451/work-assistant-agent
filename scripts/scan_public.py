@@ -10,21 +10,6 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TEXT_SUFFIXES = {
-    "",
-    ".css",
-    ".html",
-    ".js",
-    ".json",
-    ".md",
-    ".mjs",
-    ".py",
-    ".toml",
-    ".ts",
-    ".tsx",
-    ".yaml",
-    ".yml",
-}
 PATTERNS = {
     "api_key_shape": re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
     "private_key": re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"),
@@ -51,7 +36,7 @@ def candidate_files() -> list[Path]:
     files: list[Path] = []
     for relative in result.stdout.splitlines():
         path = ROOT / relative
-        if path.is_file() and path.suffix.lower() in TEXT_SUFFIXES:
+        if path.is_file():
             files.append(path)
     return files
 

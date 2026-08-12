@@ -10,6 +10,8 @@ the current time in a named timezone, the model selects a read-only time Tool,
 the UI streams product events and sources, and PostgreSQL preserves the result
 for refresh and replay.
 
+![Completed time Tool run](output/playwright/t003-normal-flow.png)
+
 ## Stack
 
 - React, TypeScript, and Vite
@@ -70,5 +72,9 @@ python3 scripts/postgres_concurrency_smoke.py
 This repository contains no company adapters or private deployment material.
 Downstream private integrations may depend on a released public version. This
 repository never depends on those private integrations.
+
+Third-party packages remain under their own licenses. The lockfile-based
+inventory and distribution notes are recorded in
+[`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md).
 
 Licensed under the MIT License.
