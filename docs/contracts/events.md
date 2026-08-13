@@ -1,4 +1,4 @@
-# Product API and event contract v0.1
+# Product API and event contract v0.2
 
 The frontend uses the product contract below. It does not consume raw model,
 LangChain, LangGraph, or provider events.
@@ -45,11 +45,44 @@ type RunView = {
   completed_at: string | null;
 };
 
+type ProductEventType =
+  | "run.started"
+  | "tool.started"
+  | "tool.finished"
+  | "message.delta"
+  | "source.added"
+  | "message.completed"
+  | "run.completed"
+  | "run.failed"
+  | "run.cancelled";
+
+type ProductEvent = {
+  event_id: string;
+  run_id: string;
+  thread_id: string;
+  seq: number;
+  type: ProductEventType;
+  occurred_at: string;
+  data: Record<string, unknown>;
+};
+
+type RunSnapshot = RunView & {
+  events: ProductEvent[];
+};
+
 type ThreadSnapshot = ThreadSummary & {
   messages: Message[];
+  runs: RunSnapshot[];
   active_run: RunView | null;
 };
 ```
+
+`runs` is ordered by creation time. Each entry includes all persisted product
+events for that Run in ascending `seq` order, including its terminal event.
+Clients rebuild historical Tool, source, message, failure, and cancellation
+state from this snapshot without starting Runtime work. An active Run is first
+rebuilt from its snapshot events and then streamed from its last accepted
+`seq`.
 
 Request and response bodies:
 
@@ -77,7 +110,7 @@ Every data event is a JSON object with:
   "seq": 1,
   "type": "run.started",
   "occurred_at": "2026-08-12T12:00:00Z",
-  "data": {}
+  "data": { "status": "running" }
 }
 ```
 
@@ -110,8 +143,44 @@ Initial public event data:
 - `message.delta`: `{ "delta": string }`
 - `source.added`: `{ "source_id", "label", "description" }`
 - `message.completed`: `{ "message": Message }`
-- terminal Run events: `{ "status", "error_code"? }`
+- `run.completed`: `{ "status": "completed" }`
+- `run.failed`: `{ "status": "failed", "error_code": RunFailureCode }`
+- `run.cancelled`: `{ "status": "cancelled" }`
+
+The only public failure codes in v0.2 are:
+
+- `run_timeout`
+- `agent_execution_failed`
+- `service_restarted`
+
+`stream_unavailable` is a client connection state, not a Run failure code or
+terminal event. A failed Run remains immutable; retry creates a new Run with a
+new idempotency key.
+
+For upgrade compatibility only, a stored v0.1 `agent_result_missing` failure is
+normalized to `agent_execution_failed` while reading. New writes still reject
+that legacy code.
+
+All event types and payloads are validated by the Host before sequence
+allocation and again when read into the public response model. Unknown types,
+extra payload fields, malformed values, and Runtime-private events are rejected.
+The Runtime adapter may emit only `tool.started`, `tool.finished`,
+`message.delta`, and `source.added`. Run lifecycle and `message.completed`
+events are Host-owned and committed with product state.
 
 The public payload contains user-facing Tool purpose, bounded result summaries,
 source references, text deltas, and errors. It never contains model reasoning,
 credentials, raw provider events, hidden prompts, or internal checkpoint state.
+
+## Conversation and restart boundaries
+
+Every new Run receives prior product-committed messages from completed Runs in
+the same Thread plus its current user message. Runtime checkpoints are scoped to
+the product `run_id`; cancelled, failed, or crashed partial Runtime state is not
+used as conversation history by a later Run.
+
+On process startup, the current single-executor deployment closes persisted
+`created` or `running` Runs as `failed / service_restarted` before accepting
+traffic. This releases the Thread for an explicit new Run retry. It is not a
+multi-replica ownership protocol; deployments with concurrent executors require
+an ownership lease before using this startup sweep.

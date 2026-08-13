@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -17,10 +18,12 @@ import {
   streamRunEvents,
 } from './api';
 import {
+  isRunFailureCode,
   isTerminalStatus,
   type Message,
   type ProductEvent,
   type RunProjection,
+  type RunSnapshot,
   type RunStatus,
   type RunView,
   type SourceReference,
@@ -57,9 +60,11 @@ const createProjection = (run: RunView): RunProjection => ({
   tools: [],
   sources: [],
   lastSeq: 0,
-  connection: 'connecting',
+  connection: isTerminalStatus(run.status) ? 'closed' : 'connecting',
   cancelling: false,
 });
+
+type ProjectionMap = Record<string, RunProjection>;
 
 function upsertTool(tools: ToolProgress[], tool: ToolProgress) {
   const index = tools.findIndex((item) => item.tool_call_id === tool.tool_call_id);
@@ -156,15 +161,46 @@ function applyEvent(projection: RunProjection, event: ProductEvent): RunProjecti
 
   const terminalStatus = statusFromTerminalEvent(event.type);
   if (terminalStatus) {
+    const errorCode = event.data.error_code;
     return {
       ...next,
       connection: 'closed',
       cancelling: false,
-      errorCode: getString(event.data, 'error_code'),
+      ...(isRunFailureCode(errorCode) ? { failureCode: errorCode } : {}),
       run: { ...next.run, status: terminalStatus },
     };
   }
   return next;
+}
+
+function projectionFromSnapshot(run: RunSnapshot): RunProjection {
+  const { events, ...view } = run;
+  const projected = events.reduce(applyEvent, createProjection(view));
+  return {
+    ...projected,
+    run: { ...projected.run, ...view },
+    lastSeq: run.last_seq,
+    connection: isTerminalStatus(run.status) ? 'closed' : 'connecting',
+  };
+}
+
+function projectionsFromSnapshot(snapshot: ThreadSnapshot): ProjectionMap {
+  const projections = Object.fromEntries(
+    snapshot.runs.map((run) => [run.run_id, projectionFromSnapshot(run)]),
+  ) as ProjectionMap;
+
+  if (snapshot.active_run && !projections[snapshot.active_run.run_id]) {
+    projections[snapshot.active_run.run_id] = createProjection(snapshot.active_run);
+  }
+
+  for (const message of snapshot.messages) {
+    if (message.role !== 'assistant' || !message.run_id) continue;
+    const projection = projections[message.run_id];
+    if (projection && !projection.assistantText) {
+      projections[message.run_id] = { ...projection, assistantText: message.content };
+    }
+  }
+  return projections;
 }
 
 function titleFromMessage(message: string) {
@@ -184,7 +220,9 @@ function optimisticMessage(content: string, idempotencyKey: string): Message {
 
 function mergeOptimisticMessage(snapshot: ThreadSnapshot, pending: Message) {
   const persisted = snapshot.messages.some(
-    (message) => message.role === 'user' && message.content === pending.content,
+    (message) =>
+      message.role === 'user' &&
+      (pending.run_id ? message.run_id === pending.run_id : message.content === pending.content),
   );
   return persisted ? snapshot : { ...snapshot, messages: [...snapshot.messages, pending] };
 }
@@ -197,9 +235,10 @@ function displayError(error: unknown) {
 export function App() {
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [snapshot, setSnapshot] = useState<ThreadSnapshot | null>(null);
-  const [projection, setProjection] = useState<RunProjection | null>(null);
+  const [projectionsByRunId, setProjectionsByRunId] = useState<ProjectionMap>({});
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const selectedThreadRef = useRef<string | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
@@ -214,70 +253,107 @@ export function App() {
 
   const refreshSnapshot = useCallback(async (threadId: string) => {
     const fresh = await getThread(threadId);
-    if (selectedThreadRef.current === threadId) setSnapshot(fresh);
+    if (selectedThreadRef.current === threadId) {
+      setSnapshot(fresh);
+      setProjectionsByRunId(projectionsFromSnapshot(fresh));
+    }
     return fresh;
   }, []);
 
   const connectRun = useCallback(
-    (run: RunView, initialAfterSeq = 0) => {
+    (run: RunView, initialProjection: RunProjection = createProjection(run)) => {
+      if (isTerminalStatus(run.status)) return;
       streamAbortRef.current?.abort();
       const controller = new AbortController();
       streamAbortRef.current = controller;
-      setProjection(createProjection(run));
+      const startingProjection = {
+        ...initialProjection,
+        run: { ...run, ...initialProjection.run },
+        connection: 'connecting' as const,
+      };
+      setProjectionsByRunId((current) => ({
+        ...current,
+        [run.run_id]: startingProjection,
+      }));
 
-      void streamRunEvents(
-        run.run_id,
-        initialAfterSeq,
-        {
-          onConnectionChange: (connection) => {
-            setProjection((current) =>
-              current?.run.run_id === run.run_id ? { ...current, connection } : current,
-            );
-          },
-          onEvent: (event) => {
-            setProjection((current) =>
-              current?.run.run_id === run.run_id ? applyEvent(current, event) : current,
-            );
-            if (event.type === 'message.completed') {
-              const message = event.data.message;
-              if (typeof message === 'object' && message !== null) {
-                const completedMessage = message as Message;
-                if (
-                  typeof completedMessage.message_id === 'string' &&
-                  typeof completedMessage.content === 'string' &&
-                  completedMessage.role === 'assistant'
-                ) {
-                  setSnapshot((current) => {
-                    if (!current || current.thread_id !== event.thread_id) return current;
-                    const messages = current.messages.some(
-                      (item) => item.message_id === completedMessage.message_id,
-                    )
-                      ? current.messages.map((item) =>
-                          item.message_id === completedMessage.message_id ? completedMessage : item,
+      const isCurrentStream = () =>
+        !controller.signal.aborted &&
+        streamAbortRef.current === controller &&
+        selectedThreadRef.current === run.thread_id;
+
+      void (async () => {
+        try {
+          await streamRunEvents(
+            run.run_id,
+            startingProjection.lastSeq,
+            {
+              onConnectionChange: (connection) => {
+                if (!isCurrentStream()) return;
+                setProjectionsByRunId((current) => {
+                  const projection = current[run.run_id];
+                  return projection
+                    ? { ...current, [run.run_id]: { ...projection, connection } }
+                    : current;
+                });
+              },
+              onEvent: (event) => {
+                if (!isCurrentStream()) return;
+                setProjectionsByRunId((current) => {
+                  const projection = current[run.run_id];
+                  return projection
+                    ? { ...current, [run.run_id]: applyEvent(projection, event) }
+                    : current;
+                });
+                if (event.type === 'message.completed') {
+                  const message = event.data.message;
+                  if (typeof message === 'object' && message !== null) {
+                    const completedMessage = message as Message;
+                    if (
+                      typeof completedMessage.message_id === 'string' &&
+                      typeof completedMessage.content === 'string' &&
+                      completedMessage.role === 'assistant'
+                    ) {
+                      setSnapshot((current) => {
+                        if (!current || current.thread_id !== event.thread_id) return current;
+                        const messages = current.messages.some(
+                          (item) => item.message_id === completedMessage.message_id,
                         )
-                      : [...current.messages, completedMessage];
-                    return { ...current, messages };
-                  });
+                          ? current.messages.map((item) =>
+                              item.message_id === completedMessage.message_id
+                                ? completedMessage
+                                : item,
+                            )
+                          : [...current.messages, completedMessage];
+                        return { ...current, messages };
+                      });
+                    }
+                  }
                 }
-              }
-            }
-          },
-        },
-        controller.signal,
-      )
-        .then(async () => {
-          if (controller.signal.aborted) return;
-          await Promise.all([refreshSnapshot(run.thread_id), refreshThreads()]);
-        })
-        .catch((streamError: unknown) => {
-          if (controller.signal.aborted) return;
-          setError(displayError(streamError));
-          setProjection((current) =>
-            current?.run.run_id === run.run_id
-              ? { ...current, connection: 'closed', errorCode: 'stream_unavailable' }
-              : current,
+              },
+            },
+            controller.signal,
           );
-        });
+        } catch {
+          if (!isCurrentStream()) return;
+          setProjectionsByRunId((current) => {
+            const projection = current[run.run_id];
+            return projection
+              ? { ...current, [run.run_id]: { ...projection, connection: 'unavailable' } }
+              : current;
+          });
+          return;
+        }
+
+        if (!isCurrentStream()) return;
+        try {
+          await Promise.all([refreshSnapshot(run.thread_id), refreshThreads()]);
+          if (isCurrentStream()) setError(null);
+        } catch {
+          // A persisted terminal event is already authoritative. A background
+          // snapshot/list refresh may fail during the same short outage and
+          // must not leave a stale global service alert after recovery.
+        }
+      })();
     },
     [refreshSnapshot, refreshThreads],
   );
@@ -288,13 +364,19 @@ export function App() {
       selectedThreadRef.current = threadId;
       setLoading(true);
       setError(null);
-      setProjection(null);
+      setSnapshot(null);
+      setProjectionsByRunId({});
       try {
         const fresh = await getThread(threadId);
         if (selectedThreadRef.current !== threadId) return;
+        const projections = projectionsFromSnapshot(fresh);
         setSnapshot(fresh);
+        setProjectionsByRunId(projections);
         if (fresh.active_run && !isTerminalStatus(fresh.active_run.status)) {
-          connectRun(fresh.active_run, 0);
+          connectRun(
+            fresh.active_run,
+            projections[fresh.active_run.run_id] ?? createProjection(fresh.active_run),
+          );
         }
       } catch (openError) {
         if (selectedThreadRef.current === threadId) setError(displayError(openError));
@@ -327,7 +409,12 @@ export function App() {
 
   useEffect(() => {
     conversationEndRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' });
-  }, [projection?.assistantText, projection?.tools.length, snapshot?.messages.length]);
+  }, [
+    projectionsByRunId,
+    snapshot?.active_run?.run_id,
+    snapshot?.messages.length,
+    snapshot?.thread_id,
+  ]);
 
   const startNewThread = useCallback(async () => {
     if (submittingRef.current) return;
@@ -338,7 +425,7 @@ export function App() {
       const created = await createThread();
       selectedThreadRef.current = created.thread_id;
       setSnapshot(created);
-      setProjection(null);
+      setProjectionsByRunId(projectionsFromSnapshot(created));
       await refreshThreads();
     } catch (newThreadError) {
       setError(displayError(newThreadError));
@@ -347,14 +434,31 @@ export function App() {
     }
   }, [refreshThreads]);
 
-  const submitMessage = useCallback(async () => {
-    const message = input.trim();
-    if (!message || submittingRef.current || (projection && !isTerminalStatus(projection.run.status))) {
+  const activeProjection = useMemo(() => {
+    const activeRunId = snapshot?.active_run?.run_id;
+    if (activeRunId) return projectionsByRunId[activeRunId] ?? null;
+    return (
+      Object.values(projectionsByRunId).find(
+        (projection) => !isTerminalStatus(projection.run.status),
+      ) ?? null
+    );
+  }, [projectionsByRunId, snapshot?.active_run?.run_id]);
+
+  const startMessage = useCallback(async (
+    rawMessage: string,
+    restoreComposerOnFailure: boolean,
+  ) => {
+    const message = rawMessage.trim();
+    if (
+      !message ||
+      submittingRef.current ||
+      (activeProjection && !isTerminalStatus(activeProjection.run.status))
+    ) {
       return;
     }
     submittingRef.current = true;
+    setSubmitting(true);
     setError(null);
-    setInput('');
     const idempotencyKey = crypto.randomUUID();
     const pending = optimisticMessage(message, idempotencyKey);
     let target = snapshot;
@@ -364,6 +468,7 @@ export function App() {
         target = await createThread(titleFromMessage(message));
         selectedThreadRef.current = target.thread_id;
         setSnapshot(target);
+        setProjectionsByRunId(projectionsFromSnapshot(target));
       }
       const threadId = target.thread_id;
       setSnapshot((current) =>
@@ -372,18 +477,53 @@ export function App() {
           : current,
       );
       const run = await createRun(threadId, message, idempotencyKey);
+      const persistedPending = { ...pending, run_id: run.run_id };
+      const initialProjection = createProjection(run);
+      if (selectedThreadRef.current === threadId) {
+        setSnapshot((current) => {
+          if (!current || current.thread_id !== threadId) return current;
+          return {
+            ...current,
+            messages: current.messages.map((item) =>
+              item.message_id === pending.message_id ? persistedPending : item,
+            ),
+            runs: current.runs.some((item) => item.run_id === run.run_id)
+              ? current.runs
+              : [...current.runs, { ...run, events: [] }],
+            active_run: run,
+          };
+        });
+        setProjectionsByRunId((current) => ({
+          ...current,
+          [run.run_id]: initialProjection,
+        }));
+      }
+
+      let projectionToConnect = initialProjection;
+      let shouldConnect = !isTerminalStatus(run.status);
       try {
         const fresh = await getThread(threadId);
         if (selectedThreadRef.current === threadId) {
-          setSnapshot(mergeOptimisticMessage(fresh, pending));
+          const merged = mergeOptimisticMessage(fresh, persistedPending);
+          const projections = projectionsFromSnapshot(merged);
+          setSnapshot(merged);
+          setProjectionsByRunId(projections);
+          projectionToConnect = projections[run.run_id] ?? initialProjection;
+          shouldConnect =
+            fresh.active_run?.run_id === run.run_id &&
+            !isTerminalStatus(projectionToConnect.run.status);
         }
       } catch {
         // The optimistic user message remains visible while the event stream proceeds.
       }
-      await refreshThreads();
-      connectRun(run, 0);
+      if (selectedThreadRef.current === threadId && shouldConnect) {
+        connectRun(run, projectionToConnect);
+      }
+      void refreshThreads().catch((refreshError: unknown) => {
+        if (selectedThreadRef.current === threadId) setError(displayError(refreshError));
+      });
     } catch (submitError) {
-      setInput(message);
+      if (restoreComposerOnFailure) setInput(message);
       setSnapshot((current) =>
         current
           ? { ...current, messages: current.messages.filter((item) => item.message_id !== pending.message_id) }
@@ -392,35 +532,88 @@ export function App() {
       setError(displayError(submitError));
     } finally {
       submittingRef.current = false;
+      setSubmitting(false);
     }
-  }, [connectRun, input, projection, refreshThreads, snapshot]);
+  }, [activeProjection, connectRun, refreshThreads, snapshot]);
+
+  const submitMessage = useCallback(async () => {
+    const message = input.trim();
+    if (!message) return;
+    setInput('');
+    await startMessage(message, true);
+  }, [input, startMessage]);
+
+  const retryRun = useCallback(
+    async (runId: string) => {
+      const original = snapshot?.messages.find(
+        (message) => message.role === 'user' && message.run_id === runId,
+      );
+      if (!original) {
+        setError('无法找到这次运行的原始问题。');
+        return;
+      }
+      await startMessage(original.content, false);
+    },
+    [snapshot?.messages, startMessage],
+  );
 
   const stopRun = useCallback(async () => {
-    if (!projection || isTerminalStatus(projection.run.status) || projection.cancelling) return;
-    const runId = projection.run.run_id;
-    setProjection((current) => (current ? { ...current, cancelling: true } : current));
+    if (
+      !activeProjection ||
+      isTerminalStatus(activeProjection.run.status) ||
+      activeProjection.cancelling
+    ) {
+      return;
+    }
+    const runId = activeProjection.run.run_id;
+    const targetThreadId = activeProjection.run.thread_id;
+    const targetController = streamAbortRef.current;
+    setProjectionsByRunId((current) => {
+      const projection = current[runId];
+      return projection
+        ? { ...current, [runId]: { ...projection, cancelling: true } }
+        : current;
+    });
     setError(null);
     try {
       const run = await cancelRun(runId);
-      setProjection((current) =>
-        current?.run.run_id === runId
+      setProjectionsByRunId((current) => {
+        const projection = current[runId];
+        return projection
           ? {
               ...current,
-              run,
-              cancelling: run.status !== 'cancelled',
-              connection: run.status === 'cancelled' ? 'closed' : current.connection,
+              [runId]: {
+                ...projection,
+                run,
+                cancelling: run.status !== 'cancelled',
+                connection: run.status === 'cancelled' ? 'closed' : projection.connection,
+              },
             }
-          : current,
-      );
+          : current;
+      });
       if (run.status === 'cancelled') {
-        streamAbortRef.current?.abort();
-        await Promise.all([refreshSnapshot(run.thread_id), refreshThreads()]);
+        if (
+          selectedThreadRef.current === run.thread_id &&
+          streamAbortRef.current === targetController
+        ) {
+          targetController?.abort();
+          await Promise.all([refreshSnapshot(run.thread_id), refreshThreads()]);
+        } else {
+          await refreshThreads();
+        }
       }
     } catch (cancelError) {
-      setProjection((current) => (current ? { ...current, cancelling: false } : current));
-      setError(displayError(cancelError));
+      setProjectionsByRunId((current) => {
+        const projection = current[runId];
+        return projection
+          ? { ...current, [runId]: { ...projection, cancelling: false } }
+          : current;
+      });
+      if (selectedThreadRef.current === targetThreadId) {
+        setError(displayError(cancelError));
+      }
     }
-  }, [projection, refreshSnapshot, refreshThreads]);
+  }, [activeProjection, refreshSnapshot, refreshThreads]);
 
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault();
@@ -434,8 +627,17 @@ export function App() {
     }
   };
 
-  const active = projection !== null && !isTerminalStatus(projection.run.status);
+  const active = activeProjection !== null && !isTerminalStatus(activeProjection.run.status);
   const displayedMessages = useMemo(() => snapshot?.messages ?? [], [snapshot]);
+  const displayedRunIds = useMemo(
+    () =>
+      new Set(
+        displayedMessages
+          .filter((message) => message.role === 'user' && message.run_id)
+          .map((message) => message.run_id as string),
+      ),
+    [displayedMessages],
+  );
 
   return (
     <div className="app-shell">
@@ -477,37 +679,58 @@ export function App() {
 
         <section className="conversation" aria-live="polite" aria-busy={active}>
           {loading && !snapshot ? <LoadingState /> : null}
-          {!loading && displayedMessages.length === 0 && !projection ? <EmptyState /> : null}
+          {!loading &&
+          displayedMessages.length === 0 &&
+          Object.keys(projectionsByRunId).length === 0 ? (
+            <EmptyState />
+          ) : null}
 
           {displayedMessages.map((message) => {
-            const isProjectedAssistant =
-              message.role === 'assistant' && message.run_id === projection?.run.run_id;
-            if (isProjectedAssistant && projection) {
-              return <AssistantTurn key={message.message_id} projection={projection} />;
+            if (message.role === 'assistant' && message.run_id && projectionsByRunId[message.run_id]) {
+              return null;
+            }
+            if (message.role === 'user' && message.run_id) {
+              const projection = projectionsByRunId[message.run_id];
+              return (
+                <Fragment key={message.message_id}>
+                  <MessageTurn message={message} />
+                  {projection ? (
+                    <AssistantTurn
+                      projection={projection}
+                      retryDisabled={active || submitting}
+                      onRetry={() => void retryRun(projection.run.run_id)}
+                    />
+                  ) : null}
+                </Fragment>
+              );
             }
             return <MessageTurn key={message.message_id} message={message} />;
           })}
 
-          {projection &&
-          !displayedMessages.some(
-            (message) => message.role === 'assistant' && message.run_id === projection.run.run_id,
-          ) ? (
-            <AssistantTurn projection={projection} />
-          ) : null}
+          {Object.values(projectionsByRunId)
+            .filter((projection) => !displayedRunIds.has(projection.run.run_id))
+            .map((projection) => (
+              <AssistantTurn
+                key={projection.run.run_id}
+                projection={projection}
+                retryDisabled={active || submitting}
+                onRetry={() => void retryRun(projection.run.run_id)}
+              />
+            ))}
 
           {error ? (
             <div className="page-error" role="alert">
               {error}
             </div>
           ) : null}
-          <div ref={conversationEndRef} />
+          <div className="conversation-end" ref={conversationEndRef} />
         </section>
 
         <Composer
           value={input}
           active={active}
-          cancelling={projection?.cancelling ?? false}
-          disabled={loading}
+          cancelling={activeProjection?.cancelling ?? false}
+          disabled={loading || submitting}
           onChange={setInput}
           onKeyDown={handleComposerKeyDown}
           onSubmit={handleSubmit}
@@ -602,8 +825,16 @@ function MessageTurn({ message }: { message: Message }) {
   );
 }
 
-function AssistantTurn({ projection }: { projection: RunProjection }) {
-  const { run, tools, sources, assistantText, connection, cancelling, errorCode } = projection;
+function AssistantTurn({
+  projection,
+  retryDisabled,
+  onRetry,
+}: {
+  projection: RunProjection;
+  retryDisabled: boolean;
+  onRetry: () => void;
+}) {
+  const { run, tools, sources, assistantText, connection, cancelling, failureCode } = projection;
   const isWorking = !isTerminalStatus(run.status);
   return (
     <article className="assistant-turn">
@@ -617,10 +848,12 @@ function AssistantTurn({ projection }: { projection: RunProjection }) {
             cancelling={cancelling}
           />
         </div>
-        {tools.length > 0 ? <ToolRun tools={tools} working={isWorking} /> : null}
+        {tools.length > 0 ? (
+          <ToolRun tools={tools} working={isWorking} runStatus={run.status} />
+        ) : null}
         {assistantText ? (
           <div className="answer-text">{assistantText}</div>
-        ) : isWorking ? (
+        ) : isWorking && connection !== 'unavailable' ? (
           <div className="thinking" role="status">
             <span />
             <span />
@@ -628,9 +861,17 @@ function AssistantTurn({ projection }: { projection: RunProjection }) {
             正在处理
           </div>
         ) : null}
-        {run.status === 'failed' || errorCode === 'stream_unavailable' ? (
-          <div className="run-notice error" role="alert">
-            {friendlyRunError(errorCode)}
+        {run.status === 'failed' ? (
+          <div className="run-notice error run-notice-row" role="alert">
+            <span>{friendlyRunError(failureCode)}</span>
+            <button className="retry-button" type="button" onClick={onRetry} disabled={retryDisabled}>
+              重新运行
+            </button>
+          </div>
+        ) : null}
+        {isWorking && connection === 'unavailable' ? (
+          <div className="run-notice connection" role="status">
+            实时连接暂不可用。运行状态未被改为失败；请刷新页面重新连接。
           </div>
         ) : null}
         {run.status === 'cancelled' ? <div className="run-notice">本次运行已停止。</div> : null}
@@ -649,10 +890,10 @@ function AssistantTurn({ projection }: { projection: RunProjection }) {
   );
 }
 
-function friendlyRunError(errorCode?: string) {
-  if (errorCode === 'permission_denied') return '当前身份没有完成此操作的权限。';
-  if (errorCode === 'timeout') return '任务等待时间过长，请稍后重试。';
-  if (errorCode === 'stream_unavailable') return '实时连接已断开，请刷新页面恢复会话。';
+function friendlyRunError(failureCode: RunProjection['failureCode']) {
+  if (failureCode === 'run_timeout') return '本次运行超时，未能完成。';
+  if (failureCode === 'agent_execution_failed') return 'Agent 执行失败，未能完成本次运行。';
+  if (failureCode === 'service_restarted') return '服务已重启，原运行已安全结束。';
   return '本次运行没有完成，请重试。';
 }
 
@@ -666,29 +907,57 @@ function RunStatusLabel({
   cancelling: boolean;
 }) {
   let label = '准备中';
-  if (cancelling) label = '正在停止';
-  else if (connection === 'reconnecting') label = '正在重新连接';
-  else if (status === 'running') label = '运行中';
-  else if (status === 'completed') label = '已完成';
+  if (status === 'completed') label = '已完成';
   else if (status === 'failed') label = '失败';
   else if (status === 'cancelled') label = '已停止';
+  else if (cancelling) label = '正在停止';
+  else if (connection === 'reconnecting') label = '正在重新连接';
+  else if (connection === 'unavailable') label = '连接中断';
+  else if (status === 'running') label = '运行中';
   return <span className={`run-status ${status}`}>{label}</span>;
 }
 
-function ToolRun({ tools, working }: { tools: ToolProgress[]; working: boolean }) {
+function ToolRun({
+  tools,
+  working,
+  runStatus,
+}: {
+  tools: ToolProgress[];
+  working: boolean;
+  runStatus: RunStatus;
+}) {
   const completed = tools.filter((tool) => tool.status === 'completed').length;
+  const stopped = isTerminalStatus(runStatus) ? tools.length - completed : 0;
   return (
     <details className="tool-run" open={working}>
       <summary>
-        <span className={working ? 'status-orb pulsing' : 'status-orb'} />
-        <strong>{working ? '正在调用工具' : `已完成 ${completed} 个工具步骤`}</strong>
+        <span
+          className={
+            working ? 'status-orb pulsing' : stopped > 0 ? 'status-orb stopped' : 'status-orb'
+          }
+        />
+        <strong>
+          {working
+            ? '正在调用工具'
+            : stopped > 0
+              ? `${completed} 个完成，${stopped} 个已停止`
+              : `已完成 ${completed} 个工具步骤`}
+        </strong>
         <span>查看详情</span>
       </summary>
       <div className="tool-list">
         {tools.map((tool) => (
           <div className="tool-step" key={tool.tool_call_id}>
-            <span className={tool.status === 'completed' ? 'tool-check completed' : 'tool-check'}>
-              {tool.status === 'completed' ? '✓' : '·'}
+            <span
+              className={
+                tool.status === 'completed'
+                  ? 'tool-check completed'
+                  : isTerminalStatus(runStatus)
+                    ? 'tool-check stopped'
+                    : 'tool-check'
+              }
+            >
+              {tool.status === 'completed' ? '✓' : isTerminalStatus(runStatus) ? '×' : '·'}
             </span>
             <div>
               <strong>{tool.label}</strong>
@@ -696,7 +965,13 @@ function ToolRun({ tools, working }: { tools: ToolProgress[]; working: boolean }
                 <span>{tool.output_summary || tool.input_summary}</span>
               ) : null}
             </div>
-            <span>{tool.status === 'completed' ? '完成' : '运行中'}</span>
+            <span>
+              {tool.status === 'completed'
+                ? '完成'
+                : isTerminalStatus(runStatus)
+                  ? '已停止'
+                  : '运行中'}
+            </span>
           </div>
         ))}
       </div>

@@ -6,6 +6,8 @@ from typing import Any
 
 from httpx import AsyncClient
 
+from work_assistant.repository import ActiveRunConflictError
+
 
 def parse_sse(body: str) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
@@ -90,7 +92,7 @@ async def test_fake_vertical_persists_contract_and_replays(app_client: tuple[Any
 async def test_idempotency_and_single_active_run_hold_under_concurrency(
     app_client: tuple[Any, Any],
 ) -> None:
-    client, _ = app_client
+    client, app = app_client
     thread_id = await create_thread(client)
     body = {
         "message": "What time is it in Europe/London?",
@@ -111,21 +113,28 @@ async def test_idempotency_and_single_active_run_hold_under_concurrency(
     await client.post(f"/api/runs/{run_ids.pop()}/cancel")
 
     second_thread = await create_thread(client, "Concurrent conflict")
+    # Keep the winning Run in `created` while every contender is admitted. The API
+    # launches successful Runs immediately, so using it here made the assertion
+    # depend on whether the fake Run completed before slower CI requests arrived.
+    # The API's 409 mapping is covered above; this phase isolates the repository's
+    # atomic one-active-Run invariant under genuinely overlapping creation calls.
     contenders = await asyncio.gather(
         *(
-            client.post(
-                f"/api/threads/{second_thread}/runs",
-                json={"message": "Current time in UTC", "idempotency_key": f"key-{index}"},
+            app.state.repository.create_run(
+                thread_id=second_thread,
+                message="Current time in UTC",
+                idempotency_key=f"key-{index}",
             )
             for index in range(10)
-        )
+        ),
+        return_exceptions=True,
     )
-    assert sum(response.status_code == 201 for response in contenders) == 1
-    assert sum(response.status_code == 409 for response in contenders) == 9
-    winner = next(
-        response.json()["run_id"] for response in contenders if response.status_code == 201
-    )
-    await client.post(f"/api/runs/{winner}/cancel")
+    created = [result for result in contenders if isinstance(result, tuple)]
+    conflicts = [result for result in contenders if isinstance(result, ActiveRunConflictError)]
+    assert len(created) == 1
+    assert created[0][1] is True
+    assert len(conflicts) == 9
+    await app.state.repository.cancel_run(created[0][0].run_id)
 
 
 async def test_cancel_is_terminal_and_late_agent_results_are_discarded(
@@ -177,7 +186,11 @@ async def test_cancel_and_event_append_reserve_distinct_sequences(
         repository.append_active_event(
             run.run_id,
             "tool.started",
-            {"tool_call_id": "race-1", "name": "get_current_time"},
+            {
+                "tool_call_id": "race-1",
+                "name": "get_current_time",
+                "label": "Read current time",
+            },
         ),
         repository.cancel_run(run.run_id),
     )
