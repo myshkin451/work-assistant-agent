@@ -36,9 +36,9 @@ Open `http://localhost:5173`. The checked-in default uses deterministic fake
 mode and no model credential. To use DeepSeek, set `MODEL_MODE=deepseek` and
 provide `DEEPSEEK_API_KEY` only in a local ignored secret source.
 
-Compose binds the database, API, and web UI to `127.0.0.1` only. This v0.1 has
-no production authentication and must not be exposed directly to a LAN or the
-public internet.
+Compose binds the database, API, and web UI to `127.0.0.1` only. The current
+v0.2 product contract has no production authentication and must not be exposed
+directly to a LAN or the public internet.
 
 ## Verification
 
@@ -112,6 +112,12 @@ python3 scripts/postgres_concurrency_smoke.py
 The included Compose topology is a single execution instance. On startup it
 closes orphaned active Runs as `service_restarted`; a multi-replica deployment
 must add explicit Run ownership before using that startup sweep.
+
+The next public-core milestone is intentionally split into four independently
+accepted slices: principal and ownership safety, the Agent policy kernel,
+controlled neutral Skill/MCP extension, and one downstream assembly and release
+path. A standalone neutral stdio MCP fixture may prepare later adapter tests, but
+it is not Host integration or Stage 3 acceptance evidence by itself.
 
 ## Public/private boundary
 
