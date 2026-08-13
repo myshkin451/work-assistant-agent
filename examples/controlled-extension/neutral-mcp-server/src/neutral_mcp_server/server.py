@@ -8,9 +8,17 @@ from collections.abc import Sequence
 from typing import Any, Literal, cast
 
 import anyio
-from mcp import types
-from mcp.server.lowlevel import Server
+from mcp.server import Server, ServerRequestContext
 from mcp.server.stdio import stdio_server
+from mcp.types import (
+    CallToolRequestParams,
+    CallToolResult,
+    ListToolsResult,
+    PaginatedRequestParams,
+    TextContent,
+    Tool,
+    ToolAnnotations,
+)
 
 SERVER_NAME = "neutral-mcp-server"
 SERVER_VERSION = "0.1.0"
@@ -60,66 +68,63 @@ ERROR_OUTPUT = {
 LOGGER = logging.getLogger(SERVER_NAME)
 
 
-def _json_text(value: dict[str, Any]) -> types.TextContent:
-    return types.TextContent(
+def _json_text(value: dict[str, Any]) -> TextContent:
+    return TextContent(
         type="text",
         text=json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True),
     )
 
 
-def _success_result(mode: Mode) -> types.CallToolResult:
+def _success_result(mode: Mode) -> CallToolResult:
     payload = "Z" * OVERSIZED_PAYLOAD_BYTES if mode == "oversized" else NORMAL_PAYLOAD
     output = {"record": dict(FIXED_RECORD), "payload": payload}
-    return types.CallToolResult(
+    return CallToolResult(
         content=[_json_text(output)],
-        structuredContent=output,
-        isError=False,
+        structured_content=output,
+        is_error=False,
     )
 
 
-def _error_result() -> types.CallToolResult:
-    return types.CallToolResult(
+def _error_result() -> CallToolResult:
+    return CallToolResult(
         content=[_json_text(ERROR_OUTPUT)],
-        structuredContent=ERROR_OUTPUT,
-        isError=True,
+        structured_content=ERROR_OUTPUT,
+        is_error=True,
     )
 
 
 def create_server(mode: Mode) -> Server:
-    server = Server(
-        SERVER_NAME,
-        version=SERVER_VERSION,
-        instructions=(
-            "A deterministic, read-only local fixture. It exposes one tool backed only by "
-            "constants compiled into this package."
-        ),
-    )
+    async def list_tools(
+        _ctx: ServerRequestContext[Any],
+        _params: PaginatedRequestParams | None,
+    ) -> ListToolsResult:
+        return ListToolsResult(
+            tools=[
+                Tool(
+                    name=TOOL_NAME,
+                    title="Read neutral fixture record",
+                    description="Return one fixed, neutral record without external access.",
+                    input_schema={
+                        "type": "object",
+                        "properties": {},
+                        "additionalProperties": False,
+                    },
+                    output_schema=SUCCESS_OUTPUT_SCHEMA,
+                    annotations=ToolAnnotations(
+                        read_only_hint=True,
+                        destructive_hint=False,
+                        idempotent_hint=True,
+                        open_world_hint=False,
+                    ),
+                )
+            ]
+        )
 
-    @server.list_tools()
-    async def list_tools() -> list[types.Tool]:
-        return [
-            types.Tool(
-                name=TOOL_NAME,
-                title="Read neutral fixture record",
-                description="Return one fixed, neutral record without external access.",
-                inputSchema={
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
-                outputSchema=SUCCESS_OUTPUT_SCHEMA,
-                annotations=types.ToolAnnotations(
-                    readOnlyHint=True,
-                    destructiveHint=False,
-                    idempotentHint=True,
-                    openWorldHint=False,
-                ),
-            )
-        ]
-
-    @server.call_tool()
-    async def call_tool(name: str, arguments: dict[str, Any]) -> types.CallToolResult:
-        if name != TOOL_NAME:
+    async def call_tool(
+        _ctx: ServerRequestContext[Any],
+        params: CallToolRequestParams,
+    ) -> CallToolResult:
+        if params.name != TOOL_NAME:
             unknown_tool = {
                 "error": {
                     "code": "neutral_fixture_unknown_tool",
@@ -127,12 +132,13 @@ def create_server(mode: Mode) -> Server:
                     "retryable": False,
                 }
             }
-            return types.CallToolResult(
+            return CallToolResult(
                 content=[_json_text(unknown_tool)],
-                structuredContent=unknown_tool,
-                isError=True,
+                structured_content=unknown_tool,
+                is_error=True,
             )
 
+        arguments = params.arguments or {}
         if arguments:
             invalid_arguments = {
                 "error": {
@@ -141,10 +147,10 @@ def create_server(mode: Mode) -> Server:
                     "retryable": False,
                 }
             }
-            return types.CallToolResult(
+            return CallToolResult(
                 content=[_json_text(invalid_arguments)],
-                structuredContent=invalid_arguments,
-                isError=True,
+                structured_content=invalid_arguments,
+                is_error=True,
             )
 
         LOGGER.info("serving tool=%s mode=%s", TOOL_NAME, mode)
@@ -156,7 +162,16 @@ def create_server(mode: Mode) -> Server:
             return _error_result()
         return _success_result(mode)
 
-    return server
+    return Server(
+        SERVER_NAME,
+        version=SERVER_VERSION,
+        instructions=(
+            "A deterministic, read-only local fixture. It exposes one tool backed only by "
+            "constants compiled into this package."
+        ),
+        on_list_tools=list_tools,
+        on_call_tool=call_tool,
+    )
 
 
 async def _serve(mode: Mode) -> None:

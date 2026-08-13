@@ -6,7 +6,6 @@ import sys
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import timedelta
 from importlib.metadata import version
 from pathlib import Path
 from tempfile import TemporaryFile
@@ -17,7 +16,8 @@ import pytest
 from mcp import types
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
-from mcp.shared.exceptions import McpError
+from mcp.shared.exceptions import MCPError
+from mcp.types import REQUEST_TIMEOUT
 
 import neutral_mcp_server
 
@@ -38,6 +38,13 @@ EXPECTED_ERROR_OUTPUT = {
     "error": {
         "code": "neutral_fixture_forced_error",
         "message": "The controlled fixture was started in error mode.",
+        "retryable": False,
+    }
+}
+EXPECTED_INVALID_ARGUMENTS_OUTPUT = {
+    "error": {
+        "code": "neutral_fixture_invalid_arguments",
+        "message": "This tool accepts no arguments.",
         "retryable": False,
     }
 }
@@ -89,7 +96,7 @@ async def connected_client(mode: Mode) -> AsyncIterator[SessionProbe]:
                 async with ClientSession(
                     read_stream,
                     write_stream,
-                    read_timeout_seconds=timedelta(seconds=2),
+                    read_timeout_seconds=2.0,
                     message_handler=collect_protocol_message,
                 ) as session:
                     probe.session = session
@@ -112,7 +119,7 @@ def assert_text_matches_structured(result: types.CallToolResult) -> None:
     assert len(result.content) == 1
     text = result.content[0]
     assert isinstance(text, types.TextContent)
-    assert json.loads(text.text) == result.structuredContent
+    assert json.loads(text.text) == result.structured_content
 
 
 async def normal_lifecycle() -> None:
@@ -120,29 +127,30 @@ async def normal_lifecycle() -> None:
         session = active_session(probe)
 
         initialized = await session.initialize()
-        assert initialized.serverInfo.name == EXPECTED_SERVER_NAME
-        assert initialized.serverInfo.version == EXPECTED_SERVER_VERSION
+        assert initialized.server_info.name == EXPECTED_SERVER_NAME
+        assert initialized.server_info.version == EXPECTED_SERVER_VERSION
         assert initialized.capabilities.tools is not None
 
         listed = await session.list_tools()
         assert [tool.name for tool in listed.tools] == [EXPECTED_TOOL_NAME]
         tool = listed.tools[0]
-        assert tool.inputSchema == {
+        assert tool.input_schema == {
             "type": "object",
             "properties": {},
             "additionalProperties": False,
         }
-        assert "mode" not in json.dumps(tool.inputSchema)
-        assert tool.outputSchema == EXPECTED_OUTPUT_SCHEMA
+        assert "mode" not in json.dumps(tool.input_schema)
+        assert tool.output_schema == EXPECTED_OUTPUT_SCHEMA
         assert tool.annotations is not None
-        assert tool.annotations.readOnlyHint is True
-        assert tool.annotations.destructiveHint is False
-        assert tool.annotations.idempotentHint is True
-        assert tool.annotations.openWorldHint is False
+        assert tool.annotations.read_only_hint is True
+        assert tool.annotations.destructive_hint is False
+        assert tool.annotations.idempotent_hint is True
+        assert tool.annotations.open_world_hint is False
 
         result = await session.call_tool(EXPECTED_TOOL_NAME, {})
-        assert result.isError is False
-        assert result.structuredContent == {
+        assert isinstance(result, types.CallToolResult)
+        assert result.is_error is False
+        assert result.structured_content == {
             "record": EXPECTED_RECORD,
             "payload": EXPECTED_NORMAL_PAYLOAD,
         }
@@ -168,15 +176,15 @@ async def mode_cannot_be_selected_by_tool_arguments() -> None:
         await session.list_tools()
 
         rejected = await session.call_tool(EXPECTED_TOOL_NAME, {"mode": "error"})
-        assert rejected.isError is True
-        assert rejected.structuredContent is None
-        assert len(rejected.content) == 1
-        assert isinstance(rejected.content[0], types.TextContent)
-        assert "Input validation error" in rejected.content[0].text
+        assert isinstance(rejected, types.CallToolResult)
+        assert rejected.is_error is True
+        assert rejected.structured_content == EXPECTED_INVALID_ARGUMENTS_OUTPUT
+        assert_text_matches_structured(rejected)
 
         still_normal = await session.call_tool(EXPECTED_TOOL_NAME, {})
-        assert still_normal.isError is False
-        assert still_normal.structuredContent == {
+        assert isinstance(still_normal, types.CallToolResult)
+        assert still_normal.is_error is False
+        assert still_normal.structured_content == {
             "record": EXPECTED_RECORD,
             "payload": EXPECTED_NORMAL_PAYLOAD,
         }
@@ -194,15 +202,15 @@ async def slow_mode_times_out() -> None:
         await session.initialize()
         await session.list_tools()
 
-        with pytest.raises(McpError) as raised, anyio.fail_after(1):
+        with pytest.raises(MCPError) as raised, anyio.fail_after(1):
             await session.call_tool(
                 EXPECTED_TOOL_NAME,
                 {},
-                read_timeout_seconds=timedelta(milliseconds=50),
+                read_timeout_seconds=0.05,
             )
 
-        assert raised.value.error.code == 408
-        assert "Timed out while waiting" in raised.value.error.message
+        assert raised.value.code == REQUEST_TIMEOUT
+        assert raised.value.message == "Request 'tools/call' timed out"
 
     assert probe.stdout_protocol_errors == []
 
@@ -219,8 +227,9 @@ async def error_mode_is_structured() -> None:
         assert [tool.name for tool in tools.tools] == [EXPECTED_TOOL_NAME]
 
         result = await session.call_tool(EXPECTED_TOOL_NAME, {})
-        assert result.isError is True
-        assert result.structuredContent == EXPECTED_ERROR_OUTPUT
+        assert isinstance(result, types.CallToolResult)
+        assert result.is_error is True
+        assert result.structured_content == EXPECTED_ERROR_OUTPUT
         assert_text_matches_structured(result)
 
     assert probe.stdout_protocol_errors == []
@@ -237,9 +246,10 @@ async def oversized_mode_is_exact_and_complete() -> None:
         await session.list_tools()
 
         result = await session.call_tool(EXPECTED_TOOL_NAME, {})
-        assert result.isError is False
-        assert result.structuredContent is not None
-        payload = result.structuredContent["payload"]
+        assert isinstance(result, types.CallToolResult)
+        assert result.is_error is False
+        assert result.structured_content is not None
+        payload = result.structured_content["payload"]
         assert isinstance(payload, str)
         encoded = payload.encode("ascii")
         assert len(encoded) == EXPECTED_OVERSIZED_PAYLOAD_BYTES
@@ -256,6 +266,6 @@ def test_oversized_mode_transfers_fixed_256_kib_payload() -> None:
 
 
 def test_runtime_uses_the_exact_sdk_pin() -> None:
-    assert version("mcp") == "1.27.1"
+    assert version("mcp") == "2.0.0"
     assert version("neutral-mcp-server-fixture") == EXPECTED_SERVER_VERSION
     assert neutral_mcp_server.__version__ == EXPECTED_SERVER_VERSION
