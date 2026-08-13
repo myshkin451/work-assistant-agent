@@ -1,7 +1,7 @@
 # Controlled neutral MCP server fixture
 
 This directory is an isolated preparation Spike for a future controlled-extension task. It is
-not wired into the Host, does not change the current T-004 entry point, and is not Stage 3
+not wired into the Host, does not change the current T-005 entry point, and is not Stage 3
 acceptance evidence.
 
 ## Boundary
