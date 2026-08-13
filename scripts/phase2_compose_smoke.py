@@ -17,6 +17,10 @@ from typing import Any
 
 
 BASE_URL = os.environ.get("WORK_ASSISTANT_API_URL", "http://127.0.0.1:8000").rstrip("/")
+DEV_PRINCIPAL = os.environ.get(
+    "WORK_ASSISTANT_DEV_PRINCIPAL",
+    "urn:work-assistant:neutral:phase2-smoke",
+)
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 TERMINAL_EVENTS = {"run.completed", "run.failed", "run.cancelled"}
 PROMPTS = ("请查询当前上海时间。", "那伦敦呢？", "再看看纽约。")
@@ -38,7 +42,11 @@ def request_json(
         f"{BASE_URL}{path}",
         data=data,
         method=method,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Work-Assistant-Dev-Subject": DEV_PRINCIPAL,
+        },
     )
     try:
         with OPENER.open(request, timeout=20) as response:
@@ -69,7 +77,11 @@ def consume_events(
         f"?after_seq={after_seq}"
     )
     request = urllib.request.Request(
-        f"{BASE_URL}{path}", headers={"Accept": "text/event-stream"}
+        f"{BASE_URL}{path}",
+        headers={
+            "Accept": "text/event-stream",
+            "X-Work-Assistant-Dev-Subject": DEV_PRINCIPAL,
+        },
     )
     events: list[dict[str, Any]] = []
     data_lines: list[str] = []

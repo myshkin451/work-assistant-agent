@@ -8,6 +8,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -28,8 +29,12 @@ class Base(DeclarativeBase):
 
 class ThreadRecord(Base):
     __tablename__ = "product_threads"
+    __table_args__ = (
+        Index("ix_product_threads_owner_updated", "owner_subject", "updated_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    owner_subject: Mapped[str] = mapped_column(String(255), nullable=False)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -39,6 +44,7 @@ class RunRecord(Base):
     __tablename__ = "product_runs"
     __table_args__ = (
         UniqueConstraint("thread_id", "idempotency_key", name="uq_product_run_idempotency"),
+        UniqueConstraint("id", "thread_id", name="uq_product_run_id_thread"),
         CheckConstraint(
             "status IN ('created', 'running', 'completed', 'failed', 'cancelled')",
             name="ck_product_run_status",
@@ -58,6 +64,7 @@ class RunRecord(Base):
         ForeignKey("product_threads.id", ondelete="CASCADE"), nullable=False
     )
     idempotency_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    actor_subject: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="created")
     last_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
@@ -68,6 +75,11 @@ class MessageRecord(Base):
     __tablename__ = "product_messages"
     __table_args__ = (
         CheckConstraint("role IN ('user', 'assistant')", name="ck_product_message_role"),
+        ForeignKeyConstraint(
+            ["run_id", "thread_id"],
+            ["product_runs.id", "product_runs.thread_id"],
+            name="fk_product_messages_run_thread",
+        ),
         Index("ix_product_messages_thread_created", "thread_id", "created_at"),
     )
 
@@ -87,6 +99,11 @@ class EventRecord(Base):
     __tablename__ = "product_events"
     __table_args__ = (
         UniqueConstraint("run_id", "seq", name="uq_product_event_run_seq"),
+        ForeignKeyConstraint(
+            ["run_id", "thread_id"],
+            ["product_runs.id", "product_runs.thread_id"],
+            name="fk_product_events_run_thread",
+        ),
         Index("ix_product_events_run_seq", "run_id", "seq"),
     )
 

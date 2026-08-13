@@ -84,5 +84,36 @@ describe('product event boundary', () => {
       '/api/runs/run-1/events?after_seq=1',
     ]);
     expect(received).toEqual([1, 2]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    for (const [url, init] of fetchMock.mock.calls) {
+      expect(String(url)).not.toContain('principal');
+      expect(init).toEqual(
+        expect.objectContaining({
+          credentials: 'include',
+          headers: { Accept: 'text/event-stream' },
+        }),
+      );
+    }
+    vi.useRealTimers();
+  });
+
+  it.each([401, 403])('does not retry an authorization failure with status %s', async (status) => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ detail: { code: 'access_denied' } }), {
+        status,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const controller = new AbortController();
+
+    await expect(
+      streamRunEvents('run-1', 3, { onEvent: vi.fn() }, controller.signal),
+    ).rejects.toMatchObject({ status });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/runs/run-1/events?after_seq=3',
+      expect.objectContaining({ credentials: 'include' }),
+    );
   });
 });

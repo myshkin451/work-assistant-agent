@@ -14,6 +14,10 @@ import uuid
 
 
 BASE_URL = os.environ.get("WORK_ASSISTANT_API_URL", "http://127.0.0.1:8000").rstrip("/")
+DEV_PRINCIPAL = os.environ.get(
+    "WORK_ASSISTANT_DEV_PRINCIPAL",
+    "urn:work-assistant:neutral:contract-smoke",
+)
 TERMINAL_EVENTS = {"run.completed", "run.failed", "run.cancelled"}
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
@@ -30,7 +34,11 @@ def request_json(method: str, path: str, body: dict[str, object] | None = None) 
         f"{BASE_URL}{path}",
         data=data,
         method=method,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Work-Assistant-Dev-Subject": DEV_PRINCIPAL,
+        },
     )
     with OPENER.open(request, timeout=15) as response:
         return json.load(response)
@@ -49,7 +57,13 @@ def wait_until_ready() -> None:
 
 def consume_events(run_id: str) -> list[dict]:
     url = f"{BASE_URL}/api/runs/{urllib.parse.quote(run_id)}/events?after_seq=0"
-    request = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "text/event-stream",
+            "X-Work-Assistant-Dev-Subject": DEV_PRINCIPAL,
+        },
+    )
     events: list[dict] = []
     data_lines: list[str] = []
     with OPENER.open(request, timeout=150) as response:
@@ -128,7 +142,13 @@ def consume_replay(run_id: str, after_seq: int) -> list[dict]:
         f"{BASE_URL}/api/runs/{urllib.parse.quote(run_id)}/events"
         f"?after_seq={after_seq}"
     )
-    request = urllib.request.Request(url, headers={"Accept": "text/event-stream"})
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Accept": "text/event-stream",
+            "X-Work-Assistant-Dev-Subject": DEV_PRINCIPAL,
+        },
+    )
     events: list[dict] = []
     data_lines: list[str] = []
     with OPENER.open(request, timeout=15) as response:

@@ -6,7 +6,10 @@ from typing import Any
 
 from httpx import AsyncClient
 
+from work_assistant.identity import ANONYMOUS_DEVELOPMENT_SUBJECT, Principal
 from work_assistant.repository import ActiveRunConflictError
+
+TEST_PRINCIPAL = Principal(subject=ANONYMOUS_DEVELOPMENT_SUBJECT)
 
 
 def parse_sse(body: str) -> list[dict[str, Any]]:
@@ -121,6 +124,7 @@ async def test_idempotency_and_single_active_run_hold_under_concurrency(
     contenders = await asyncio.gather(
         *(
             app.state.repository.create_run(
+                principal=TEST_PRINCIPAL,
                 thread_id=second_thread,
                 message="Current time in UTC",
                 idempotency_key=f"key-{index}",
@@ -134,7 +138,7 @@ async def test_idempotency_and_single_active_run_hold_under_concurrency(
     assert len(created) == 1
     assert created[0][1] is True
     assert len(conflicts) == 9
-    await app.state.repository.cancel_run(created[0][0].run_id)
+    await app.state.repository.cancel_run(created[0][0].run_id, principal=TEST_PRINCIPAL)
 
 
 async def test_cancel_is_terminal_and_late_agent_results_are_discarded(
@@ -173,8 +177,11 @@ async def test_cancel_and_event_append_reserve_distinct_sequences(
 ) -> None:
     _, app = app_client
     repository = app.state.repository
-    thread = await repository.create_thread("Atomic event sequence")
+    thread = await repository.create_thread(
+        principal=TEST_PRINCIPAL, title="Atomic event sequence"
+    )
     run, created = await repository.create_run(
+        principal=TEST_PRINCIPAL,
         thread_id=thread.thread_id,
         message="Current time UTC",
         idempotency_key="cancel-event-race",
@@ -192,11 +199,11 @@ async def test_cancel_and_event_append_reserve_distinct_sequences(
                 "label": "Read current time",
             },
         ),
-        repository.cancel_run(run.run_id),
+        repository.cancel_run(run.run_id, principal=TEST_PRINCIPAL),
     )
 
     assert cancelled.status == "cancelled"
-    events = await repository.get_events(run.run_id, 0)
+    events = await repository.get_events(run.run_id, 0, principal=TEST_PRINCIPAL)
     assert [event.seq for event in events] == list(range(1, len(events) + 1))
     assert events[-1].type == "run.cancelled"
     if append_result is not None:
@@ -213,7 +220,8 @@ async def test_errors_and_public_events_are_bounded(app_client: tuple[Any, Any])
         "/api/threads/not-found/runs",
         json={"message": " ", "idempotency_key": " "},
     )
-    assert invalid.status_code == 422
+    assert invalid.status_code == 404
+    assert invalid.json() == {"detail": {"code": "thread_not_found"}}
     assert "traceback" not in invalid.text.casefold()
 
     thread_id = await create_thread(client)

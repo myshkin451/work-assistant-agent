@@ -18,6 +18,7 @@ async def app_client(tmp_path: Path) -> AsyncIterator[tuple[AsyncClient, Any]]:
     database_url = f"sqlite+aiosqlite:///{database_path}"
     settings = Settings(
         app_env="test",
+        identity_provider_mode="anonymous",
         database_url=database_url,
         checkpoint_database_url="postgresql://unused:unused@localhost/unused",
         model_mode="fake",

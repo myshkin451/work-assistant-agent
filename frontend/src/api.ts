@@ -25,7 +25,8 @@ const apiUrl = (path: string) => `${API_BASE_URL}${path}`;
 async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(apiUrl(path), {
     ...init,
-    credentials: 'omit',
+    credentials: 'include',
+    cache: 'no-store',
     headers: {
       Accept: 'application/json',
       ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
@@ -41,6 +42,8 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 function publicErrorMessage(status: number) {
+  if (status === 401) return '当前请求未通过身份认证，请完成认证后刷新页面。';
+  if (status === 403) return '当前身份无权访问这项会话或运行。';
   if (status === 404) return '请求的会话不存在。';
   if (status === 409) return '这个会话已有任务正在运行。';
   if (status === 422) return '提交内容不符合要求。';
@@ -180,7 +183,8 @@ export async function streamRunEvents(
           // already disables caching; a request Cache-Control header would add
           // an unnecessary preflight before every reconnect.
           headers: { Accept: 'text/event-stream' },
-          credentials: 'omit',
+          credentials: 'include',
+          cache: 'no-store',
           signal,
         },
       );

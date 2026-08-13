@@ -659,6 +659,14 @@ summary:focus-visible {
   cursor: not-allowed;
 }
 
+.new-thread:disabled,
+.history-item:disabled,
+.mobile-new:disabled,
+.mobile-actions select:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
 .composer-footer {
   display: flex;
   align-items: center;
