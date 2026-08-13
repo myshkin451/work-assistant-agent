@@ -2,7 +2,15 @@ import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 import { App } from './App';
-import type { ProductEvent, RunView, ThreadSnapshot, ThreadSummary } from './types';
+import type {
+  Message,
+  ProductEvent,
+  RunFailureCode,
+  RunSnapshot,
+  RunView,
+  ThreadSnapshot,
+  ThreadSummary,
+} from './types';
 
 const timestamp = '2026-08-12T12:00:00Z';
 
@@ -13,11 +21,17 @@ function jsonResponse(value: unknown, status = 200) {
   });
 }
 
-function event(seq: number, type: ProductEvent['type'], data: Record<string, unknown> = {}) {
+function event(
+  seq: number,
+  type: ProductEvent['type'],
+  data: Record<string, unknown> = {},
+  runId = 'run-1',
+  threadId = 'thread-1',
+) {
   return {
     event_id: `event-${seq}`,
-    run_id: 'run-1',
-    thread_id: 'thread-1',
+    run_id: runId,
+    thread_id: threadId,
     seq,
     type,
     occurred_at: timestamp,
@@ -76,14 +90,52 @@ const assistantMessage = {
   run_id: 'run-1',
 };
 
+function runSnapshot(run: RunView, events: ProductEvent[]): RunSnapshot {
+  return { ...run, events };
+}
+
 describe('employee chat vertical slice', () => {
   it('creates a real run and renders deduplicated product events, tools and sources', async () => {
     const emptyList = { items: [] as ThreadSummary[] };
-    const emptySnapshot: ThreadSnapshot = { ...summary, messages: [], active_run: null };
-    const withUser: ThreadSnapshot = { ...summary, messages: [userMessage], active_run: running };
+    const emptySnapshot: ThreadSnapshot = { ...summary, messages: [], runs: [], active_run: null };
+    const withUser: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage],
+      runs: [runSnapshot(running, [])],
+      active_run: running,
+    };
     const completedSnapshot: ThreadSnapshot = {
       ...summary,
       messages: [userMessage, assistantMessage],
+      runs: [
+        runSnapshot(
+          { ...running, status: 'completed', last_seq: 9, completed_at: timestamp },
+          [
+            event(1, 'run.started', { status: 'running' }),
+            event(2, 'tool.started', {
+              tool_call_id: 'tool-1',
+              name: 'get_current_time',
+              label: '查询指定时区的当前时间',
+              input_summary: 'Asia/Shanghai',
+            }),
+            event(3, 'tool.finished', {
+              tool_call_id: 'tool-1',
+              name: 'get_current_time',
+              label: '查询指定时区的当前时间',
+              output_summary: '已取得 Asia/Shanghai 当前时间',
+            }),
+            event(5, 'message.delta', { delta: '上海当前时间' }),
+            event(6, 'message.delta', { delta: '为 2026 年 8 月 12 日 20:00。' }),
+            event(7, 'source.added', {
+              source_id: 'source-1',
+              label: '系统时钟 · Asia/Shanghai',
+              description: '由只读时间工具返回',
+            }),
+            event(8, 'message.completed', { message: assistantMessage }),
+            event(9, 'run.completed', { status: 'completed' }),
+          ],
+        ),
+      ],
       active_run: null,
     };
     let snapshotReads = 0;
@@ -151,15 +203,48 @@ describe('employee chat vertical slice', () => {
     );
   });
 
-  it('restores an active run from the thread snapshot and replays from seq zero', async () => {
+  it('restores an active run and continues SSE from the snapshot last seq', async () => {
+    const activeEvents = [
+      event(1, 'run.started', { status: 'running' }),
+      event(2, 'tool.started', {
+        tool_call_id: 'tool-1',
+        name: 'get_current_time',
+        label: '查询指定时区的当前时间',
+        input_summary: 'Asia/Shanghai',
+      }),
+      event(3, 'tool.finished', {
+        tool_call_id: 'tool-1',
+        name: 'get_current_time',
+        label: '查询指定时区的当前时间',
+        output_summary: '已取得 Asia/Shanghai 当前时间',
+      }),
+      event(4, 'source.added', {
+        source_id: 'source-1',
+        label: '系统时钟 · Asia/Shanghai',
+        description: '由只读时间工具返回',
+      }),
+    ];
+    const activeRun = { ...running, last_seq: 4 };
     const activeSnapshot: ThreadSnapshot = {
       ...summary,
       messages: [userMessage],
-      active_run: { ...running, last_seq: 4 },
+      runs: [runSnapshot(activeRun, activeEvents)],
+      active_run: activeRun,
     };
     const completedSnapshot: ThreadSnapshot = {
       ...summary,
       messages: [userMessage, assistantMessage],
+      runs: [
+        runSnapshot(
+          { ...running, status: 'completed', last_seq: 7, completed_at: timestamp },
+          [
+            ...activeEvents,
+            event(5, 'message.delta', { delta: assistantMessage.content }),
+            event(6, 'message.completed', { message: assistantMessage }),
+            event(7, 'run.completed', { status: 'completed' }),
+          ],
+        ),
+      ],
       active_run: null,
     };
     let threadReads = 0;
@@ -171,9 +256,56 @@ describe('employee chat vertical slice', () => {
         threadReads += 1;
         return jsonResponse(threadReads === 1 ? activeSnapshot : completedSnapshot);
       }
-      if (url === '/api/runs/run-1/events?after_seq=0') {
+      if (url === '/api/runs/run-1/events?after_seq=4') {
         return sseResponse([
-          event(1, 'run.started', { status: 'running' }),
+          event(4, 'source.added', {
+            source_id: 'source-1',
+            label: '重复来源',
+            description: '不应覆盖已恢复来源',
+          }),
+          event(5, 'message.delta', { delta: assistantMessage.content }),
+          event(6, 'message.completed', { message: assistantMessage }),
+          event(7, 'run.completed', { status: 'completed' }),
+        ]);
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+
+    expect(await screen.findByText(assistantMessage.content)).toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/runs/run-1/events?after_seq=4',
+      expect.objectContaining({ credentials: 'omit' }),
+    );
+    expect(screen.queryByText('重复来源')).not.toBeInTheDocument();
+  });
+
+  it('keeps a recovered terminal event authoritative when its background refresh is offline', async () => {
+    const activeRun = { ...running, last_seq: 1 };
+    const activeSnapshot: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage],
+      runs: [runSnapshot(activeRun, [event(1, 'run.started', { status: 'running' })])],
+      active_run: activeRun,
+    };
+    let listReads = 0;
+    let threadReads = 0;
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/api/threads' && method === 'GET') {
+        listReads += 1;
+        if (listReads === 1) return jsonResponse({ items: [summary] });
+        throw new TypeError('offline background list refresh');
+      }
+      if (url === '/api/threads/thread-1' && method === 'GET') {
+        threadReads += 1;
+        if (threadReads === 1) return jsonResponse(activeSnapshot);
+        throw new TypeError('offline background snapshot refresh');
+      }
+      if (url === '/api/runs/run-1/events?after_seq=1') {
+        return sseResponse([
           event(2, 'message.delta', { delta: assistantMessage.content }),
           event(3, 'message.completed', { message: assistantMessage }),
           event(4, 'run.completed', { status: 'completed' }),
@@ -185,17 +317,345 @@ describe('employee chat vertical slice', () => {
     render(<App />);
 
     expect(await screen.findByText(assistantMessage.content)).toBeInTheDocument();
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/api/runs/run-1/events?after_seq=0',
-      expect.objectContaining({ credentials: 'omit' }),
+    expect(await screen.findByText('已完成')).toBeInTheDocument();
+    await waitFor(() => expect(listReads).toBeGreaterThan(1));
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('rebuilds every historical run with its own tool, source and terminal state', async () => {
+    const cities = [
+      ['run-shanghai', 'Asia/Shanghai', '上海时间', '上海现在是 20:00。'],
+      ['run-london', 'Europe/London', '伦敦时间', '伦敦现在是 13:00。'],
+      ['run-new-york', 'America/New_York', '纽约时间', '纽约现在是 08:00。'],
+    ] as const;
+    const messages: Message[] = [];
+    const runs: RunSnapshot[] = [];
+
+    cities.forEach(([runId, timezone, question, answer], index) => {
+      const user: Message = {
+        message_id: `user-${index}`,
+        role: 'user',
+        content: question,
+        created_at: timestamp,
+        run_id: runId,
+      };
+      const assistant: Message = {
+        message_id: `assistant-${index}`,
+        role: 'assistant',
+        content: answer,
+        created_at: timestamp,
+        run_id: runId,
+      };
+      const run: RunView = {
+        ...running,
+        run_id: runId,
+        status: 'completed',
+        last_seq: 6,
+        completed_at: timestamp,
+      };
+      messages.push(user, assistant);
+      runs.push(
+        runSnapshot(run, [
+          event(1, 'run.started', { status: 'running' }, runId),
+          event(
+            2,
+            'tool.started',
+            {
+              tool_call_id: `tool-${index}`,
+              name: 'get_current_time',
+              label: '查询指定时区的当前时间',
+              input_summary: timezone,
+            },
+            runId,
+          ),
+          event(
+            3,
+            'tool.finished',
+            {
+              tool_call_id: `tool-${index}`,
+              name: 'get_current_time',
+              label: '查询指定时区的当前时间',
+              output_summary: `已取得 ${timezone} 当前时间`,
+            },
+            runId,
+          ),
+          event(
+            4,
+            'source.added',
+            {
+              source_id: `source-${index}`,
+              label: `系统时钟 · ${timezone}`,
+              description: '由只读时间工具返回',
+            },
+            runId,
+          ),
+          event(5, 'message.completed', { message: assistant }, runId),
+          event(6, 'run.completed', { status: 'completed' }, runId),
+        ]),
+      );
+    });
+
+    const historySnapshot: ThreadSnapshot = {
+      ...summary,
+      messages,
+      runs,
+      active_run: null,
+    };
+    const otherSummary: ThreadSummary = {
+      ...summary,
+      thread_id: 'thread-2',
+      title: '其他对话',
+    };
+    const otherSnapshot: ThreadSnapshot = {
+      ...otherSummary,
+      messages: [],
+      runs: [],
+      active_run: null,
+    };
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/api/threads' && method === 'GET') {
+        return jsonResponse({ items: [summary, otherSummary] });
+      }
+      if (url === '/api/threads/thread-1' && method === 'GET') return jsonResponse(historySnapshot);
+      if (url === '/api/threads/thread-2' && method === 'GET') return jsonResponse(otherSnapshot);
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText('纽约现在是 08:00。')).toBeInTheDocument();
+    for (const [, timezone, , answer] of cities) {
+      expect(screen.getByText(`已取得 ${timezone} 当前时间`)).toBeInTheDocument();
+      expect(screen.getByText(`系统时钟 · ${timezone}`)).toBeInTheDocument();
+      expect(screen.getByText(answer)).toBeInTheDocument();
+    }
+    expect(screen.getAllByText('已完成')).toHaveLength(3);
+
+    await user.click(screen.getByRole('button', { name: '其他对话' }));
+    expect(await screen.findByText('从一个真实工具开始')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '查询上海当前时间' }));
+    expect(await screen.findByText('伦敦现在是 13:00。')).toBeInTheDocument();
+
+    expect(
+      fetchMock.mock.calls.filter(([, init]) => (init?.method ?? 'GET') === 'POST'),
+    ).toHaveLength(0);
+  });
+
+  it('keeps stream_unavailable as connection state instead of a run failure', async () => {
+    const activeRun = { ...running, last_seq: 1 };
+    const activeSnapshot: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage],
+      runs: [runSnapshot(activeRun, [event(1, 'run.started', { status: 'running' })])],
+      active_run: activeRun,
+    };
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/api/threads' && method === 'GET') return jsonResponse({ items: [summary] });
+      if (url === '/api/threads/thread-1' && method === 'GET') return jsonResponse(activeSnapshot);
+      if (url === '/api/runs/run-1/events?after_seq=1') return jsonResponse({}, 404);
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+
+    expect(await screen.findByText('连接中断')).toBeInTheDocument();
+    expect(
+      screen.getByText('实时连接暂不可用。运行状态未被改为失败；请刷新页面重新连接。'),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重新运行' })).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: '停止运行' })).toBeInTheDocument();
+  });
+
+  it('renders every frozen run failure code with a deterministic message', async () => {
+    const cases: Array<[RunFailureCode, string]> = [
+      ['run_timeout', '本次运行超时，未能完成。'],
+      ['agent_execution_failed', 'Agent 执行失败，未能完成本次运行。'],
+      ['service_restarted', '服务已重启，原运行已安全结束。'],
+    ];
+    const messages: Message[] = [];
+    const runs: RunSnapshot[] = [];
+    cases.forEach(([failureCode], index) => {
+      const runId = `failed-${index}`;
+      messages.push({
+        message_id: `failed-message-${index}`,
+        role: 'user',
+        content: `failure ${index}`,
+        created_at: timestamp,
+        run_id: runId,
+      });
+      runs.push(
+        runSnapshot(
+          {
+            ...running,
+            run_id: runId,
+            status: 'failed',
+            last_seq: 2,
+            completed_at: timestamp,
+          },
+          [
+            event(1, 'run.started', { status: 'running' }, runId),
+            event(2, 'run.failed', { status: 'failed', error_code: failureCode }, runId),
+          ],
+        ),
+      );
+    });
+    const failureSnapshot: ThreadSnapshot = {
+      ...summary,
+      messages,
+      runs,
+      active_run: null,
+    };
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/api/threads' && method === 'GET') return jsonResponse({ items: [summary] });
+      if (url === '/api/threads/thread-1' && method === 'GET') return jsonResponse(failureSnapshot);
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+
+    for (const [, message] of cases) {
+      expect(await screen.findByText(message)).toBeInTheDocument();
+    }
+    expect(screen.getAllByRole('button', { name: '重新运行' })).toHaveLength(3);
+  });
+
+  it('retries service_restarted as a new run and preserves the failed turn', async () => {
+    const failedRun: RunView = {
+      ...running,
+      status: 'failed',
+      last_seq: 3,
+      completed_at: timestamp,
+    };
+    const failedEvents = [
+      event(1, 'run.started', { status: 'running' }),
+      event(2, 'tool.started', {
+        tool_call_id: 'tool-old',
+        name: 'get_current_time',
+        label: '查询指定时区的当前时间',
+        input_summary: 'Asia/Shanghai',
+      }),
+      event(3, 'run.failed', { status: 'failed', error_code: 'service_restarted' }),
+    ];
+    const failedSnapshot: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage],
+      runs: [runSnapshot(failedRun, failedEvents)],
+      active_run: null,
+    };
+    const retryRunView: RunView = {
+      ...running,
+      run_id: 'run-2',
+      last_seq: 0,
+    };
+    const retryUser: Message = {
+      ...userMessage,
+      message_id: 'message-user-retry',
+      run_id: 'run-2',
+    };
+    const retryAssistant: Message = {
+      ...assistantMessage,
+      message_id: 'message-assistant-retry',
+      run_id: 'run-2',
+      content: '重试后已取得上海当前时间。',
+    };
+    const retryEvents = [
+      event(1, 'run.started', { status: 'running' }, 'run-2'),
+      event(
+        2,
+        'tool.started',
+        {
+          tool_call_id: 'tool-new',
+          name: 'get_current_time',
+          label: '查询指定时区的当前时间',
+          input_summary: 'Asia/Shanghai',
+        },
+        'run-2',
+      ),
+      event(
+        3,
+        'tool.finished',
+        {
+          tool_call_id: 'tool-new',
+          name: 'get_current_time',
+          label: '查询指定时区的当前时间',
+          output_summary: '已取得 Asia/Shanghai 当前时间',
+        },
+        'run-2',
+      ),
+      event(4, 'message.completed', { message: retryAssistant }, 'run-2'),
+      event(5, 'run.completed', { status: 'completed' }, 'run-2'),
+    ];
+    const retryActiveSnapshot: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage, retryUser],
+      runs: [runSnapshot(failedRun, failedEvents), runSnapshot(retryRunView, [])],
+      active_run: retryRunView,
+    };
+    const completedRetryRun: RunView = {
+      ...retryRunView,
+      status: 'completed',
+      last_seq: 5,
+      completed_at: timestamp,
+    };
+    const retryCompletedSnapshot: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage, retryUser, retryAssistant],
+      runs: [runSnapshot(failedRun, failedEvents), runSnapshot(completedRetryRun, retryEvents)],
+      active_run: null,
+    };
+    let threadReads = 0;
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/api/threads' && method === 'GET') return jsonResponse({ items: [summary] });
+      if (url === '/api/threads/thread-1' && method === 'GET') {
+        threadReads += 1;
+        if (threadReads === 1) return jsonResponse(failedSnapshot);
+        if (threadReads === 2) return jsonResponse(retryActiveSnapshot);
+        return jsonResponse(retryCompletedSnapshot);
+      }
+      if (url === '/api/threads/thread-1/runs' && method === 'POST') {
+        return jsonResponse(retryRunView);
+      }
+      if (url === '/api/runs/run-2/events?after_seq=0') return sseResponse(retryEvents);
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText('服务已重启，原运行已安全结束。')).toBeInTheDocument();
+    expect(screen.getByText('已停止')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '重新运行' }));
+
+    expect(await screen.findByText(retryAssistant.content)).toBeInTheDocument();
+    expect(screen.getByText('服务已重启，原运行已安全结束。')).toBeInTheDocument();
+    const runPosts = fetchMock.mock.calls.filter(
+      ([input, init]) =>
+        String(input) === '/api/threads/thread-1/runs' && (init?.method ?? 'GET') === 'POST',
     );
+    expect(runPosts).toHaveLength(1);
+    const requestBody = JSON.parse(String(runPosts[0]?.[1]?.body)) as {
+      message: string;
+      idempotency_key: string;
+    };
+    expect(requestBody.message).toBe(userMessage.content);
+    expect(requestBody.idempotency_key).toMatch(/^[0-9a-f-]{36}$/i);
   });
 
   it('cancels the active run and leaves a clear terminal state', async () => {
     const activeSnapshot: ThreadSnapshot = {
       ...summary,
       messages: [userMessage],
-      active_run: running,
+      runs: [runSnapshot({ ...running, last_seq: 1 }, [event(1, 'run.started', { status: 'running' })])],
+      active_run: { ...running, last_seq: 1 },
     };
     const cancelled: RunView = {
       ...running,
@@ -206,6 +666,12 @@ describe('employee chat vertical slice', () => {
     const cancelledSnapshot: ThreadSnapshot = {
       ...summary,
       messages: [userMessage],
+      runs: [
+        runSnapshot(cancelled, [
+          event(1, 'run.started', { status: 'running' }),
+          event(2, 'run.cancelled', { status: 'cancelled' }),
+        ]),
+      ],
       active_run: null,
     };
     let threadReads = 0;
@@ -217,8 +683,8 @@ describe('employee chat vertical slice', () => {
         threadReads += 1;
         return jsonResponse(threadReads === 1 ? activeSnapshot : cancelledSnapshot);
       }
-      if (url === '/api/runs/run-1/events?after_seq=0') {
-        return sseResponse([event(1, 'run.started', { status: 'running' })]);
+      if (url === '/api/runs/run-1/events?after_seq=1') {
+        return sseResponse([]);
       }
       if (url === '/api/runs/run-1/cancel' && method === 'POST') return jsonResponse(cancelled);
       throw new Error(`Unexpected request: ${method} ${url}`);
@@ -236,5 +702,106 @@ describe('employee chat vertical slice', () => {
         expect.objectContaining({ method: 'POST' }),
       ),
     );
+  });
+
+  it('does not abort a newly selected active stream when an old cancel returns late', async () => {
+    const threadB: ThreadSummary = {
+      ...summary,
+      thread_id: 'thread-2',
+      title: '活动会话 B',
+    };
+    const runB: RunView = {
+      ...running,
+      run_id: 'run-2',
+      thread_id: 'thread-2',
+      last_seq: 1,
+    };
+    const messageB: Message = {
+      ...userMessage,
+      message_id: 'message-b',
+      run_id: 'run-2',
+      content: '会话 B 的问题',
+    };
+    const snapshotA: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage],
+      runs: [runSnapshot({ ...running, last_seq: 1 }, [event(1, 'run.started', { status: 'running' })])],
+      active_run: { ...running, last_seq: 1 },
+    };
+    const snapshotB: ThreadSnapshot = {
+      ...threadB,
+      messages: [messageB],
+      runs: [
+        runSnapshot(runB, [
+          event(1, 'run.started', { status: 'running' }, 'run-2', 'thread-2'),
+        ]),
+      ],
+      active_run: runB,
+    };
+    const cancelledA: RunView = {
+      ...running,
+      status: 'cancelled',
+      last_seq: 2,
+      completed_at: timestamp,
+    };
+    let resolveCancel!: (response: Response) => void;
+    const cancelResponse = new Promise<Response>((resolve) => {
+      resolveCancel = resolve;
+    });
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/api/threads' && method === 'GET') {
+        return jsonResponse({ items: [summary, threadB] });
+      }
+      if (url === '/api/threads/thread-1' && method === 'GET') return jsonResponse(snapshotA);
+      if (url === '/api/threads/thread-2' && method === 'GET') return jsonResponse(snapshotB);
+      if (url === '/api/runs/run-1/events?after_seq=1') {
+        return new Promise<Response>(() => undefined);
+      }
+      if (url === '/api/runs/run-1/cancel' && method === 'POST') return cancelResponse;
+      if (url === '/api/runs/run-2/events?after_seq=1') {
+        return new Promise<Response>(() => undefined);
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await user.click(await screen.findByRole('button', { name: '停止运行' }));
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/runs/run-1/cancel',
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    );
+    await user.click(screen.getByRole('button', { name: '活动会话 B' }));
+    expect(await screen.findByText(messageB.content)).toBeInTheDocument();
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        '/api/runs/run-2/events?after_seq=1',
+        expect.objectContaining({ signal: expect.any(AbortSignal) }),
+      ),
+    );
+
+    const bRequest = fetchMock.mock.calls.find(
+      ([input]) => String(input) === '/api/runs/run-2/events?after_seq=1',
+    );
+    const bSignal = bRequest?.[1]?.signal;
+    expect(bSignal).toBeInstanceOf(AbortSignal);
+    const threadListReadsBeforeCancelSettles = fetchMock.mock.calls.filter(
+      ([input, init]) => String(input) === '/api/threads' && (init?.method ?? 'GET') === 'GET',
+    ).length;
+    resolveCancel(jsonResponse(cancelledA));
+    await waitFor(() =>
+      expect(
+        fetchMock.mock.calls.filter(
+          ([input, init]) =>
+            String(input) === '/api/threads' && (init?.method ?? 'GET') === 'GET',
+        ).length,
+      ).toBeGreaterThan(threadListReadsBeforeCancelSettles),
+    );
+    expect(bSignal?.aborted).toBe(false);
   });
 });

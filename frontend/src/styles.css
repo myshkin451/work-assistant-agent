@@ -38,6 +38,7 @@ body,
 
 body {
   min-height: 100vh;
+  min-height: 100dvh;
   color: var(--ink);
   background: var(--paper);
   line-height: 1.55;
@@ -87,6 +88,7 @@ summary:focus-visible {
 
 .app-shell {
   min-height: 100vh;
+  min-height: 100dvh;
   display: grid;
   grid-template-columns: 270px minmax(0, 1fr);
 }
@@ -214,6 +216,7 @@ summary:focus-visible {
   grid-column: 2;
   min-width: 0;
   min-height: 100vh;
+  min-height: 100dvh;
   background:
     radial-gradient(circle at 50% -150px, rgb(82 103 232 / 7%), transparent 380px),
     var(--paper);
@@ -261,8 +264,14 @@ summary:focus-visible {
 .conversation {
   width: min(820px, calc(100% - 36px));
   min-height: calc(100vh - 64px);
+  min-height: calc(100dvh - 64px);
   margin: 0 auto;
   padding: 42px 0 190px;
+}
+
+.conversation-end {
+  height: 1px;
+  scroll-margin-bottom: 170px;
 }
 
 .empty-state {
@@ -436,6 +445,10 @@ summary:focus-visible {
   background: var(--green);
 }
 
+.status-orb.stopped {
+  background: #8a8e98;
+}
+
 .pulsing {
   animation: pulse 1s ease-in-out infinite;
 }
@@ -474,6 +487,11 @@ summary:focus-visible {
   color: var(--green);
 }
 
+.tool-check.stopped {
+  background: #f0f1f3;
+  color: #747883;
+}
+
 .tool-step div strong,
 .tool-step div span {
   display: block;
@@ -488,6 +506,7 @@ summary:focus-visible {
 .tool-step > span:last-child {
   color: var(--quiet);
   font-size: 10px;
+  overflow-wrap: anywhere;
 }
 
 .tool-step > span:last-child {
@@ -528,6 +547,7 @@ summary:focus-visible {
 }
 
 .source-chip {
+  max-width: 100%;
   display: inline-flex;
   gap: 6px;
   align-items: center;
@@ -537,6 +557,7 @@ summary:focus-visible {
   background: white;
   color: var(--ink-soft);
   font-size: 11px;
+  overflow-wrap: anywhere;
 }
 
 .source-chip .icon {
@@ -561,6 +582,40 @@ summary:focus-visible {
 .page-error {
   background: var(--red-soft);
   color: var(--red);
+}
+
+.run-notice.connection {
+  background: var(--amber-soft);
+  color: var(--amber);
+}
+
+.run-notice-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.retry-button {
+  min-height: 34px;
+  flex: none;
+  border: 1px solid rgb(183 72 72 / 28%);
+  border-radius: 9px;
+  padding: 6px 11px;
+  background: white;
+  color: var(--red);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.retry-button:hover:not(:disabled) {
+  border-color: rgb(183 72 72 / 48%);
+  background: #fffafa;
+}
+
+.retry-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 .page-error {
@@ -703,18 +758,25 @@ summary:focus-visible {
 
   .topbar div:first-child {
     min-width: 0;
+    flex: 1;
   }
 
   .topbar strong {
-    max-width: 180px;
+    max-width: 100%;
+  }
+
+  .topbar div:first-child > span {
+    display: none;
   }
 
   .mobile-actions {
     display: flex;
+    flex: none;
   }
 
   .mobile-actions select {
-    max-width: 130px;
+    width: min(118px, 30vw);
+    max-width: 118px;
     border: 1px solid var(--line);
     border-radius: 9px;
     padding: 7px 8px;
@@ -731,12 +793,22 @@ summary:focus-visible {
   .conversation {
     width: calc(100% - 28px);
     padding-top: 28px;
+    padding-bottom: 210px;
+  }
+
+  .conversation-end {
+    scroll-margin-bottom: 195px;
   }
 
   .composer-dock {
     left: 0;
     padding-right: 14px;
+    padding-bottom: calc(18px + env(safe-area-inset-bottom));
     padding-left: 14px;
+  }
+
+  .composer textarea {
+    resize: none;
   }
 
   .assistant-turn {
@@ -755,6 +827,15 @@ summary:focus-visible {
 
   .tool-step > span:last-child {
     display: none;
+  }
+
+  .run-notice-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .retry-button {
+    min-height: 42px;
   }
 }
 

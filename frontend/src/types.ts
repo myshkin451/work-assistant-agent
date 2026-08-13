@@ -24,8 +24,13 @@ export type RunView = {
   completed_at: string | null;
 };
 
+export type RunSnapshot = RunView & {
+  events: ProductEvent[];
+};
+
 export type ThreadSnapshot = ThreadSummary & {
   messages: Message[];
+  runs: RunSnapshot[];
   active_run: RunView | null;
 };
 
@@ -68,15 +73,35 @@ export type SourceReference = {
   description: string;
 };
 
+export const runFailureCodes = [
+  'run_timeout',
+  'agent_execution_failed',
+  'service_restarted',
+] as const;
+
+export type RunFailureCode = (typeof runFailureCodes)[number];
+
+const knownRunFailureCodes = new Set<string>(runFailureCodes);
+
+export const isRunFailureCode = (value: unknown): value is RunFailureCode =>
+  typeof value === 'string' && knownRunFailureCodes.has(value);
+
+export type StreamConnection =
+  | 'connecting'
+  | 'live'
+  | 'reconnecting'
+  | 'unavailable'
+  | 'closed';
+
 export type RunProjection = {
   run: RunView;
   assistantText: string;
   tools: ToolProgress[];
   sources: SourceReference[];
   lastSeq: number;
-  connection: 'connecting' | 'live' | 'reconnecting' | 'closed';
+  connection: StreamConnection;
   cancelling: boolean;
-  errorCode?: string;
+  failureCode?: RunFailureCode;
 };
 
 export const isTerminalStatus = (status: RunStatus) =>
