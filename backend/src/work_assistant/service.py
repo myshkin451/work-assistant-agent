@@ -6,7 +6,7 @@ from typing import Protocol
 
 from .agent_runtime import AgentResult, AgentRunner, ProductEvent
 from .repository import ProductRepository
-from .schemas import EventEnvelope, RunView
+from .schemas import EventEnvelope, RunView, validate_runtime_event
 from .settings import Settings
 
 
@@ -102,24 +102,25 @@ class RunService:
         try:
             if not await self.repository.start_run(run_id):
                 return
-            thread_id, user_message = await self.repository.get_run_input(run_id)
+            thread_id, messages = await self.repository.get_run_context(run_id)
             result: AgentResult | None = None
             async with asyncio.timeout(self._settings.run_timeout_seconds):
                 async for item in self._runner.stream(
                     thread_id=thread_id,
                     run_id=run_id,
-                    message=user_message,
+                    messages=messages,
                 ):
                     if isinstance(item, ProductEvent):
+                        event_type, data = validate_runtime_event(item.type, item.data)
                         persisted = await self.repository.append_active_event(
-                            run_id, item.type, item.data
+                            run_id, event_type, data
                         )
                         if persisted is None:
                             return
                     else:
                         result = item
             if result is None:
-                await self.repository.fail_run(run_id, "agent_result_missing")
+                await self.repository.fail_run(run_id, "agent_execution_failed")
                 return
             await self.repository.complete_run(run_id, result.text)
         except asyncio.CancelledError:

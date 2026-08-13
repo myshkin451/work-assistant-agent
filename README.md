@@ -5,10 +5,11 @@ chat experience. It owns stable Thread, Run, Message, Event, Tool, cancellation,
 replay, and persistence semantics while reusing LangChain and LangGraph for the
 model/Tool loop.
 
-The first vertical slice is deliberately small but complete: a user asks for
-the current time in a named timezone, the model selects a read-only time Tool,
-the UI streams product events and sources, and PostgreSQL preserves the result
-for refresh and replay.
+The first vertical slice is deliberately small but complete: a user can ask for
+the current time and follow up with other places in the same conversation. The
+model uses a read-only time Tool once per Run, the UI streams stable product
+events and sources, and PostgreSQL preserves every turn for refresh, history
+switching, reconnect, and failure recovery.
 
 ![Completed time Tool run](output/playwright/t003-normal-flow.png)
 
@@ -35,9 +36,9 @@ Open `http://localhost:5173`. The checked-in default uses deterministic fake
 mode and no model credential. To use DeepSeek, set `MODEL_MODE=deepseek` and
 provide `DEEPSEEK_API_KEY` only in a local ignored secret source.
 
-Compose binds the database, API, and web UI to `127.0.0.1` only. This v0.1 has
-no production authentication and must not be exposed directly to a LAN or the
-public internet.
+Compose binds the database, API, and web UI to `127.0.0.1` only. The current
+v0.2 product contract has no production authentication and must not be exposed
+directly to a LAN or the public internet.
 
 ## Verification
 
@@ -60,12 +61,63 @@ message content:
 python3 scripts/compose_smoke.py
 ```
 
+The phase-2 smoke uses one Thread for Shanghai, London, and New York, deliberately
+disconnects and resumes the first SSE stream, checks idempotent replay, and then
+rebuilds all three Runs from the persisted Thread snapshot:
+
+```bash
+python3 scripts/phase2_compose_smoke.py conversation
+```
+
+For the redacted live-model lane, explicitly start Compose with a local secret,
+independently confirm the effective provider/model inside the backend, and use
+distinct evidence labels:
+
+```bash
+cp .env.example .env
+# Edit the ignored .env locally: set MODEL_MODE=deepseek,
+# DEEPSEEK_API_KEY, and DEEPSEEK_MODEL=deepseek-v4-flash.
+docker compose up -d --force-recreate backend frontend
+docker compose exec -T backend python -c \
+  'from work_assistant.settings import get_settings; s=get_settings(); print(s.model_mode, s.deepseek_model)'
+python3 scripts/phase2_compose_smoke.py conversation \
+  --lane deepseek_multiturn_e4 --model deepseek-v4-flash
+```
+
+The CLI `--model` value is an operator-supplied redacted evidence label; the
+container check above is the independent configuration proof. The smoke output
+contains only that label, timings, event types, counts, and boolean contract
+checks, never the credential, answers, Tool output, or exception details.
+
+To exercise hard-restart recovery, start a long fake Run, record the bounded
+IDs printed by `restart-create`, kill only the backend, restart it without
+deleting the PostgreSQL volume, and then verify the old and retry Runs:
+
+```bash
+FAKE_STEP_DELAY_SECONDS=10 docker compose up -d --force-recreate backend
+python3 scripts/phase2_compose_smoke.py restart-create
+docker compose kill -s SIGKILL backend
+FAKE_STEP_DELAY_SECONDS=0.02 docker compose up -d --no-deps backend
+python3 scripts/phase2_compose_smoke.py restart-verify \
+  --thread-id '<thread_id>' --run-id '<run_id>'
+```
+
 With `FAKE_STEP_DELAY_SECONDS=2` on the backend, the PostgreSQL concurrency
 smoke verifies 20 duplicate idempotency requests and 10 competing active Runs:
 
 ```bash
 python3 scripts/postgres_concurrency_smoke.py
 ```
+
+The included Compose topology is a single execution instance. On startup it
+closes orphaned active Runs as `service_restarted`; a multi-replica deployment
+must add explicit Run ownership before using that startup sweep.
+
+The next public-core milestone is intentionally split into four independently
+accepted slices: principal and ownership safety, the Agent policy kernel,
+controlled neutral Skill/MCP extension, and one downstream assembly and release
+path. A standalone neutral stdio MCP fixture may prepare later adapter tests, but
+it is not Host integration or Stage 3 acceptance evidence by itself.
 
 ## Public/private boundary
 

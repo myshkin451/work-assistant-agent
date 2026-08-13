@@ -1,0 +1,607 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from collections.abc import AsyncIterator, Sequence
+from pathlib import Path
+from typing import Any, cast, get_args
+
+import pytest
+
+from work_assistant.agent_runtime import AgentResult, AgentRunner, ProductEvent
+from work_assistant.db import Database
+from work_assistant.models import EventRecord, RunRecord, utc_now
+from work_assistant.repository import ProductRepository
+from work_assistant.schemas import (
+    Message,
+    ProductEventValidationError,
+    RunFailureCode,
+    RuntimeEventType,
+    validate_product_event,
+)
+from work_assistant.service import RunService
+from work_assistant.settings import Settings
+
+
+@pytest.fixture
+async def recovery_repository(tmp_path: Path) -> AsyncIterator[ProductRepository]:
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 't004-recovery.db'}")
+    await database.create_schema_for_tests()
+    try:
+        yield ProductRepository(database.session_factory)
+    finally:
+        await database.dispose()
+
+
+def service_for(
+    repository: ProductRepository,
+    runner: AgentRunner,
+    *,
+    run_timeout_seconds: float = 2,
+) -> RunService:
+    settings = Settings(
+        app_env="test",
+        database_url="sqlite+aiosqlite:///:memory:",
+        checkpoint_database_url="postgresql://unused:unused@localhost/unused",
+        model_mode="fake",
+        fake_step_delay_seconds=0,
+        run_timeout_seconds=run_timeout_seconds,
+    )
+    return RunService(repository=repository, runner=runner, settings=settings)
+
+
+class CapturingRunner:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, list[tuple[str, str, str | None]]]] = []
+
+    async def stream(
+        self, *, thread_id: str, run_id: str, messages: Sequence[Message]
+    ) -> AsyncIterator[ProductEvent | AgentResult]:
+        self.calls.append(
+            (
+                thread_id,
+                run_id,
+                [(message.role, message.content, message.run_id) for message in messages],
+            )
+        )
+        prompt = messages[-1].content
+        tool_call_id = f"tool-{run_id}"
+        yield ProductEvent(
+            "tool.started",
+            {
+                "tool_call_id": tool_call_id,
+                "name": "capture_context",
+                "label": "Capture conversation context",
+                "input_summary": prompt,
+            },
+        )
+        yield ProductEvent(
+            "tool.finished",
+            {
+                "tool_call_id": tool_call_id,
+                "name": "capture_context",
+                "label": "Capture conversation context",
+                "output_summary": "Context captured",
+            },
+        )
+        yield ProductEvent(
+            "source.added",
+            {
+                "source_id": "capture-source",
+                "label": "Capture source",
+                "description": "Deterministic test source",
+            },
+        )
+        yield ProductEvent("message.delta", {"delta": f"answer:{prompt}"})
+        yield AgentResult(text=f"answer:{prompt}")
+
+
+class InvalidEventRunner:
+    def __init__(self, event_type: str, data: dict[str, Any]) -> None:
+        self._event_type = event_type
+        self._data = data
+
+    async def stream(
+        self, *, thread_id: str, run_id: str, messages: Sequence[Message]
+    ) -> AsyncIterator[ProductEvent | AgentResult]:
+        del thread_id, run_id, messages
+        yield ProductEvent(self._event_type, self._data)
+        yield AgentResult(text="must not complete")
+
+
+class SlowRunner:
+    async def stream(
+        self, *, thread_id: str, run_id: str, messages: Sequence[Message]
+    ) -> AsyncIterator[ProductEvent | AgentResult]:
+        del thread_id, run_id, messages
+        await asyncio.sleep(0.05)
+        yield AgentResult(text="must time out")
+
+
+class RaisingRunner:
+    async def stream(
+        self, *, thread_id: str, run_id: str, messages: Sequence[Message]
+    ) -> AsyncIterator[ProductEvent | AgentResult]:
+        del thread_id, run_id, messages
+        yield ProductEvent("message.delta", {"delta": "safe prefix"})
+        raise RuntimeError("provider-secret-sentinel")
+
+
+async def test_three_runs_keep_messages_events_and_context_isolated(
+    recovery_repository: ProductRepository,
+) -> None:
+    repository = recovery_repository
+    runner = CapturingRunner()
+    service = service_for(repository, runner)
+    thread = await repository.create_thread("Three-turn context")
+    prompts = ("请查询当前上海时间。", "那伦敦呢？", "再看看纽约。")
+    run_ids: list[str] = []
+
+    for index, prompt in enumerate(prompts, start=1):
+        run = await service.create_run(
+            thread_id=thread.thread_id,
+            message=prompt,
+            idempotency_key=f"turn-{index}",
+        )
+        run_ids.append(run.run_id)
+        await service.wait_for_idle()
+        assert (await repository.get_run(run.run_id)).status == "completed"
+
+    snapshot = await repository.get_thread(thread.thread_id)
+    assert snapshot.active_run is None
+    assert [run.run_id for run in snapshot.runs] == run_ids
+    assert [message.role for message in snapshot.messages] == [
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+        "user",
+        "assistant",
+    ]
+    assert [message.run_id for message in snapshot.messages] == [
+        run_ids[0],
+        run_ids[0],
+        run_ids[1],
+        run_ids[1],
+        run_ids[2],
+        run_ids[2],
+    ]
+
+    for index, run in enumerate(snapshot.runs):
+        assert run.status == "completed"
+        assert [event.seq for event in run.events] == list(range(1, run.last_seq + 1))
+        assert all(event.run_id == run.run_id for event in run.events)
+        assert all(event.thread_id == thread.thread_id for event in run.events)
+        assert [event.type for event in run.events] == [
+            "run.started",
+            "tool.started",
+            "tool.finished",
+            "source.added",
+            "message.delta",
+            "message.completed",
+            "run.completed",
+        ]
+        tool_started = next(event for event in run.events if event.type == "tool.started")
+        assert tool_started.data["input_summary"] == prompts[index]
+
+    assert len(runner.calls) == 3
+    for index, (thread_id, run_id, captured) in enumerate(runner.calls):
+        expected_messages: list[tuple[str, str, str | None]] = []
+        for previous in range(index):
+            expected_messages.extend(
+                [
+                    ("user", prompts[previous], run_ids[previous]),
+                    ("assistant", f"answer:{prompts[previous]}", run_ids[previous]),
+                ]
+            )
+        expected_messages.append(("user", prompts[index], run_ids[index]))
+        assert thread_id == thread.thread_id
+        assert run_id == run_ids[index]
+        assert captured == expected_messages
+
+    await service.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("event_type", "data"),
+    [
+        pytest.param("future.runtime.event", {"marker": "private-runtime-payload"}, id="unknown"),
+        pytest.param(
+            "provider.reasoning",
+            {"reasoning": "private-runtime-payload"},
+            id="private",
+        ),
+        pytest.param(
+            "run.completed",
+            {"status": "completed", "marker": "private-runtime-payload"},
+            id="host-owned",
+        ),
+        pytest.param(
+            "tool.started",
+            {
+                "tool_call_id": "bad-tool",
+                "name": "get_current_time",
+                "input_summary": "private-runtime-payload",
+            },
+            id="bad-payload",
+        ),
+    ],
+)
+async def test_invalid_runtime_events_fail_without_persisting_or_skipping_sequence(
+    recovery_repository: ProductRepository,
+    event_type: str,
+    data: dict[str, Any],
+) -> None:
+    repository = recovery_repository
+    service = service_for(repository, InvalidEventRunner(event_type, data))
+    thread = await repository.create_thread(f"Invalid event: {event_type}")
+
+    run = await service.create_run(
+        thread_id=thread.thread_id,
+        message="Trigger invalid Runtime output",
+        idempotency_key=f"invalid-{event_type}",
+    )
+    await service.wait_for_idle()
+
+    failed = await repository.get_run(run.run_id)
+    events = await repository.get_events(run.run_id, 0)
+    assert failed.status == "failed"
+    assert failed.last_seq == 2
+    assert [event.seq for event in events] == [1, 2]
+    assert [event.type for event in events] == ["run.started", "run.failed"]
+    assert events[-1].data == {
+        "status": "failed",
+        "error_code": "agent_execution_failed",
+    }
+    serialized = json.dumps([event.model_dump(mode="json") for event in events])
+    assert event_type not in serialized
+    assert "private-runtime-payload" not in serialized
+
+    await service.shutdown()
+
+
+async def test_repository_rejects_invalid_events_before_reserving_sequence(
+    recovery_repository: ProductRepository,
+) -> None:
+    repository = recovery_repository
+    thread = await repository.create_thread("Repository validation")
+    run, created = await repository.create_run(
+        thread_id=thread.thread_id,
+        message="Keep the sequence contiguous",
+        idempotency_key="repository-invalid-event",
+    )
+    assert created is True
+    assert await repository.start_run(run.run_id) is True
+
+    invalid_events = [
+        (cast(RuntimeEventType, "provider.reasoning"), {"reasoning": "private"}),
+        (
+            cast(RuntimeEventType, "run.completed"),
+            {"status": "completed"},
+        ),
+        (
+            cast(RuntimeEventType, "run.failed"),
+            {"status": "failed", "error_code": "agent_execution_failed"},
+        ),
+        (
+            cast(RuntimeEventType, "message.completed"),
+            {
+                "message": {
+                    "message_id": "forged-assistant",
+                    "role": "assistant",
+                    "content": "forged",
+                    "created_at": "2026-08-13T00:00:00Z",
+                    "run_id": run.run_id,
+                }
+            },
+        ),
+        (
+            cast(RuntimeEventType, "tool.started"),
+            {"tool_call_id": "missing-fields"},
+        ),
+    ]
+    for event_type, data in invalid_events:
+        with pytest.raises(ProductEventValidationError):
+            await repository.append_active_event(run.run_id, event_type, data)
+        current = await repository.get_run(run.run_id)
+        assert current.status == "running"
+        assert current.last_seq == 1
+        assert [event.seq for event in await repository.get_events(run.run_id, 0)] == [1]
+
+    appended = await repository.append_active_event(
+        run.run_id,
+        "message.delta",
+        {"delta": "valid after rejected events"},
+    )
+    assert appended is not None
+    assert appended.seq == 2
+    await repository.cancel_run(run.run_id)
+    assert [event.seq for event in await repository.get_events(run.run_id, 0)] == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    ("runner", "timeout_seconds", "expected_code", "expected_types"),
+    [
+        pytest.param(
+            SlowRunner(),
+            0.005,
+            "run_timeout",
+            ["run.started", "run.failed"],
+            id="timeout",
+        ),
+        pytest.param(
+            RaisingRunner(),
+            2,
+            "agent_execution_failed",
+            ["run.started", "message.delta", "run.failed"],
+            id="provider-exception",
+        ),
+    ],
+)
+async def test_service_failures_are_bounded_contiguous_and_do_not_persist_exceptions(
+    recovery_repository: ProductRepository,
+    runner: AgentRunner,
+    timeout_seconds: float,
+    expected_code: str,
+    expected_types: list[str],
+) -> None:
+    repository = recovery_repository
+    service = service_for(
+        repository,
+        runner,
+        run_timeout_seconds=timeout_seconds,
+    )
+    thread = await repository.create_thread(f"Service failure: {expected_code}")
+    run = await service.create_run(
+        thread_id=thread.thread_id,
+        message="Exercise bounded failure",
+        idempotency_key=f"bounded-{expected_code}",
+    )
+    await service.wait_for_idle()
+
+    failed = await repository.get_run(run.run_id)
+    events = await repository.get_events(run.run_id, 0)
+    assert failed.status == "failed"
+    assert [event.seq for event in events] == list(range(1, len(events) + 1))
+    assert [event.type for event in events] == expected_types
+    assert events[-1].data == {"status": "failed", "error_code": expected_code}
+    serialized = json.dumps([event.model_dump(mode="json") for event in events])
+    assert "provider-secret-sentinel" not in serialized
+
+    await service.shutdown()
+
+
+async def test_orphan_sweep_is_idempotent_preserves_terminals_and_allows_new_run(
+    recovery_repository: ProductRepository,
+) -> None:
+    repository = recovery_repository
+
+    created_thread = await repository.create_thread("Created orphan")
+    created_orphan, _ = await repository.create_run(
+        thread_id=created_thread.thread_id,
+        message="Created before restart",
+        idempotency_key="created-orphan",
+    )
+
+    running_thread = await repository.create_thread("Running orphan")
+    running_orphan, _ = await repository.create_run(
+        thread_id=running_thread.thread_id,
+        message="Running before restart",
+        idempotency_key="running-orphan",
+    )
+    assert await repository.start_run(running_orphan.run_id) is True
+    await repository.append_active_event(
+        running_orphan.run_id,
+        "message.delta",
+        {"delta": "partial result"},
+    )
+
+    completed_thread = await repository.create_thread("Completed terminal")
+    completed, _ = await repository.create_run(
+        thread_id=completed_thread.thread_id,
+        message="Already complete",
+        idempotency_key="completed-terminal",
+    )
+    assert await repository.start_run(completed.run_id) is True
+    await repository.complete_run(completed.run_id, "completed answer")
+
+    cancelled_thread = await repository.create_thread("Cancelled terminal")
+    cancelled, _ = await repository.create_run(
+        thread_id=cancelled_thread.thread_id,
+        message="Already cancelled",
+        idempotency_key="cancelled-terminal",
+    )
+    assert await repository.start_run(cancelled.run_id) is True
+    await repository.cancel_run(cancelled.run_id)
+
+    terminal_event_counts = {
+        completed.run_id: len(await repository.get_events(completed.run_id, 0)),
+        cancelled.run_id: len(await repository.get_events(cancelled.run_id, 0)),
+    }
+    swept = await repository.fail_orphaned_runs()
+    assert {run.run_id for run in swept} == {created_orphan.run_id, running_orphan.run_id}
+
+    for orphan_id in (created_orphan.run_id, running_orphan.run_id):
+        orphan = await repository.get_run(orphan_id)
+        events = await repository.get_events(orphan_id, 0)
+        assert orphan.status == "failed"
+        assert [event.seq for event in events] == list(range(1, orphan.last_seq + 1))
+        assert events[-1].type == "run.failed"
+        assert events[-1].data == {
+            "status": "failed",
+            "error_code": "service_restarted",
+        }
+
+    orphan_event_counts = {
+        orphan_id: len(await repository.get_events(orphan_id, 0))
+        for orphan_id in (created_orphan.run_id, running_orphan.run_id)
+    }
+    assert await repository.fail_orphaned_runs() == []
+    assert {
+        orphan_id: len(await repository.get_events(orphan_id, 0))
+        for orphan_id in orphan_event_counts
+    } == orphan_event_counts
+
+    assert (await repository.get_run(completed.run_id)).status == "completed"
+    assert (await repository.get_run(cancelled.run_id)).status == "cancelled"
+    assert {
+        completed.run_id: len(await repository.get_events(completed.run_id, 0)),
+        cancelled.run_id: len(await repository.get_events(cancelled.run_id, 0)),
+    } == terminal_event_counts
+
+    same_run, created = await repository.create_run(
+        thread_id=created_thread.thread_id,
+        message="Must return immutable old Run",
+        idempotency_key="created-orphan",
+    )
+    assert created is False
+    assert same_run.run_id == created_orphan.run_id
+    assert same_run.status == "failed"
+
+    retry_runner = CapturingRunner()
+    retry_service = service_for(repository, retry_runner)
+    retry = await retry_service.create_run(
+        thread_id=created_thread.thread_id,
+        message="Retry after restart",
+        idempotency_key="created-orphan-retry",
+    )
+    await retry_service.wait_for_idle()
+    assert retry.run_id != created_orphan.run_id
+    assert (await repository.get_run(retry.run_id)).status == "completed"
+    assert (await repository.get_run(created_orphan.run_id)).status == "failed"
+    await retry_service.shutdown()
+
+
+async def test_failure_codes_are_frozen_and_stream_unavailable_cannot_be_terminal(
+    recovery_repository: ProductRepository,
+) -> None:
+    repository = recovery_repository
+    frozen_codes = {"run_timeout", "agent_execution_failed", "service_restarted"}
+    assert set(get_args(RunFailureCode)) == frozen_codes
+    for code in frozen_codes:
+        assert validate_product_event(
+            "run.failed",
+            {"status": "failed", "error_code": code},
+        )["error_code"] == code
+    with pytest.raises(ProductEventValidationError):
+        validate_product_event(
+            "run.failed",
+            {"status": "failed", "error_code": "stream_unavailable"},
+        )
+
+    thread = await repository.create_thread("Failure code rollback")
+    run, _ = await repository.create_run(
+        thread_id=thread.thread_id,
+        message="Reject connection-only state",
+        idempotency_key="stream-unavailable",
+    )
+    assert await repository.start_run(run.run_id) is True
+    with pytest.raises(ProductEventValidationError):
+        await repository.fail_run(run.run_id, cast(RunFailureCode, "stream_unavailable"))
+    still_running = await repository.get_run(run.run_id)
+    assert still_running.status == "running"
+    assert still_running.last_seq == 1
+    assert [event.type for event in await repository.get_events(run.run_id, 0)] == [
+        "run.started"
+    ]
+
+    await repository.fail_run(run.run_id, "run_timeout")
+    events = await repository.get_events(run.run_id, 0)
+    assert [event.seq for event in events] == [1, 2]
+    assert events[-1].data["error_code"] == "run_timeout"
+
+
+async def test_v01_result_missing_is_normalized_only_for_stored_event_reads(
+    recovery_repository: ProductRepository,
+) -> None:
+    repository = recovery_repository
+    legacy = {"status": "failed", "error_code": "agent_result_missing"}
+    with pytest.raises(ProductEventValidationError):
+        validate_product_event("run.failed", legacy)
+
+    thread = await repository.create_thread("v0.1 compatibility")
+    run, _ = await repository.create_run(
+        thread_id=thread.thread_id,
+        message="Read the legacy terminal event",
+        idempotency_key="legacy-result-missing",
+    )
+    assert await repository.start_run(run.run_id) is True
+    now = utc_now()
+    async with repository._sessions() as session, session.begin():  # noqa: SLF001
+        stored_run = await session.get(RunRecord, run.run_id)
+        assert stored_run is not None
+        stored_run.status = "failed"
+        stored_run.last_seq = 2
+        stored_run.completed_at = now
+        session.add(
+            EventRecord(
+                id="legacy-agent-result-missing",
+                run_id=run.run_id,
+                thread_id=thread.thread_id,
+                seq=2,
+                type="run.failed",
+                occurred_at=now,
+                payload=legacy,
+            )
+        )
+
+    expected = {"status": "failed", "error_code": "agent_execution_failed"}
+    events = await repository.get_events(run.run_id, 0)
+    snapshot = await repository.get_thread(thread.thread_id)
+    assert events[-1].data == expected
+    assert snapshot.runs[0].events[-1].data == expected
+    assert legacy["error_code"] == "agent_result_missing"
+
+
+async def test_failed_and_cancelled_user_messages_do_not_enter_later_context(
+    recovery_repository: ProductRepository,
+) -> None:
+    repository = recovery_repository
+    thread = await repository.create_thread("Committed context only")
+
+    completed, _ = await repository.create_run(
+        thread_id=thread.thread_id,
+        message="completed question",
+        idempotency_key="completed",
+    )
+    assert await repository.start_run(completed.run_id) is True
+    await repository.complete_run(completed.run_id, "completed answer")
+
+    failed, _ = await repository.create_run(
+        thread_id=thread.thread_id,
+        message="failed question must stay out",
+        idempotency_key="failed",
+    )
+    assert await repository.start_run(failed.run_id) is True
+    await repository.fail_run(failed.run_id, "agent_execution_failed")
+
+    cancelled, _ = await repository.create_run(
+        thread_id=thread.thread_id,
+        message="cancelled question must stay out",
+        idempotency_key="cancelled",
+    )
+    assert await repository.start_run(cancelled.run_id) is True
+    await repository.cancel_run(cancelled.run_id)
+
+    runner = CapturingRunner()
+    service = service_for(repository, runner)
+    current = await service.create_run(
+        thread_id=thread.thread_id,
+        message="current question",
+        idempotency_key="current",
+    )
+    await service.wait_for_idle()
+
+    assert len(runner.calls) == 1
+    thread_id, run_id, captured = runner.calls[0]
+    assert thread_id == thread.thread_id
+    assert run_id == current.run_id
+    assert captured == [
+        ("user", "completed question", completed.run_id),
+        ("assistant", "completed answer", completed.run_id),
+        ("user", "current question", current.run_id),
+    ]
+    assert "failed question must stay out" not in {content for _, content, _ in captured}
+    assert "cancelled question must stay out" not in {content for _, content, _ in captured}
+
+    await service.shutdown()

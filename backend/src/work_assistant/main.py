@@ -21,6 +21,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         database = Database(resolved.database_url)
         repository = ProductRepository(database.session_factory)
+        # The current deployment contract has one executing backend process. Any
+        # active Run present before this process accepts traffic belonged to a lost
+        # executor and must become an immutable, retryable product failure.
+        await repository.fail_orphaned_runs()
         async with runtime_for_settings(resolved) as runner:
             service = RunService(repository=repository, runner=runner, settings=resolved)
             app.state.settings = resolved

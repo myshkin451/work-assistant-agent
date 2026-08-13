@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import uuid4
 
-from sqlalchemy import Select, select, update
+from sqlalchemy import Select, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -13,10 +13,17 @@ from .schemas import (
     EventEnvelope,
     Message,
     MessageRole,
+    ProductEventType,
+    RunFailureCode,
+    RunSnapshot,
     RunStatus,
+    RuntimeEventType,
     RunView,
     ThreadSnapshot,
     ThreadSummary,
+    normalize_stored_product_event,
+    validate_product_event,
+    validate_runtime_event,
 )
 
 ACTIVE_STATUSES = ("created", "running")
@@ -72,10 +79,14 @@ def _event_view(record: EventRecord) -> EventEnvelope:
         run_id=record.run_id,
         thread_id=record.thread_id,
         seq=record.seq,
-        type=record.type,
+        type=cast(ProductEventType, record.type),
         occurred_at=_aware(record.occurred_at),
-        data=record.payload,
+        data=normalize_stored_product_event(record.type, record.payload),
     )
+
+
+def _run_snapshot(record: RunRecord, events: list[EventEnvelope]) -> RunSnapshot:
+    return RunSnapshot(**_run_view(record).model_dump(), events=events)
 
 
 class ProductRepository:
@@ -92,7 +103,12 @@ class ProductRepository:
         )
         async with self._sessions() as session, session.begin():
             session.add(record)
-        return ThreadSnapshot(**_thread_summary(record).model_dump(), messages=[], active_run=None)
+        return ThreadSnapshot(
+            **_thread_summary(record).model_dump(),
+            messages=[],
+            runs=[],
+            active_run=None,
+        )
 
     async def list_threads(self) -> list[ThreadSummary]:
         async with self._sessions() as session:
@@ -117,10 +133,28 @@ class ProductRepository:
                     .order_by(MessageRecord.created_at, MessageRecord.id)
                 )
             ).all()
-            active = await session.scalar(self._active_run_query(thread_id))
+            runs = (
+                await session.scalars(
+                    select(RunRecord)
+                    .where(RunRecord.thread_id == thread_id)
+                    .order_by(RunRecord.created_at, RunRecord.id)
+                )
+            ).all()
+            events = (
+                await session.scalars(
+                    select(EventRecord)
+                    .where(EventRecord.thread_id == thread_id)
+                    .order_by(EventRecord.run_id, EventRecord.seq)
+                )
+            ).all()
+        events_by_run: dict[str, list[EventEnvelope]] = {}
+        for event in events:
+            events_by_run.setdefault(event.run_id, []).append(_event_view(event))
+        active = next((run for run in runs if run.status in ACTIVE_STATUSES), None)
         return ThreadSnapshot(
             **_thread_summary(thread).model_dump(),
             messages=[_message_view(message) for message in messages],
+            runs=[_run_snapshot(run, events_by_run.get(run.id, [])) for run in runs],
             active_run=_run_view(active) if active else None,
         )
 
@@ -193,20 +227,26 @@ class ProductRepository:
                 raise ResourceNotFoundError("run")
             return _run_view(run)
 
-    async def get_run_input(self, run_id: str) -> tuple[str, str]:
+    async def get_run_context(self, run_id: str) -> tuple[str, list[Message]]:
         async with self._sessions() as session:
             run = await session.get(RunRecord, run_id)
             if run is None:
                 raise ResourceNotFoundError("run")
-            message = await session.scalar(
-                select(MessageRecord).where(
-                    MessageRecord.run_id == run_id,
-                    MessageRecord.role == "user",
+            records = (
+                await session.scalars(
+                    select(MessageRecord)
+                    .join(RunRecord, MessageRecord.run_id == RunRecord.id)
+                    .where(
+                        MessageRecord.thread_id == run.thread_id,
+                        or_(RunRecord.status == "completed", RunRecord.id == run_id),
+                    )
+                    .order_by(MessageRecord.created_at, MessageRecord.id)
                 )
-            )
-            if message is None:
+            ).all()
+            messages = [_message_view(record) for record in records]
+            if not any(message.run_id == run_id and message.role == "user" for message in messages):
                 raise ResourceNotFoundError("message")
-            return run.thread_id, message.content
+            return run.thread_id, messages
 
     async def start_run(self, run_id: str) -> bool:
         async with self._sessions() as session, session.begin():
@@ -226,8 +266,9 @@ class ProductRepository:
         return True
 
     async def append_active_event(
-        self, run_id: str, event_type: str, data: dict[str, Any]
+        self, run_id: str, event_type: RuntimeEventType, data: dict[str, Any]
     ) -> EventEnvelope | None:
+        event_type, validated = validate_runtime_event(event_type, data)
         async with self._sessions() as session, session.begin():
             run = await session.scalar(
                 update(RunRecord)
@@ -239,7 +280,7 @@ class ProductRepository:
                 if await session.get(RunRecord, run_id) is None:
                     raise ResourceNotFoundError("run")
                 return None
-            event = self._event_record(run, event_type, data)
+            event = self._event_record(run, event_type, validated)
             session.add(event)
         return _event_view(event)
 
@@ -293,7 +334,7 @@ class ProductRepository:
                 thread.updated_at = now
         return _run_view(run)
 
-    async def fail_run(self, run_id: str, error_code: str) -> RunView:
+    async def fail_run(self, run_id: str, error_code: RunFailureCode) -> RunView:
         now = utc_now()
         async with self._sessions() as session, session.begin():
             run = await session.scalar(
@@ -319,6 +360,9 @@ class ProductRepository:
                     occurred_at=now,
                 )
             )
+            thread = await session.get(ThreadRecord, run.thread_id)
+            if thread is not None:
+                thread.updated_at = now
         return _run_view(run)
 
     async def cancel_run(self, run_id: str) -> RunView:
@@ -347,7 +391,45 @@ class ProductRepository:
                     occurred_at=now,
                 )
             )
+            thread = await session.get(ThreadRecord, run.thread_id)
+            if thread is not None:
+                thread.updated_at = now
         return _run_view(run)
+
+    async def fail_orphaned_runs(self) -> list[RunView]:
+        """Close work owned by a previous process before this executor accepts traffic.
+
+        This sweep is intentionally scoped to the single-executor deployment supported by
+        the current release. A multi-replica deployment requires ownership leases first.
+        """
+
+        now = utc_now()
+        async with self._sessions() as session, session.begin():
+            runs = (
+                await session.scalars(
+                    update(RunRecord)
+                    .where(RunRecord.status.in_(ACTIVE_STATUSES))
+                    .values(
+                        status="failed",
+                        completed_at=now,
+                        last_seq=RunRecord.last_seq + 1,
+                    )
+                    .returning(RunRecord)
+                )
+            ).all()
+            for run in runs:
+                session.add(
+                    self._event_record(
+                        run,
+                        "run.failed",
+                        {"status": "failed", "error_code": "service_restarted"},
+                        occurred_at=now,
+                    )
+                )
+                thread = await session.get(ThreadRecord, run.thread_id)
+                if thread is not None:
+                    thread.updated_at = now
+        return [_run_view(run) for run in runs]
 
     async def get_events(self, run_id: str, after_seq: int) -> list[EventEnvelope]:
         async with self._sessions() as session:
@@ -379,6 +461,7 @@ class ProductRepository:
         seq: int | None = None,
         occurred_at: datetime | None = None,
     ) -> EventRecord:
+        validated = validate_product_event(event_type, data)
         return EventRecord(
             id=str(uuid4()),
             run_id=run.id,
@@ -386,5 +469,5 @@ class ProductRepository:
             seq=run.last_seq if seq is None else seq,
             type=event_type,
             occurred_at=occurred_at or utc_now(),
-            payload=data,
+            payload=validated,
         )

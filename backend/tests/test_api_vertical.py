@@ -177,7 +177,11 @@ async def test_cancel_and_event_append_reserve_distinct_sequences(
         repository.append_active_event(
             run.run_id,
             "tool.started",
-            {"tool_call_id": "race-1", "name": "get_current_time"},
+            {
+                "tool_call_id": "race-1",
+                "name": "get_current_time",
+                "label": "Read current time",
+            },
         ),
         repository.cancel_run(run.run_id),
     )

@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import json
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -16,6 +17,7 @@ from .agent_runtime import (
     RuntimeConfigurationError,
     runtime_for_settings,
 )
+from .schemas import Message
 from .settings import Settings
 
 
@@ -29,10 +31,19 @@ async def _run(env_file: Path | None, timezone: str) -> int:
         event_types: list[str] = []
         result: AgentResult | None = None
         async with runtime_for_settings(settings) as runner:
+            run_id = f"live-smoke-{uuid4()}"
             async for item in runner.stream(
                 thread_id=f"live-smoke-{uuid4()}",
-                run_id=f"live-smoke-{uuid4()}",
-                message=f"What is the current time in {timezone}?",
+                run_id=run_id,
+                messages=[
+                    Message(
+                        message_id=f"live-smoke-{uuid4()}",
+                        role="user",
+                        content=f"What is the current time in {timezone}?",
+                        created_at=datetime.now(UTC),
+                        run_id=run_id,
+                    )
+                ],
             ):
                 if isinstance(item, ProductEvent):
                     event_types.append(item.type)
