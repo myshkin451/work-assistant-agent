@@ -15,6 +15,10 @@ from concurrent.futures import ThreadPoolExecutor
 
 
 BASE_URL = os.environ.get("WORK_ASSISTANT_API_URL", "http://127.0.0.1:8000").rstrip("/")
+DEV_PRINCIPAL = os.environ.get(
+    "WORK_ASSISTANT_DEV_PRINCIPAL",
+    "urn:work-assistant:neutral:concurrency-smoke",
+)
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
@@ -32,7 +36,11 @@ def request_json(
         f"{BASE_URL}{path}",
         data=data,
         method=method,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Work-Assistant-Dev-Subject": DEV_PRINCIPAL,
+        },
     )
     try:
         with OPENER.open(request, timeout=15) as response:

@@ -21,7 +21,8 @@ services:
     build:
       context: ./backend
     environment:
-      APP_ENV: development
+      APP_ENV: ${APP_ENV:-development}
+      IDENTITY_PROVIDER_MODE: ${IDENTITY_PROVIDER_MODE:-anonymous}
       DATABASE_URL: postgresql+psycopg://work_assistant:work_assistant@postgres:5432/work_assistant
       CHECKPOINT_DATABASE_URL: postgresql://work_assistant:work_assistant@postgres:5432/work_assistant
       MODEL_MODE: ${MODEL_MODE:-fake}

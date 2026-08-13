@@ -2,8 +2,8 @@
 
 Work Assistant Agent is a neutral, open-source Agent Host with a real employee
 chat experience. It owns stable Thread, Run, Message, Event, Tool, cancellation,
-replay, and persistence semantics while reusing LangChain and LangGraph for the
-model/Tool loop.
+replay, persistence, and subject-scoped ownership semantics while reusing
+LangChain and LangGraph for the model/Tool loop.
 
 The first vertical slice is deliberately small but complete: a user can ask for
 the current time and follow up with other places in the same conversation. The
@@ -33,12 +33,17 @@ docker compose up --build
 ```
 
 Open `http://localhost:5173`. The checked-in default uses deterministic fake
-mode and no model credential. To use DeepSeek, set `MODEL_MODE=deepseek` and
-provide `DEEPSEEK_API_KEY` only in a local ignored secret source.
+mode, no model credential, and the explicitly configured single-Principal
+`anonymous` development identity. To use DeepSeek, set `MODEL_MODE=deepseek`
+and provide `DEEPSEEK_API_KEY` only in a local ignored secret source.
 
-Compose binds the database, API, and web UI to `127.0.0.1` only. The current
-v0.2 product contract has no production authentication and must not be exposed
-directly to a LAN or the public internet.
+Compose binds the database, API, and web UI to `127.0.0.1` only. Anonymous mode
+is not a production identity system and must not be exposed to a LAN or the
+public internet. The default server identity mode is `external`: a production
+deployment must inject a real neutral `IdentityProvider`, and startup fails
+closed if it does not. The public core defines no company login or token format.
+See the
+[`Principal and ownership contract`](docs/contracts/identity-and-ownership.md).
 
 ## Verification
 
@@ -60,6 +65,29 @@ message content:
 ```bash
 python3 scripts/compose_smoke.py
 ```
+
+For the two-Principal ownership lane, start an isolated Compose project with the
+development header provider and a deliberately slow fake Run so cancellation is
+observable, then run the bounded identity smoke:
+
+```bash
+COMPOSE_DISABLE_ENV_FILE=1 APP_ENV=development \
+  IDENTITY_PROVIDER_MODE=development_header MODEL_MODE=fake \
+  FAKE_STEP_DELAY_SECONDS=1 \
+  docker compose --env-file /dev/null -p work-assistant-t005-e3 up --build
+python3 scripts/identity_compose_smoke.py
+```
+
+The smoke covers owner-filtered list/detail, independent same-key idempotency,
+cross-subject denial, cancellation, retry, SSE `after_seq`, `Last-Event-ID`, and
+re-authentication on reconnect. The development subject header is confined to
+loopback tests; it is not placed in frontend configuration, URLs, browser
+storage, product payloads, or smoke output.
+
+Migration `0002_principal_ownership` requires a live database connection but an
+exclusive application downtime window. It preserves v0.2 rows under an
+unclaimable internal quarantine subject; it does not support offline `--sql`
+generation or a non-empty downgrade to the unauthenticated schema.
 
 The phase-2 smoke uses one Thread for Shanghai, London, and New York, deliberately
 disconnects and resumes the first SSE stream, checks idempotent replay, and then
@@ -113,11 +141,11 @@ The included Compose topology is a single execution instance. On startup it
 closes orphaned active Runs as `service_restarted`; a multi-replica deployment
 must add explicit Run ownership before using that startup sweep.
 
-The next public-core milestone is intentionally split into four independently
+The public-core Stage 3 milestone is intentionally split into four independently
 accepted slices: principal and ownership safety, the Agent policy kernel,
 controlled neutral Skill/MCP extension, and one downstream assembly and release
-path. A standalone neutral stdio MCP fixture may prepare later adapter tests, but
-it is not Host integration or Stage 3 acceptance evidence by itself.
+path. This repository does not treat a standalone neutral MCP fixture as Host
+integration or Stage 3 acceptance evidence.
 
 ## Public/private boundary
 

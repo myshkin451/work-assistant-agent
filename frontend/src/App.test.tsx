@@ -95,6 +95,125 @@ function runSnapshot(run: RunView, events: ProductEvent[]): RunSnapshot {
 }
 
 describe('employee chat vertical slice', () => {
+  it('blocks all interaction when the initial request is unauthenticated', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse({ detail: { code: 'authentication_required' } }, 401),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+
+    expect(
+      await screen.findByText('当前请求未通过身份认证，请完成认证后刷新页面。'),
+    ).toBeInTheDocument();
+    expect(screen.getByLabelText('向 Work Assistant 提问')).toBeDisabled();
+    expect(screen.queryByText('从一个真实工具开始')).not.toBeInTheDocument();
+    for (const button of screen.getAllByRole('button', { name: '新建对话' })) {
+      expect(button).toBeDisabled();
+    }
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/threads',
+      expect.objectContaining({ credentials: 'include' }),
+    );
+  });
+
+  it('clears another principal\'s rendered state when SSE reauthorization is forbidden', async () => {
+    const privateMessage: Message = {
+      ...userMessage,
+      content: 'A 主体的私密会话正文',
+    };
+    const activeRun = { ...running, last_seq: 1 };
+    const privateSnapshot: ThreadSnapshot = {
+      ...summary,
+      title: 'A 主体私密历史',
+      messages: [privateMessage],
+      runs: [runSnapshot(activeRun, [event(1, 'run.started', { status: 'running' })])],
+      active_run: activeRun,
+    };
+    let resolveSse!: (response: Response) => void;
+    const deferredSse = new Promise<Response>((resolve) => {
+      resolveSse = resolve;
+    });
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/api/threads' && method === 'GET') return jsonResponse({ items: [summary] });
+      if (url === '/api/threads/thread-1' && method === 'GET') return jsonResponse(privateSnapshot);
+      if (url === '/api/runs/run-1/events?after_seq=1') {
+        return deferredSse;
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+
+    expect(await screen.findByText(privateMessage.content)).toBeInTheDocument();
+    expect(screen.getByText(privateSnapshot.title)).toBeInTheDocument();
+    resolveSse(jsonResponse({ detail: { code: 'run_forbidden' } }, 403));
+    expect(
+      await screen.findByText('当前身份无权访问这项会话或运行。'),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(privateMessage.content)).not.toBeInTheDocument();
+    expect(screen.queryByText(privateSnapshot.title)).not.toBeInTheDocument();
+    expect(screen.getByLabelText('向 Work Assistant 提问')).toBeDisabled();
+    expect(screen.queryByRole('button', { name: '停止运行' })).not.toBeInTheDocument();
+  });
+
+  it('does not let a late request restore state after access is blocked', async () => {
+    const otherSummary: ThreadSummary = {
+      ...summary,
+      thread_id: 'thread-2',
+      title: '触发重新鉴权',
+    };
+    const idleSnapshot: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage],
+      runs: [],
+      active_run: null,
+    };
+    let resolveCreateRun!: (response: Response) => void;
+    const deferredCreateRun = new Promise<Response>((resolve) => {
+      resolveCreateRun = resolve;
+    });
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/api/threads' && method === 'GET') {
+        return jsonResponse({ items: [summary, otherSummary] });
+      }
+      if (url === '/api/threads/thread-1' && method === 'GET') return jsonResponse(idleSnapshot);
+      if (url === '/api/threads/thread-1/runs' && method === 'POST') {
+        return deferredCreateRun;
+      }
+      if (url === '/api/threads/thread-2' && method === 'GET') {
+        return jsonResponse({ detail: { code: 'thread_forbidden' } }, 403);
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+    render(<App />);
+
+    expect(await screen.findByText(userMessage.content)).toBeInTheDocument();
+    const composer = screen.getByLabelText('向 Work Assistant 提问');
+    await user.type(composer, 'A 主体尚未发送完成的草稿');
+    await user.click(screen.getByRole('button', { name: '发送消息' }));
+    await user.click(screen.getByRole('button', { name: otherSummary.title }));
+
+    expect(
+      await screen.findByText('当前身份无权访问这项会话或运行。'),
+    ).toBeInTheDocument();
+    resolveCreateRun(jsonResponse({ detail: { code: 'service_failure' } }, 500));
+    await waitFor(() => {
+      expect(screen.getByRole('alert')).toHaveTextContent(
+        '当前身份无权访问这项会话或运行。',
+      );
+    });
+    expect(composer).toHaveValue('');
+    expect(composer).toBeDisabled();
+    expect(screen.queryByText(userMessage.content)).not.toBeInTheDocument();
+    expect(screen.queryByText('A 主体尚未发送完成的草稿')).not.toBeInTheDocument();
+  });
+
   it('creates a real run and renders deduplicated product events, tools and sources', async () => {
     const emptyList = { items: [] as ThreadSummary[] };
     const emptySnapshot: ThreadSnapshot = { ...summary, messages: [], runs: [], active_run: null };
@@ -199,7 +318,7 @@ describe('employee chat vertical slice', () => {
     expect(screen.queryByText('不应显示的内部思考')).not.toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/runs/run-1/events?after_seq=0',
-      expect.objectContaining({ credentials: 'omit' }),
+      expect.objectContaining({ credentials: 'include' }),
     );
   });
 
@@ -276,7 +395,7 @@ describe('employee chat vertical slice', () => {
     expect(await screen.findByText(assistantMessage.content)).toBeInTheDocument();
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/runs/run-1/events?after_seq=4',
-      expect.objectContaining({ credentials: 'omit' }),
+      expect.objectContaining({ credentials: 'include' }),
     );
     expect(screen.queryByText('重复来源')).not.toBeInTheDocument();
   });

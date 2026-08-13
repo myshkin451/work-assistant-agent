@@ -232,6 +232,10 @@ function displayError(error: unknown) {
   return '无法连接服务，请确认后端已经启动。';
 }
 
+function isAccessError(error: unknown): error is ApiError {
+  return error instanceof ApiError && (error.status === 401 || error.status === 403);
+}
+
 export function App() {
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [snapshot, setSnapshot] = useState<ThreadSnapshot | null>(null);
@@ -240,20 +244,43 @@ export function App() {
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [accessBlocked, setAccessBlocked] = useState(false);
   const selectedThreadRef = useRef<string | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
   const submittingRef = useRef(false);
+  const accessBlockedRef = useRef(false);
   const conversationEndRef = useRef<HTMLDivElement | null>(null);
 
+  const blockAccess = useCallback((accessError: unknown) => {
+    if (accessBlockedRef.current) return true;
+    if (!isAccessError(accessError)) return false;
+    accessBlockedRef.current = true;
+    submittingRef.current = false;
+    streamAbortRef.current?.abort();
+    selectedThreadRef.current = null;
+    setThreads([]);
+    setSnapshot(null);
+    setProjectionsByRunId({});
+    setInput('');
+    setSubmitting(false);
+    setLoading(false);
+    setAccessBlocked(true);
+    setError(displayError(accessError));
+    return true;
+  }, []);
+
   const refreshThreads = useCallback(async () => {
+    if (accessBlockedRef.current) return [];
     const items = await listThreads();
+    if (accessBlockedRef.current) return [];
     setThreads(items);
     return items;
   }, []);
 
   const refreshSnapshot = useCallback(async (threadId: string) => {
+    if (accessBlockedRef.current) return null;
     const fresh = await getThread(threadId);
-    if (selectedThreadRef.current === threadId) {
+    if (!accessBlockedRef.current && selectedThreadRef.current === threadId) {
       setSnapshot(fresh);
       setProjectionsByRunId(projectionsFromSnapshot(fresh));
     }
@@ -262,7 +289,7 @@ export function App() {
 
   const connectRun = useCallback(
     (run: RunView, initialProjection: RunProjection = createProjection(run)) => {
-      if (isTerminalStatus(run.status)) return;
+      if (accessBlockedRef.current || isTerminalStatus(run.status)) return;
       streamAbortRef.current?.abort();
       const controller = new AbortController();
       streamAbortRef.current = controller;
@@ -333,8 +360,9 @@ export function App() {
             },
             controller.signal,
           );
-        } catch {
+        } catch (streamError) {
           if (!isCurrentStream()) return;
+          if (blockAccess(streamError)) return;
           setProjectionsByRunId((current) => {
             const projection = current[run.run_id];
             return projection
@@ -348,18 +376,20 @@ export function App() {
         try {
           await Promise.all([refreshSnapshot(run.thread_id), refreshThreads()]);
           if (isCurrentStream()) setError(null);
-        } catch {
+        } catch (refreshError) {
+          if (blockAccess(refreshError)) return;
           // A persisted terminal event is already authoritative. A background
           // snapshot/list refresh may fail during the same short outage and
           // must not leave a stale global service alert after recovery.
         }
       })();
     },
-    [refreshSnapshot, refreshThreads],
+    [blockAccess, refreshSnapshot, refreshThreads],
   );
 
   const openThread = useCallback(
     async (threadId: string) => {
+      if (accessBlockedRef.current) return;
       streamAbortRef.current?.abort();
       selectedThreadRef.current = threadId;
       setLoading(true);
@@ -368,6 +398,7 @@ export function App() {
       setProjectionsByRunId({});
       try {
         const fresh = await getThread(threadId);
+        if (accessBlockedRef.current) return;
         if (selectedThreadRef.current !== threadId) return;
         const projections = projectionsFromSnapshot(fresh);
         setSnapshot(fresh);
@@ -379,12 +410,14 @@ export function App() {
           );
         }
       } catch (openError) {
-        if (selectedThreadRef.current === threadId) setError(displayError(openError));
+        if (!blockAccess(openError) && selectedThreadRef.current === threadId) {
+          setError(displayError(openError));
+        }
       } finally {
         if (selectedThreadRef.current === threadId) setLoading(false);
       }
     },
-    [connectRun],
+    [blockAccess, connectRun],
   );
 
   useEffect(() => {
@@ -397,15 +430,17 @@ export function App() {
       })
       .catch((initialError: unknown) => {
         if (!disposed) {
-          setError(displayError(initialError));
-          setLoading(false);
+          if (!blockAccess(initialError)) {
+            setError(displayError(initialError));
+            setLoading(false);
+          }
         }
       });
     return () => {
       disposed = true;
       streamAbortRef.current?.abort();
     };
-  }, [openThread, refreshThreads]);
+  }, [blockAccess, openThread, refreshThreads]);
 
   useEffect(() => {
     conversationEndRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' });
@@ -417,22 +452,23 @@ export function App() {
   ]);
 
   const startNewThread = useCallback(async () => {
-    if (submittingRef.current) return;
+    if (submittingRef.current || accessBlockedRef.current) return;
     streamAbortRef.current?.abort();
     setError(null);
     setLoading(true);
     try {
       const created = await createThread();
+      if (accessBlockedRef.current) return;
       selectedThreadRef.current = created.thread_id;
       setSnapshot(created);
       setProjectionsByRunId(projectionsFromSnapshot(created));
       await refreshThreads();
     } catch (newThreadError) {
-      setError(displayError(newThreadError));
+      if (!blockAccess(newThreadError)) setError(displayError(newThreadError));
     } finally {
       setLoading(false);
     }
-  }, [refreshThreads]);
+  }, [blockAccess, refreshThreads]);
 
   const activeProjection = useMemo(() => {
     const activeRunId = snapshot?.active_run?.run_id;
@@ -451,6 +487,7 @@ export function App() {
     const message = rawMessage.trim();
     if (
       !message ||
+      accessBlockedRef.current ||
       submittingRef.current ||
       (activeProjection && !isTerminalStatus(activeProjection.run.status))
     ) {
@@ -466,6 +503,7 @@ export function App() {
     try {
       if (!target) {
         target = await createThread(titleFromMessage(message));
+        if (accessBlockedRef.current) return;
         selectedThreadRef.current = target.thread_id;
         setSnapshot(target);
         setProjectionsByRunId(projectionsFromSnapshot(target));
@@ -477,6 +515,7 @@ export function App() {
           : current,
       );
       const run = await createRun(threadId, message, idempotencyKey);
+      if (accessBlockedRef.current) return;
       const persistedPending = { ...pending, run_id: run.run_id };
       const initialProjection = createProjection(run);
       if (selectedThreadRef.current === threadId) {
@@ -513,16 +552,19 @@ export function App() {
             fresh.active_run?.run_id === run.run_id &&
             !isTerminalStatus(projectionToConnect.run.status);
         }
-      } catch {
+      } catch (snapshotError) {
+        if (blockAccess(snapshotError)) return;
         // The optimistic user message remains visible while the event stream proceeds.
       }
       if (selectedThreadRef.current === threadId && shouldConnect) {
         connectRun(run, projectionToConnect);
       }
       void refreshThreads().catch((refreshError: unknown) => {
+        if (blockAccess(refreshError)) return;
         if (selectedThreadRef.current === threadId) setError(displayError(refreshError));
       });
     } catch (submitError) {
+      if (blockAccess(submitError)) return;
       if (restoreComposerOnFailure) setInput(message);
       setSnapshot((current) =>
         current
@@ -534,7 +576,7 @@ export function App() {
       submittingRef.current = false;
       setSubmitting(false);
     }
-  }, [activeProjection, connectRun, refreshThreads, snapshot]);
+  }, [activeProjection, blockAccess, connectRun, refreshThreads, snapshot]);
 
   const submitMessage = useCallback(async () => {
     const message = input.trim();
@@ -559,6 +601,7 @@ export function App() {
 
   const stopRun = useCallback(async () => {
     if (
+      accessBlockedRef.current ||
       !activeProjection ||
       isTerminalStatus(activeProjection.run.status) ||
       activeProjection.cancelling
@@ -577,6 +620,7 @@ export function App() {
     setError(null);
     try {
       const run = await cancelRun(runId);
+      if (accessBlockedRef.current) return;
       setProjectionsByRunId((current) => {
         const projection = current[runId];
         return projection
@@ -603,6 +647,7 @@ export function App() {
         }
       }
     } catch (cancelError) {
+      if (blockAccess(cancelError)) return;
       setProjectionsByRunId((current) => {
         const projection = current[runId];
         return projection
@@ -613,7 +658,7 @@ export function App() {
         setError(displayError(cancelError));
       }
     }
-  }, [activeProjection, refreshSnapshot, refreshThreads]);
+  }, [activeProjection, blockAccess, refreshSnapshot, refreshThreads]);
 
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault();
@@ -644,6 +689,7 @@ export function App() {
       <Sidebar
         threads={threads}
         activeThreadId={snapshot?.thread_id ?? null}
+        disabled={accessBlocked}
         onOpenThread={(threadId) => void openThread(threadId)}
         onNewThread={() => void startNewThread()}
       />
@@ -662,6 +708,7 @@ export function App() {
               id="mobile-thread-select"
               value={snapshot?.thread_id ?? ''}
               onChange={(event) => event.target.value && void openThread(event.target.value)}
+              disabled={accessBlocked}
             >
               <option value="">历史会话</option>
               {threads.map((thread) => (
@@ -670,7 +717,12 @@ export function App() {
                 </option>
               ))}
             </select>
-            <button className="mobile-new" type="button" onClick={() => void startNewThread()}>
+            <button
+              className="mobile-new"
+              type="button"
+              onClick={() => void startNewThread()}
+              disabled={accessBlocked}
+            >
               <Icon name="plus" />
               <span className="sr-only">新建对话</span>
             </button>
@@ -680,6 +732,7 @@ export function App() {
         <section className="conversation" aria-live="polite" aria-busy={active}>
           {loading && !snapshot ? <LoadingState /> : null}
           {!loading &&
+          !error &&
           displayedMessages.length === 0 &&
           Object.keys(projectionsByRunId).length === 0 ? (
             <EmptyState />
@@ -697,7 +750,7 @@ export function App() {
                   {projection ? (
                     <AssistantTurn
                       projection={projection}
-                      retryDisabled={active || submitting}
+                      retryDisabled={active || submitting || accessBlocked}
                       onRetry={() => void retryRun(projection.run.run_id)}
                     />
                   ) : null}
@@ -713,7 +766,7 @@ export function App() {
               <AssistantTurn
                 key={projection.run.run_id}
                 projection={projection}
-                retryDisabled={active || submitting}
+                retryDisabled={active || submitting || accessBlocked}
                 onRetry={() => void retryRun(projection.run.run_id)}
               />
             ))}
@@ -730,7 +783,7 @@ export function App() {
           value={input}
           active={active}
           cancelling={activeProjection?.cancelling ?? false}
-          disabled={loading || submitting}
+          disabled={loading || submitting || accessBlocked}
           onChange={setInput}
           onKeyDown={handleComposerKeyDown}
           onSubmit={handleSubmit}
@@ -746,9 +799,10 @@ type SidebarProps = {
   activeThreadId: string | null;
   onOpenThread: (threadId: string) => void;
   onNewThread: () => void;
+  disabled: boolean;
 };
 
-function Sidebar({ threads, activeThreadId, onOpenThread, onNewThread }: SidebarProps) {
+function Sidebar({ threads, activeThreadId, onOpenThread, onNewThread, disabled }: SidebarProps) {
   return (
     <aside className="sidebar" aria-label="对话导航">
       <div className="brand">
@@ -758,7 +812,7 @@ function Sidebar({ threads, activeThreadId, onOpenThread, onNewThread }: Sidebar
           <span>Agent 对话核心</span>
         </div>
       </div>
-      <button className="new-thread" type="button" onClick={onNewThread}>
+      <button className="new-thread" type="button" onClick={onNewThread} disabled={disabled}>
         <Icon name="plus" />
         新建对话
       </button>
@@ -774,6 +828,7 @@ function Sidebar({ threads, activeThreadId, onOpenThread, onNewThread }: Sidebar
               key={thread.thread_id}
               onClick={() => onOpenThread(thread.thread_id)}
               aria-current={thread.thread_id === activeThreadId ? 'page' : undefined}
+              disabled={disabled}
             >
               <Icon name="chat" />
               <span>{thread.title || EMPTY_TITLE}</span>

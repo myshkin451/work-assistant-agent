@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from ipaddress import ip_address
 from typing import Literal
+from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -22,6 +24,7 @@ class Settings(BaseSettings):
     )
 
     app_env: Literal["development", "test", "production"] = "development"
+    identity_provider_mode: Literal["external", "anonymous", "development_header"] = "external"
     database_url: str = (
         "postgresql+psycopg://work_assistant:work_assistant@localhost:55432/work_assistant"
     )
@@ -40,6 +43,23 @@ class Settings(BaseSettings):
     fake_step_delay_seconds: float = Field(default=0.02, ge=0, le=10)
     sse_poll_interval_seconds: float = Field(default=0.05, gt=0, le=2)
     sse_keepalive_seconds: float = Field(default=15.0, gt=0, le=60)
+
+    @model_validator(mode="after")
+    def validate_identity_mode(self) -> Settings:
+        if self.app_env == "production" and self.identity_provider_mode != "external":
+            raise ValueError("production requires an external identity provider")
+        if self.app_env == "production":
+            for origin in self.cors_origins:
+                hostname = urlsplit(origin).hostname
+                try:
+                    is_loopback = hostname == "localhost" or (
+                        hostname is not None and ip_address(hostname).is_loopback
+                    )
+                except ValueError:
+                    is_loopback = False
+                if is_loopback:
+                    raise ValueError("production requires explicit non-loopback allowed origins")
+        return self
 
     @field_validator("database_url")
     @classmethod
@@ -68,6 +88,33 @@ class Settings(BaseSettings):
         if value not in {"deepseek-v4-flash", "deepseek-v4-pro"}:
             raise ValueError("DeepSeek model is not in the public allowlist")
         return value
+
+    @field_validator("allowed_origins")
+    @classmethod
+    def validate_allowed_origins(cls, value: str) -> str:
+        origins = [item.strip() for item in value.split(",") if item.strip()]
+        if not origins or len(set(origins)) != len(origins):
+            raise ValueError("allowed origins must be a non-empty unique list")
+        for origin in origins:
+            if origin in {"*", "null"}:
+                raise ValueError("credentialed CORS requires exact origins")
+            parsed = urlsplit(origin)
+            try:
+                parsed_port = parsed.port
+            except ValueError as exc:
+                raise ValueError("allowed origin has an invalid port") from exc
+            if (
+                parsed.scheme not in {"http", "https"}
+                or parsed.hostname is None
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.path
+                or parsed.query
+                or parsed.fragment
+                or (parsed_port is not None and not 1 <= parsed_port <= 65535)
+            ):
+                raise ValueError("allowed origin must be an exact HTTP origin")
+        return ",".join(origins)
 
     @property
     def cors_origins(self) -> list[str]:

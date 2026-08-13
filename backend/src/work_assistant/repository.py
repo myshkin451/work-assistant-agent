@@ -8,6 +8,8 @@ from sqlalchemy import Select, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from .authorization import ExactOwnershipAuthorizer, ResourceKind
+from .identity import INTERNAL_SUBJECT_PREFIX, Principal
 from .models import EventRecord, MessageRecord, RunRecord, ThreadRecord, utc_now
 from .schemas import (
     EventEnvelope,
@@ -90,13 +92,22 @@ def _run_snapshot(record: RunRecord, events: list[EventEnvelope]) -> RunSnapshot
 
 
 class ProductRepository:
-    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+    def __init__(
+        self,
+        session_factory: async_sessionmaker[AsyncSession],
+    ) -> None:
         self._sessions = session_factory
+        # Exact ownership is a non-replaceable security baseline. A future policy
+        # hook may add denials, but it must never broaden this check.
+        self._authorizer = ExactOwnershipAuthorizer()
 
-    async def create_thread(self, title: str | None) -> ThreadSnapshot:
+    async def create_thread(
+        self, *, principal: Principal, title: str | None
+    ) -> ThreadSnapshot:
         now = utc_now()
         record = ThreadRecord(
             id=str(uuid4()),
+            owner_subject=principal.subject,
             title=title or "New conversation",
             created_at=now,
             updated_at=now,
@@ -110,34 +121,39 @@ class ProductRepository:
             active_run=None,
         )
 
-    async def list_threads(self) -> list[ThreadSummary]:
+    async def list_threads(self, *, principal: Principal) -> list[ThreadSummary]:
         async with self._sessions() as session:
             records = (
                 await session.scalars(
-                    select(ThreadRecord).order_by(
+                    select(ThreadRecord)
+                    .where(ThreadRecord.owner_subject == principal.subject)
+                    .order_by(
                         ThreadRecord.updated_at.desc(), ThreadRecord.id.desc()
                     )
                 )
             ).all()
         return [_thread_summary(record) for record in records]
 
-    async def get_thread(self, thread_id: str) -> ThreadSnapshot:
+    async def get_thread(self, thread_id: str, *, principal: Principal) -> ThreadSnapshot:
         async with self._sessions() as session:
             thread = await session.get(ThreadRecord, thread_id)
             if thread is None:
                 raise ResourceNotFoundError("thread")
-            messages = (
-                await session.scalars(
-                    select(MessageRecord)
-                    .where(MessageRecord.thread_id == thread_id)
-                    .order_by(MessageRecord.created_at, MessageRecord.id)
-                )
-            ).all()
+            self._require_thread_owner(thread, principal)
             runs = (
                 await session.scalars(
                     select(RunRecord)
                     .where(RunRecord.thread_id == thread_id)
                     .order_by(RunRecord.created_at, RunRecord.id)
+                )
+            ).all()
+            for run in runs:
+                self._require_run_actor(run, principal, resource_kind="thread")
+            messages = (
+                await session.scalars(
+                    select(MessageRecord)
+                    .where(MessageRecord.thread_id == thread_id)
+                    .order_by(MessageRecord.created_at, MessageRecord.id)
                 )
             ).all()
             events = (
@@ -158,13 +174,30 @@ class ProductRepository:
             active_run=_run_view(active) if active else None,
         )
 
+    async def require_thread_access(
+        self, thread_id: str, *, principal: Principal
+    ) -> None:
+        """Authorize a Thread without reading its subject-scoped content."""
+
+        async with self._sessions() as session:
+            thread = await session.get(ThreadRecord, thread_id)
+            if thread is None:
+                raise ResourceNotFoundError("thread")
+            self._require_thread_owner(thread, principal)
+
     async def create_run(
-        self, *, thread_id: str, message: str, idempotency_key: str
+        self,
+        *,
+        principal: Principal,
+        thread_id: str,
+        message: str,
+        idempotency_key: str,
     ) -> tuple[RunView, bool]:
         run = RunRecord(
             id=str(uuid4()),
             thread_id=thread_id,
             idempotency_key=idempotency_key,
+            actor_subject=principal.subject,
             status="created",
             last_seq=0,
             created_at=utc_now(),
@@ -184,6 +217,8 @@ class ProductRepository:
                 )
                 if thread is None:
                     raise ResourceNotFoundError("thread")
+                self._require_thread_owner(thread, principal)
+                await self._require_thread_run_consistency(session, thread)
                 existing = await session.scalar(
                     select(RunRecord).where(
                         RunRecord.thread_id == thread_id,
@@ -191,11 +226,14 @@ class ProductRepository:
                     )
                 )
                 if existing is not None:
+                    self._require_run_actor(existing, principal, resource_kind="thread")
                     return _run_view(existing), False
                 active = await session.scalar(self._active_run_query(thread_id))
                 if active is not None and active.idempotency_key == idempotency_key:
+                    self._require_run_actor(active, principal, resource_kind="thread")
                     return _run_view(active), False
                 if active is not None:
+                    self._require_run_actor(active, principal, resource_kind="thread")
                     raise ActiveRunConflictError
                 # These tables intentionally have no ORM ownership cascade. Flush the
                 # referenced Run first so both PostgreSQL and FK-enabled SQLite see it.
@@ -208,6 +246,11 @@ class ProductRepository:
         except IntegrityError:
             # Database constraints are the final arbiter for concurrent callers.
             async with self._sessions() as session:
+                thread = await session.get(ThreadRecord, thread_id)
+                if thread is None:
+                    raise ResourceNotFoundError("thread") from None
+                self._require_thread_owner(thread, principal)
+                await self._require_thread_run_consistency(session, thread)
                 existing = await session.scalar(
                     select(RunRecord).where(
                         RunRecord.thread_id == thread_id,
@@ -215,16 +258,20 @@ class ProductRepository:
                     )
                 )
                 if existing is not None:
+                    self._require_run_actor(existing, principal, resource_kind="thread")
                     return _run_view(existing), False
-                if await session.scalar(self._active_run_query(thread_id)) is not None:
+                active = await session.scalar(self._active_run_query(thread_id))
+                if active is not None:
+                    self._require_run_actor(active, principal, resource_kind="thread")
                     raise ActiveRunConflictError from None
             raise
 
-    async def get_run(self, run_id: str) -> RunView:
+    async def get_run(self, run_id: str, *, principal: Principal) -> RunView:
         async with self._sessions() as session:
             run = await session.get(RunRecord, run_id)
             if run is None:
                 raise ResourceNotFoundError("run")
+            await self._require_authorized_run(session, run, principal)
             return _run_view(run)
 
     async def get_run_context(self, run_id: str) -> tuple[str, list[Message]]:
@@ -232,6 +279,11 @@ class ProductRepository:
             run = await session.get(RunRecord, run_id)
             if run is None:
                 raise ResourceNotFoundError("run")
+            thread = await session.get(ThreadRecord, run.thread_id)
+            if thread is None:
+                raise ResourceNotFoundError("run_ownership")
+            await self._require_internal_run_consistency(session, run)
+            await self._require_thread_run_consistency(session, thread)
             records = (
                 await session.scalars(
                     select(MessageRecord)
@@ -260,6 +312,7 @@ class ProductRepository:
                 if await session.get(RunRecord, run_id) is None:
                     raise ResourceNotFoundError("run")
                 return False
+            await self._require_internal_run_consistency(session, run)
             session.add(
                 self._event_record(run, "run.started", {"status": "running"})
             )
@@ -280,6 +333,7 @@ class ProductRepository:
                 if await session.get(RunRecord, run_id) is None:
                     raise ResourceNotFoundError("run")
                 return None
+            await self._require_internal_run_consistency(session, run)
             event = self._event_record(run, event_type, validated)
             session.add(event)
         return _event_view(event)
@@ -302,6 +356,7 @@ class ProductRepository:
                 if existing is None:
                     raise ResourceNotFoundError("run")
                 return _run_view(existing)
+            thread = await self._require_internal_run_consistency(session, run)
             message = MessageRecord(
                 id=str(uuid4()),
                 thread_id=run.thread_id,
@@ -329,9 +384,7 @@ class ProductRepository:
                     occurred_at=now,
                 )
             )
-            thread = await session.get(ThreadRecord, run.thread_id)
-            if thread is not None:
-                thread.updated_at = now
+            thread.updated_at = now
         return _run_view(run)
 
     async def fail_run(self, run_id: str, error_code: RunFailureCode) -> RunView:
@@ -352,6 +405,7 @@ class ProductRepository:
                 if existing is None:
                     raise ResourceNotFoundError("run")
                 return _run_view(existing)
+            thread = await self._require_internal_run_consistency(session, run)
             session.add(
                 self._event_record(
                     run,
@@ -360,14 +414,34 @@ class ProductRepository:
                     occurred_at=now,
                 )
             )
-            thread = await session.get(ThreadRecord, run.thread_id)
-            if thread is not None:
-                thread.updated_at = now
+            thread.updated_at = now
         return _run_view(run)
 
-    async def cancel_run(self, run_id: str) -> RunView:
+    async def cancel_run(self, run_id: str, *, principal: Principal) -> RunView:
         now = utc_now()
         async with self._sessions() as session, session.begin():
+            ownership = (
+                await session.execute(
+                    select(RunRecord.thread_id, RunRecord.actor_subject).where(
+                        RunRecord.id == run_id
+                    )
+                )
+            ).one_or_none()
+            if ownership is None:
+                raise ResourceNotFoundError("run")
+            thread = await session.get(ThreadRecord, ownership.thread_id)
+            if thread is None:
+                raise ResourceNotFoundError("run")
+            self._authorizer.require_owner(
+                principal=principal,
+                owner_subject=thread.owner_subject,
+                resource_kind="run",
+            )
+            self._authorizer.require_owner(
+                principal=principal,
+                owner_subject=ownership.actor_subject,
+                resource_kind="run",
+            )
             run = await session.scalar(
                 update(RunRecord)
                 .where(RunRecord.id == run_id, RunRecord.status.in_(ACTIVE_STATUSES))
@@ -379,10 +453,10 @@ class ProductRepository:
                 .returning(RunRecord)
             )
             if run is None:
-                existing = await session.get(RunRecord, run_id)
-                if existing is None:
+                current = await session.get(RunRecord, run_id, populate_existing=True)
+                if current is None:
                     raise ResourceNotFoundError("run")
-                return _run_view(existing)
+                return _run_view(current)
             session.add(
                 self._event_record(
                     run,
@@ -391,9 +465,7 @@ class ProductRepository:
                     occurred_at=now,
                 )
             )
-            thread = await session.get(ThreadRecord, run.thread_id)
-            if thread is not None:
-                thread.updated_at = now
+            thread.updated_at = now
         return _run_view(run)
 
     async def fail_orphaned_runs(self) -> list[RunView]:
@@ -418,6 +490,9 @@ class ProductRepository:
                 )
             ).all()
             for run in runs:
+                thread = await self._require_internal_run_consistency(
+                    session, run, allow_internal=True
+                )
                 session.add(
                     self._event_record(
                         run,
@@ -426,15 +501,17 @@ class ProductRepository:
                         occurred_at=now,
                     )
                 )
-                thread = await session.get(ThreadRecord, run.thread_id)
-                if thread is not None:
-                    thread.updated_at = now
+                thread.updated_at = now
         return [_run_view(run) for run in runs]
 
-    async def get_events(self, run_id: str, after_seq: int) -> list[EventEnvelope]:
+    async def get_events(
+        self, run_id: str, after_seq: int, *, principal: Principal
+    ) -> list[EventEnvelope]:
         async with self._sessions() as session:
-            if await session.get(RunRecord, run_id) is None:
+            run = await session.get(RunRecord, run_id)
+            if run is None:
                 raise ResourceNotFoundError("run")
+            await self._require_authorized_run(session, run, principal)
             records = (
                 await session.scalars(
                     select(EventRecord)
@@ -443,6 +520,73 @@ class ProductRepository:
                 )
             ).all()
         return [_event_view(record) for record in records]
+
+    def _require_thread_owner(self, thread: ThreadRecord, principal: Principal) -> None:
+        self._authorizer.require_owner(
+            principal=principal,
+            owner_subject=thread.owner_subject,
+            resource_kind="thread",
+        )
+
+    def _require_run_actor(
+        self,
+        run: RunRecord,
+        principal: Principal,
+        *,
+        resource_kind: ResourceKind,
+    ) -> None:
+        self._authorizer.require_owner(
+            principal=principal,
+            owner_subject=run.actor_subject,
+            resource_kind=resource_kind,
+        )
+
+    async def _require_authorized_run(
+        self,
+        session: AsyncSession,
+        run: RunRecord,
+        principal: Principal,
+    ) -> ThreadRecord:
+        thread = await session.get(ThreadRecord, run.thread_id)
+        if thread is None:
+            raise ResourceNotFoundError("run")
+        self._authorizer.require_owner(
+            principal=principal,
+            owner_subject=thread.owner_subject,
+            resource_kind="run",
+        )
+        self._require_run_actor(run, principal, resource_kind="run")
+        return thread
+
+    async def _require_thread_run_consistency(
+        self,
+        session: AsyncSession,
+        thread: ThreadRecord,
+    ) -> None:
+        inconsistent_run = await session.scalar(
+            select(RunRecord.id)
+            .where(
+                RunRecord.thread_id == thread.id,
+                RunRecord.actor_subject != thread.owner_subject,
+            )
+            .limit(1)
+        )
+        if inconsistent_run is not None:
+            raise ResourceNotFoundError("run_ownership")
+
+    async def _require_internal_run_consistency(
+        self,
+        session: AsyncSession,
+        run: RunRecord,
+        *,
+        allow_internal: bool = False,
+    ) -> ThreadRecord:
+        thread = await session.get(ThreadRecord, run.thread_id)
+        if thread is None or run.actor_subject != thread.owner_subject:
+            raise ResourceNotFoundError("run_ownership")
+        if not allow_internal and thread.owner_subject.startswith(INTERNAL_SUBJECT_PREFIX):
+            raise ResourceNotFoundError("run_ownership")
+        return thread
 
     @staticmethod
     def _active_run_query(thread_id: str) -> Select[tuple[RunRecord]]:

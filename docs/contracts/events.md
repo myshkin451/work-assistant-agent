@@ -1,7 +1,11 @@
-# Product API and event contract v0.2
+# Product API and event contract v0.3
 
 The frontend uses the product contract below. It does not consume raw model,
 LangChain, LangGraph, or provider events.
+
+All product endpoints below require a current neutral Principal and enforce the
+ownership rules in
+[`identity-and-ownership.md`](identity-and-ownership.md). `/health` is public.
 
 ## Endpoints
 
@@ -94,9 +98,26 @@ Request and response bodies:
 - `POST /api/runs/{run_id}/cancel` returns the current `RunView` after recording
   the cancellation request or terminal cancellation.
 
-Missing resources use `404`. A different idempotency key while the thread has
-an active Run uses `409`. Validation errors use `422`. Error bodies never include
-provider responses, prompts, stack traces, or credentials.
+Authentication and resource errors are stable:
+
+- `401 {"detail":{"code":"authentication_required"}}` when no valid Principal exists;
+- `403 {"detail":{"code":"thread_forbidden"}}` for an existing foreign Thread;
+- `403 {"detail":{"code":"run_forbidden"}}` for an existing foreign Run;
+- `403 {"detail":{"code":"origin_forbidden"}}` for a browser mutation from
+  an Origin outside the exact configured allowlist;
+- `404` with `thread_not_found` or `run_not_found` for an unknown identifier.
+
+Authentication occurs before product body or cursor validation. For an
+authenticated caller, ownership is checked before idempotency replay, active-Run
+conflict, cancellation, replay, or retry behavior. Therefore a forbidden caller
+never receives another Principal's Run ID or a `409` hint. A different
+idempotency key while the caller's own Thread has an active Run uses `409`.
+Validation errors for an owned resource use `422`. Error bodies never include
+resource content, owner/actor subjects, provider responses, prompts, stack
+traces, or credentials.
+
+Every browser `POST` with an `Origin` header also passes the exact-origin guard
+before mutation; service-to-service clients that omit `Origin` remain supported.
 
 ## SSE envelope
 
@@ -119,6 +140,9 @@ increasing within a Run. Reconnecting with `after_seq` replays only persisted
 events and never starts or resumes Agent execution by itself. The endpoint also
 accepts the standard `Last-Event-ID` header; an explicit `after_seq` query value
 takes precedence, otherwise the header is used, otherwise replay starts at `0`.
+Every initial connection and reconnect authenticates and authorizes again. A
+`401`, `403`, or `404` is returned as JSON before the `StreamingResponse` starts,
+so it contains no SSE frame or heartbeat.
 While a Run is active the server may send SSE comment heartbeats so proxies and
 clients can detect liveness. Once a Run is terminal and all persisted events
 after the requested sequence have been sent, the server closes the response.
@@ -147,7 +171,7 @@ Initial public event data:
 - `run.failed`: `{ "status": "failed", "error_code": RunFailureCode }`
 - `run.cancelled`: `{ "status": "cancelled" }`
 
-The only public failure codes in v0.2 are:
+The public failure codes remain:
 
 - `run_timeout`
 - `agent_execution_failed`
