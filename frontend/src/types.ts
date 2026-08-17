@@ -77,6 +77,13 @@ export const runFailureCodes = [
   'run_timeout',
   'agent_execution_failed',
   'service_restarted',
+  'model_step_limit',
+  'tool_call_limit',
+  'repeated_tool_call',
+  'no_progress',
+  'tool_not_allowed',
+  'result_schema_invalid',
+  'source_validation_failed',
 ] as const;
 
 export type RunFailureCode = (typeof runFailureCodes)[number];

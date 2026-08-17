@@ -23,6 +23,12 @@ downstream provider, but T-005 does not interpret it for authorization. A
 Principal never contains a password, bearer token, cookie, API key, or raw
 provider assertion.
 
+The Agent capability policy introduced by T-006 is a separate narrowing filter.
+It may deny a Tool for the current Principal, but it cannot grant Thread/Run
+ownership or replace exact subject authorization. An allow-all decision or an
+admin-shaped role therefore still cannot read, cancel, replay, or inspect
+another subject's Run or its server-side policy evidence.
+
 ## IdentityProvider
 
 An `IdentityProvider` implements the neutral asynchronous boundary:

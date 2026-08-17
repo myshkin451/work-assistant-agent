@@ -9,6 +9,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .authorization import ExactOwnershipAuthorizer, ResourceKind
+from .execution_policy import (
+    ExecutionOutcomeEvidence,
+    ExecutionPlanEvidence,
+    PolicyKernelConfigurationError,
+    orphaned_run_outcome,
+    validate_execution_outcome,
+    validate_execution_plan,
+)
 from .identity import INTERNAL_SUBJECT_PREFIX, Principal
 from .models import EventRecord, MessageRecord, RunRecord, ThreadRecord, utc_now
 from .schemas import (
@@ -37,6 +45,24 @@ class ResourceNotFoundError(Exception):
 
 class ActiveRunConflictError(Exception):
     pass
+
+
+class RepositoryUnavailableError(RuntimeError):
+    """No new transaction may start after the product pool fails closed."""
+
+
+def _validated_terminal_outcome(
+    value: ExecutionOutcomeEvidence,
+    *,
+    status: str,
+    failure_code: RunFailureCode | None = None,
+) -> dict[str, Any]:
+    validated = validate_execution_outcome(value)
+    if validated["status"] != status:
+        raise PolicyKernelConfigurationError("execution_outcome_status_mismatch")
+    if status == "failed" and validated["failure_code"] != failure_code:
+        raise PolicyKernelConfigurationError("execution_outcome_failure_mismatch")
+    return validated
 
 
 def _aware(value: datetime) -> datetime:
@@ -97,13 +123,21 @@ class ProductRepository:
         session_factory: async_sessionmaker[AsyncSession],
     ) -> None:
         self._sessions = session_factory
+        self._fatal_error: str | None = None
         # Exact ownership is a non-replaceable security baseline. A future policy
         # hook may add denials, but it must never broaden this check.
         self._authorizer = ExactOwnershipAuthorizer()
 
-    async def create_thread(
-        self, *, principal: Principal, title: str | None
-    ) -> ThreadSnapshot:
+    def fail_closed(self, reason: str) -> None:
+        if self._fatal_error is None:
+            self._fatal_error = reason
+
+    def _require_available(self) -> None:
+        if self._fatal_error is not None:
+            raise RepositoryUnavailableError(self._fatal_error)
+
+    async def create_thread(self, *, principal: Principal, title: str | None) -> ThreadSnapshot:
+        self._require_available()
         now = utc_now()
         record = ThreadRecord(
             id=str(uuid4()),
@@ -122,19 +156,19 @@ class ProductRepository:
         )
 
     async def list_threads(self, *, principal: Principal) -> list[ThreadSummary]:
+        self._require_available()
         async with self._sessions() as session:
             records = (
                 await session.scalars(
                     select(ThreadRecord)
                     .where(ThreadRecord.owner_subject == principal.subject)
-                    .order_by(
-                        ThreadRecord.updated_at.desc(), ThreadRecord.id.desc()
-                    )
+                    .order_by(ThreadRecord.updated_at.desc(), ThreadRecord.id.desc())
                 )
             ).all()
         return [_thread_summary(record) for record in records]
 
     async def get_thread(self, thread_id: str, *, principal: Principal) -> ThreadSnapshot:
+        self._require_available()
         async with self._sessions() as session:
             thread = await session.get(ThreadRecord, thread_id)
             if thread is None:
@@ -174,11 +208,10 @@ class ProductRepository:
             active_run=_run_view(active) if active else None,
         )
 
-    async def require_thread_access(
-        self, thread_id: str, *, principal: Principal
-    ) -> None:
+    async def require_thread_access(self, thread_id: str, *, principal: Principal) -> None:
         """Authorize a Thread without reading its subject-scoped content."""
 
+        self._require_available()
         async with self._sessions() as session:
             thread = await session.get(ThreadRecord, thread_id)
             if thread is None:
@@ -192,7 +225,10 @@ class ProductRepository:
         thread_id: str,
         message: str,
         idempotency_key: str,
+        execution_plan: ExecutionPlanEvidence,
     ) -> tuple[RunView, bool]:
+        self._require_available()
+        validated_plan = validate_execution_plan(execution_plan)
         run = RunRecord(
             id=str(uuid4()),
             thread_id=thread_id,
@@ -200,6 +236,8 @@ class ProductRepository:
             actor_subject=principal.subject,
             status="created",
             last_seq=0,
+            execution_plan=validated_plan,
+            execution_outcome=None,
             created_at=utc_now(),
         )
         user_message = MessageRecord(
@@ -267,6 +305,7 @@ class ProductRepository:
             raise
 
     async def get_run(self, run_id: str, *, principal: Principal) -> RunView:
+        self._require_available()
         async with self._sessions() as session:
             run = await session.get(RunRecord, run_id)
             if run is None:
@@ -274,7 +313,34 @@ class ProductRepository:
             await self._require_authorized_run(session, run, principal)
             return _run_view(run)
 
+    async def get_run_evidence(
+        self,
+        run_id: str,
+        *,
+        principal: Principal,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        """Return server-side audit evidence without exposing it in the product API."""
+
+        self._require_available()
+        async with self._sessions() as session:
+            run = await session.get(RunRecord, run_id)
+            if run is None:
+                raise ResourceNotFoundError("run")
+            await self._require_authorized_run(session, run, principal)
+            plan = (
+                validate_execution_plan(run.execution_plan)
+                if run.execution_plan is not None
+                else None
+            )
+            outcome = (
+                validate_execution_outcome(run.execution_outcome)
+                if run.execution_outcome is not None
+                else None
+            )
+            return plan, outcome
+
     async def get_run_context(self, run_id: str) -> tuple[str, list[Message]]:
+        self._require_available()
         async with self._sessions() as session:
             run = await session.get(RunRecord, run_id)
             if run is None:
@@ -301,6 +367,7 @@ class ProductRepository:
             return run.thread_id, messages
 
     async def start_run(self, run_id: str) -> bool:
+        self._require_available()
         async with self._sessions() as session, session.begin():
             run = await session.scalar(
                 update(RunRecord)
@@ -313,14 +380,13 @@ class ProductRepository:
                     raise ResourceNotFoundError("run")
                 return False
             await self._require_internal_run_consistency(session, run)
-            session.add(
-                self._event_record(run, "run.started", {"status": "running"})
-            )
+            session.add(self._event_record(run, "run.started", {"status": "running"}))
         return True
 
     async def append_active_event(
         self, run_id: str, event_type: RuntimeEventType, data: dict[str, Any]
     ) -> EventEnvelope | None:
+        self._require_available()
         event_type, validated = validate_runtime_event(event_type, data)
         async with self._sessions() as session, session.begin():
             run = await session.scalar(
@@ -338,7 +404,18 @@ class ProductRepository:
             session.add(event)
         return _event_view(event)
 
-    async def complete_run(self, run_id: str, content: str) -> RunView:
+    async def complete_run(
+        self,
+        run_id: str,
+        content: str,
+        *,
+        execution_outcome: ExecutionOutcomeEvidence,
+    ) -> RunView:
+        self._require_available()
+        validated_outcome = _validated_terminal_outcome(
+            execution_outcome,
+            status="completed",
+        )
         now = utc_now()
         async with self._sessions() as session, session.begin():
             run = await session.scalar(
@@ -348,6 +425,7 @@ class ProductRepository:
                     status="completed",
                     completed_at=now,
                     last_seq=RunRecord.last_seq + 2,
+                    execution_outcome=validated_outcome,
                 )
                 .returning(RunRecord)
             )
@@ -387,7 +465,19 @@ class ProductRepository:
             thread.updated_at = now
         return _run_view(run)
 
-    async def fail_run(self, run_id: str, error_code: RunFailureCode) -> RunView:
+    async def fail_run(
+        self,
+        run_id: str,
+        error_code: RunFailureCode,
+        *,
+        execution_outcome: ExecutionOutcomeEvidence,
+    ) -> RunView:
+        self._require_available()
+        validated_outcome = _validated_terminal_outcome(
+            execution_outcome,
+            status="failed",
+            failure_code=error_code,
+        )
         now = utc_now()
         async with self._sessions() as session, session.begin():
             run = await session.scalar(
@@ -397,6 +487,7 @@ class ProductRepository:
                     status="failed",
                     completed_at=now,
                     last_seq=RunRecord.last_seq + 1,
+                    execution_outcome=validated_outcome,
                 )
                 .returning(RunRecord)
             )
@@ -417,7 +508,18 @@ class ProductRepository:
             thread.updated_at = now
         return _run_view(run)
 
-    async def cancel_run(self, run_id: str, *, principal: Principal) -> RunView:
+    async def cancel_run(
+        self,
+        run_id: str,
+        *,
+        principal: Principal,
+        execution_outcome: ExecutionOutcomeEvidence,
+    ) -> RunView:
+        self._require_available()
+        validated_outcome = _validated_terminal_outcome(
+            execution_outcome,
+            status="cancelled",
+        )
         now = utc_now()
         async with self._sessions() as session, session.begin():
             ownership = (
@@ -449,6 +551,7 @@ class ProductRepository:
                     status="cancelled",
                     completed_at=now,
                     last_seq=RunRecord.last_seq + 1,
+                    execution_outcome=validated_outcome,
                 )
                 .returning(RunRecord)
             )
@@ -475,21 +578,64 @@ class ProductRepository:
         the current release. A multi-replica deployment requires ownership leases first.
         """
 
+        self._require_available()
         now = utc_now()
         async with self._sessions() as session, session.begin():
-            runs = (
+            candidates = (
                 await session.scalars(
-                    update(RunRecord)
+                    select(RunRecord)
                     .where(RunRecord.status.in_(ACTIVE_STATUSES))
+                    .order_by(RunRecord.created_at, RunRecord.id)
+                )
+            ).all()
+            runs: list[RunRecord] = []
+            for candidate in candidates:
+                if candidate.execution_outcome is not None:
+                    # A terminal outcome and an active status can never be
+                    # produced by the atomic repository transitions. Refuse to
+                    # overwrite that contradictory audit fact during recovery.
+                    validate_execution_outcome(candidate.execution_outcome)
+                    raise PolicyKernelConfigurationError("active_run_execution_outcome_present")
+                execution_outcome: dict[str, Any] | None = None
+                if candidate.execution_plan is not None:
+                    # Corrupt modern evidence must stop startup rather than be
+                    # reinterpreted. Legacy rows deliberately retain NULL facts.
+                    validate_execution_plan(candidate.execution_plan)
+                    source_events = (
+                        await session.scalars(
+                            select(EventRecord)
+                            .where(
+                                EventRecord.run_id == candidate.id,
+                                EventRecord.type == "source.added",
+                            )
+                            .order_by(EventRecord.seq)
+                        )
+                    ).all()
+                    source_ids: list[str] = []
+                    for event in source_events:
+                        source_data = validate_product_event(event.type, event.payload)
+                        source_id = cast(str, source_data["source_id"])
+                        if source_id not in source_ids:
+                            source_ids.append(source_id)
+                    execution_outcome = validate_execution_outcome(
+                        orphaned_run_outcome(accepted_source_ids=tuple(source_ids))
+                    )
+                run = await session.scalar(
+                    update(RunRecord)
+                    .where(
+                        RunRecord.id == candidate.id,
+                        RunRecord.status.in_(ACTIVE_STATUSES),
+                    )
                     .values(
                         status="failed",
                         completed_at=now,
                         last_seq=RunRecord.last_seq + 1,
+                        execution_outcome=execution_outcome,
                     )
                     .returning(RunRecord)
                 )
-            ).all()
-            for run in runs:
+                if run is None:
+                    continue
                 thread = await self._require_internal_run_consistency(
                     session, run, allow_internal=True
                 )
@@ -502,11 +648,13 @@ class ProductRepository:
                     )
                 )
                 thread.updated_at = now
+                runs.append(run)
         return [_run_view(run) for run in runs]
 
     async def get_events(
         self, run_id: str, after_seq: int, *, principal: Principal
     ) -> list[EventEnvelope]:
+        self._require_available()
         async with self._sessions() as session:
             run = await session.get(RunRecord, run_id)
             if run is None:

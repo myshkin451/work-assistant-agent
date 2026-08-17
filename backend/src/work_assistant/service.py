@@ -1,53 +1,101 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Awaitable
-from typing import Protocol
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any, Protocol
 
-from .agent_runtime import AgentResult, AgentRunner, ProductEvent
+from .agent_runtime import AgentResult, AgentRunner, ProductEvent, RuntimeFatalError
+from .execution_policy import (
+    AgentExecutionFailed,
+    AgentPolicyKernel,
+    PolicyViolation,
+    ResultSchemaInvalid,
+    RunExecution,
+)
 from .identity import Principal
 from .repository import ProductRepository
-from .schemas import EventEnvelope, RunView, validate_runtime_event
+from .schemas import (
+    EventEnvelope,
+    ProductEventValidationError,
+    RuntimeEventType,
+    RunView,
+    validate_runtime_event,
+)
 from .settings import Settings
 
 
-async def _finish_repository_call[T](awaitable: Awaitable[T]) -> T:
-    """Let a database call reach a clean boundary before propagating cancellation.
+class RepositoryCleanupTimeout(RuntimeError):
+    """A transaction did not settle after its one deadline cancellation."""
 
-    SQLAlchemy shields parts of async transaction cleanup. Cancelling the parent
-    Run task during that cleanup can strand a driver connection, so repository
-    calls execute in a child task. The parent still records cancellation at once,
-    waits only for the in-flight database operation to finish, and then exits.
+
+class RunAdmissionTimeout(RuntimeError):
+    """Run persistence did not finish within the Run's original deadline."""
+
+
+class RunServiceUnavailable(RuntimeError):
+    """The executor failed closed after a repository cleanup invariant failed."""
+
+
+async def _finish_repository_call[T](
+    operation_factory: Callable[[], Awaitable[T]],
+    *,
+    deadline_at: float,
+    cleanup_grace_seconds: float,
+    quarantine: set[asyncio.Task[Any]],
+) -> T:
+    """Run one transaction with one cancellation and bounded cleanup observation.
+
+    The child owns the absolute timeout, so SQLAlchemy receives exactly one
+    cancellation and may finish rollback/connection cleanup. Parent cancellation
+    records intent but never injects a second cancellation into that child.
     """
 
     async def execute() -> T:
-        return await awaitable
+        async with asyncio.timeout_at(deadline_at):
+            return await operation_factory()
 
     operation = asyncio.create_task(execute())
-    cancellation_requested = False
-    while True:
+    parent_cancelled = False
+
+    def observe_quarantined(completed: asyncio.Task[Any]) -> None:
+        quarantine.discard(completed)
         try:
-            result = await asyncio.shield(operation)
-        except asyncio.CancelledError:
-            cancellation_requested = True
-            if operation.done():
-                break
+            completed.exception()
         except BaseException:
-            if cancellation_requested:
-                break
-            raise
-        else:
-            if cancellation_requested:
+            pass
+
+    while True:
+        if operation.done():
+            try:
+                result = operation.result()
+            except BaseException:
+                if parent_cancelled:
+                    raise asyncio.CancelledError from None
+                raise
+            if parent_cancelled:
                 raise asyncio.CancelledError
             return result
 
-    # Retrieve any child exception so cancellation never leaves an unobserved
-    # database-operation Task behind.
-    try:
-        operation.result()
-    except BaseException:
-        pass
-    raise asyncio.CancelledError
+        remaining = deadline_at + cleanup_grace_seconds - time.monotonic()
+        if remaining <= 0:
+            quarantine.add(operation)
+            operation.add_done_callback(observe_quarantined)
+            raise RepositoryCleanupTimeout("repository_cleanup_timeout")
+        try:
+            await asyncio.wait({operation}, timeout=remaining)
+        except asyncio.CancelledError:
+            parent_cancelled = True
+
+
+def _result_delta_events(text: str) -> list[tuple[RuntimeEventType, dict[str, Any]]]:
+    """Encode one validated answer as public payload-sized delta events."""
+
+    chunk_size = 8_000
+    return [
+        ("message.delta", {"delta": text[offset : offset + chunk_size]})
+        for offset in range(0, len(text), chunk_size)
+    ]
 
 
 class DisconnectAware(Protocol):
@@ -60,13 +108,72 @@ class RunService:
         *,
         repository: ProductRepository,
         runner: AgentRunner,
+        policy_kernel: AgentPolicyKernel,
         settings: Settings,
     ) -> None:
         self.repository = repository
         self._runner = runner
+        self._policy_kernel = policy_kernel
         self._settings = settings
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._executions: dict[str, RunExecution] = {}
+        self._terminal_locks: dict[str, asyncio.Lock] = {}
+        self._quarantined_repository_tasks: set[asyncio.Task[Any]] = set()
+        self._fatal_error: str | None = None
         self._closed = False
+
+    @property
+    def is_healthy(self) -> bool:
+        return not self._closed and self._fatal_error is None
+
+    def _require_healthy(self) -> None:
+        if self._closed:
+            raise RunServiceUnavailable("run_service_closed")
+        self._require_repository_safe()
+
+    def _require_repository_safe(self) -> None:
+        if self._fatal_error is not None:
+            raise RunServiceUnavailable(self._fatal_error)
+
+    def _mark_fatal(self, reason: str) -> None:
+        if self._fatal_error is None:
+            self._fatal_error = reason
+        fail_closed = getattr(self.repository, "fail_closed", None)
+        if callable(fail_closed):
+            fail_closed(reason)
+        current = asyncio.current_task()
+        for task in tuple(self._tasks.values()):
+            if task is not current:
+                self._request_cancel(task)
+
+    def _terminal_deadline(self) -> float:
+        return time.monotonic() + self._settings.database_operation_timeout_seconds
+
+    async def _repository_call[T](
+        self,
+        operation_factory: Callable[[], Awaitable[T]],
+        *,
+        deadline_at: float,
+    ) -> T:
+        self._require_repository_safe()
+
+        async def guarded_operation() -> T:
+            # Recheck inside the child immediately before the repository
+            # coroutine begins. There is no await gap between this check and a
+            # production repository's own synchronous admission gate.
+            self._require_repository_safe()
+            return await operation_factory()
+
+        try:
+            return await _finish_repository_call(
+                guarded_operation,
+                deadline_at=deadline_at,
+                cleanup_grace_seconds=self._settings.repository_cleanup_grace_seconds,
+                quarantine=self._quarantined_repository_tasks,
+            )
+        except RepositoryCleanupTimeout:
+            self._mark_fatal("repository_cleanup_timeout")
+            raise
 
     async def create_run(
         self,
@@ -76,18 +183,65 @@ class RunService:
         message: str,
         idempotency_key: str,
     ) -> RunView:
-        view, created = await self.repository.create_run(
-            principal=principal,
-            thread_id=thread_id,
-            message=message,
-            idempotency_key=idempotency_key,
-        )
-        if created:
-            self._launch(view.run_id)
-        return view
+        self._require_healthy()
+        execution = self._policy_kernel.prepare_run(principal=principal)
+
+        async def admit_and_launch() -> RunView:
+            view, created = await self.repository.create_run(
+                principal=principal,
+                thread_id=thread_id,
+                message=message,
+                idempotency_key=idempotency_key,
+                execution_plan=execution.plan_evidence,
+            )
+            # No await may separate a committed new Run from worker ownership.
+            if created:
+                self._launch(view.run_id, execution)
+            return view
+
+        try:
+            return await self._repository_call(
+                admit_and_launch,
+                deadline_at=execution.deadline_at,
+            )
+        except TimeoutError as exc:
+            raise RunAdmissionTimeout("run_admission_timeout") from exc
 
     async def cancel_run(self, run_id: str, *, principal: Principal) -> RunView:
-        view = await self.repository.cancel_run(run_id, principal=principal)
+        # Existing Runs remain cancellable during graceful shutdown. A fatal
+        # repository cleanup failure is different: no transaction may be
+        # attempted again until the process has restarted with a clean pool.
+        self._require_repository_safe()
+        execution = self._executions.get(run_id)
+        if execution is None:
+            # A terminal idempotent cancel will ignore this fresh snapshot. An
+            # active Run without an in-process execution is not expected in the
+            # supported single-executor topology because startup closes orphans.
+            execution = self._policy_kernel.prepare_run(principal=principal)
+        terminal_lock = self._terminal_locks.get(run_id)
+
+        async def commit_cancel() -> RunView:
+            outcome = execution.outcome(
+                status="cancelled",
+                stop_reason="user_cancelled",
+            )
+            return await self._repository_call(
+                lambda: self.repository.cancel_run(
+                    run_id,
+                    principal=principal,
+                    execution_outcome=outcome,
+                ),
+                deadline_at=self._terminal_deadline(),
+            )
+
+        if terminal_lock is None:
+            view = await commit_cancel()
+        else:
+            # Serialize the terminal snapshot with any in-flight event append. If
+            # the append wins, its ledger confirmation is included; if cancel
+            # wins, the append observes the immutable terminal Run and is ignored.
+            async with terminal_lock:
+                view = await commit_cancel()
         task = self._tasks.get(run_id)
         if task is not None:
             self._request_cancel(task)
@@ -101,12 +255,12 @@ class RunService:
         after_seq: int,
         is_disconnected: DisconnectAware,
     ) -> AsyncIterator[EventEnvelope | None]:
+        self._require_repository_safe()
         cursor = after_seq
         elapsed_since_keepalive = 0.0
         while True:
-            events = await self.repository.get_events(
-                run_id, cursor, principal=principal
-            )
+            self._require_repository_safe()
+            events = await self.repository.get_events(run_id, cursor, principal=principal)
             for event in events:
                 cursor = event.seq
                 elapsed_since_keepalive = 0.0
@@ -134,15 +288,29 @@ class RunService:
             self._request_cancel(task)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        # A quarantined DB task has already received its one deadline
+        # cancellation. Observe it for a bounded period, but never inject a
+        # second cancellation during shutdown.
+        if self._quarantined_repository_tasks:
+            await asyncio.wait(
+                tuple(self._quarantined_repository_tasks),
+                timeout=self._settings.repository_cleanup_grace_seconds,
+            )
 
-    def _launch(self, run_id: str) -> None:
-        if self._closed:
-            raise RuntimeError("run service is closed")
-        task = asyncio.create_task(self._execute(run_id), name=f"product-run-{run_id}")
+    def _launch(self, run_id: str, execution: RunExecution) -> None:
+        self._require_healthy()
+        task = asyncio.create_task(
+            self._execute(run_id, execution),
+            name=f"product-run-{run_id}",
+        )
         self._tasks[run_id] = task
+        self._executions[run_id] = execution
+        self._terminal_locks[run_id] = asyncio.Lock()
 
         def discard(completed: asyncio.Task[None]) -> None:
             self._tasks.pop(run_id, None)
+            self._executions.pop(run_id, None)
+            self._terminal_locks.pop(run_id, None)
             if not completed.cancelled():
                 completed.exception()
 
@@ -156,42 +324,183 @@ class RunService:
         if not task.done() and task.cancelling() == 0:
             task.cancel()
 
-    async def _execute(self, run_id: str) -> None:
+    async def _execute(self, run_id: str, execution: RunExecution) -> None:
         try:
-            if not await _finish_repository_call(self.repository.start_run(run_id)):
-                return
-            thread_id, messages = await _finish_repository_call(
-                self.repository.get_run_context(run_id)
-            )
-            result: AgentResult | None = None
-            async with asyncio.timeout(self._settings.run_timeout_seconds):
+            async with asyncio.timeout_at(execution.deadline_at):
+                if not await self._repository_call(
+                    lambda: self.repository.start_run(run_id),
+                    deadline_at=execution.deadline_at,
+                ):
+                    return
+                thread_id, messages = await self._repository_call(
+                    lambda: self.repository.get_run_context(run_id),
+                    deadline_at=execution.deadline_at,
+                )
+                built_context = execution.build_context(messages)
+                result: AgentResult | None = None
+                runtime_text_parts: list[str] = []
+                runtime_text_chars = 0
+
+                async def persist_controlled_event(
+                    event: ProductEvent,
+                    event_type: RuntimeEventType,
+                    data: dict[str, Any],
+                ) -> EventEnvelope | None:
+                    async def append_and_confirm() -> EventEnvelope | None:
+                        persisted_event = await self.repository.append_active_event(
+                            run_id, event_type, data
+                        )
+                        if persisted_event is not None:
+                            # This synchronous confirmation is part of the
+                            # shielded child operation, so cancellation cannot
+                            # split the database fact from its evidence ledger.
+                            execution.accept_runtime_event(event)
+                        return persisted_event
+
+                    terminal_lock = self._terminal_locks[run_id]
+                    async with terminal_lock:
+                        return await self._repository_call(
+                            append_and_confirm,
+                            deadline_at=execution.deadline_at,
+                        )
+
                 async for item in self._runner.stream(
                     thread_id=thread_id,
                     run_id=run_id,
                     messages=messages,
+                    execution=execution,
+                    built_context=built_context,
                 ):
+                    if result is not None:
+                        raise AgentExecutionFailed("runtime_item_after_result")
                     if isinstance(item, ProductEvent):
-                        event_type, data = validate_runtime_event(item.type, item.data)
-                        persisted = await _finish_repository_call(
-                            self.repository.append_active_event(run_id, event_type, data)
-                        )
+                        execution.validate_runtime_event(item)
+                        try:
+                            event_type, data = validate_runtime_event(item.type, item.data)
+                        except ProductEventValidationError as exc:
+                            if item.type == "message.delta":
+                                raise ResultSchemaInvalid from exc
+                            raise
+                        if event_type == "message.delta":
+                            runtime_text_chars += len(data["delta"])
+                            if (
+                                runtime_text_chars
+                                > execution.agent.result_contract.max_answer_chars
+                            ):
+                                raise ResultSchemaInvalid
+                            runtime_text_parts.append(data["delta"])
+                        persisted = await persist_controlled_event(item, event_type, data)
                         if persisted is None:
                             return
                     else:
                         result = item
-            if result is None:
-                await _finish_repository_call(
-                    self.repository.fail_run(run_id, "agent_execution_failed")
+                if result is None:
+                    raise AgentExecutionFailed("agent_result_missing")
+                runtime_text = "".join(runtime_text_parts) if runtime_text_parts else None
+                validated_result = execution.validate_result(
+                    result,
+                    runtime_text=runtime_text,
                 )
-                return
-            await _finish_repository_call(self.repository.complete_run(run_id, result.text))
+                if not runtime_text_parts:
+                    for event_type, data in _result_delta_events(validated_result.text):
+                        event = ProductEvent(event_type, data)
+                        execution.validate_runtime_event(event)
+                        persisted = await persist_controlled_event(event, event_type, data)
+                        if persisted is None:
+                            return
+            outcome = execution.outcome(
+                status="completed",
+                stop_reason="completed",
+            )
+            await self._commit_terminal(
+                run_id,
+                lambda: self.repository.complete_run(
+                    run_id,
+                    validated_result.text,
+                    execution_outcome=outcome,
+                ),
+            )
         except asyncio.CancelledError:
             # The cancel endpoint has already committed the immutable terminal event.
             return
+        except RuntimeFatalError:
+            # The provider/checkpointer cleanup boundary is no longer reusable.
+            # Stop all product work and let startup recovery close active Runs
+            # after the process supervisor replaces this instance.
+            self._mark_fatal("runtime_cleanup_timeout")
+            return
+        except (RepositoryCleanupTimeout, RunServiceUnavailable):
+            # _repository_call has already failed the service closed. Do not
+            # recursively attempt another transaction on the uncertain pool.
+            return
         except TimeoutError:
-            await _finish_repository_call(self.repository.fail_run(run_id, "run_timeout"))
+            outcome = execution.outcome(
+                status="failed",
+                stop_reason="run_timeout",
+                failure_code="run_timeout",
+            )
+            await self._commit_terminal(
+                run_id,
+                lambda: self.repository.fail_run(
+                    run_id,
+                    "run_timeout",
+                    execution_outcome=outcome,
+                ),
+            )
+        except PolicyViolation as exc:
+            if isinstance(exc, ResultSchemaInvalid):
+                execution.record_result_validation_failure()
+            failure_code = exc.failure_code
+            outcome = execution.outcome(
+                status="failed",
+                stop_reason=exc.stop_reason,
+                failure_code=failure_code,
+            )
+            await self._commit_terminal(
+                run_id,
+                lambda: self.repository.fail_run(
+                    run_id,
+                    failure_code,
+                    execution_outcome=outcome,
+                ),
+            )
         except Exception:
             # Provider responses and exception text are intentionally not persisted.
-            await _finish_repository_call(
-                self.repository.fail_run(run_id, "agent_execution_failed")
+            outcome = execution.outcome(
+                status="failed",
+                stop_reason="agent_execution_failed",
+                failure_code="agent_execution_failed",
             )
+            await self._commit_terminal(
+                run_id,
+                lambda: self.repository.fail_run(
+                    run_id,
+                    "agent_execution_failed",
+                    execution_outcome=outcome,
+                ),
+            )
+
+    async def _commit_terminal[T](
+        self,
+        run_id: str,
+        operation_factory: Callable[[], Awaitable[T]],
+    ) -> T | None:
+        """Persist one terminal fact without recursively retrying a bad pool."""
+
+        try:
+            async with self._terminal_locks[run_id]:
+                return await self._repository_call(
+                    operation_factory,
+                    deadline_at=self._terminal_deadline(),
+                )
+        except asyncio.CancelledError:
+            raise
+        except RepositoryCleanupTimeout:
+            # _repository_call already recorded the stronger fatal reason.
+            return None
+        except Exception:
+            # A terminal write that cannot be confirmed leaves an active Run.
+            # Stop admitting work so startup recovery can deterministically
+            # close it after the supervisor replaces this process.
+            self._mark_fatal("repository_finalization_failed")
+            return None

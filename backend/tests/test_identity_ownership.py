@@ -8,10 +8,12 @@ from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
+from policy_fixtures import make_execution_plan, terminal_outcome
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from work_assistant.authorization import ResourceForbiddenError
 from work_assistant.db import Database
 from work_assistant.identity import (
     DEVELOPMENT_PRINCIPAL_HEADER,
@@ -97,7 +99,13 @@ def test_identity_contract_rejects_reserved_and_invalid_subjects() -> None:
 @pytest.mark.parametrize("mode", ["anonymous", "development_header"])
 def test_production_rejects_development_identity_modes(mode: str) -> None:
     with pytest.raises(ValidationError, match="production requires an external"):
-        Settings(app_env="production", identity_provider_mode=mode)  # type: ignore[arg-type]
+        Settings(
+            app_env="production",
+            identity_provider_mode=mode,  # type: ignore[arg-type]
+            model_mode="deepseek",
+            deepseek_api_key="test-only-key",
+            allowed_origins="https://neutral.example",
+        )
 
 
 @pytest.mark.parametrize(
@@ -113,6 +121,8 @@ async def test_production_rejects_injected_development_providers(
         identity_provider_mode="external",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'must-not-open.db'}",
         allowed_origins="https://neutral.example",
+        model_mode="deepseek",
+        deepseek_api_key="test-only-key",
     )
     app = create_app(settings, identity_provider=provider)
     with pytest.raises(
@@ -135,7 +145,12 @@ def test_credentialed_cors_rejects_non_origin_values(origin: str) -> None:
 
 def test_production_rejects_loopback_allowed_origins() -> None:
     with pytest.raises(ValidationError, match="non-loopback allowed origins"):
-        Settings(app_env="production", identity_provider_mode="external")
+        Settings(
+            app_env="production",
+            identity_provider_mode="external",
+            model_mode="deepseek",
+            deepseek_api_key="test-only-key",
+        )
 
 
 async def test_missing_external_provider_fails_before_database_work(tmp_path: Path) -> None:
@@ -144,6 +159,8 @@ async def test_missing_external_provider_fails_before_database_work(tmp_path: Pa
         identity_provider_mode="external",
         database_url=f"sqlite+aiosqlite:///{tmp_path / 'must-not-open.db'}",
         allowed_origins="https://neutral.example",
+        model_mode="deepseek",
+        deepseek_api_key="test-only-key",
     )
     app = create_app(settings)
     with pytest.raises(IdentityConfigurationError, match="external_identity_provider_missing"):
@@ -289,6 +306,34 @@ async def test_run_idempotency_actor_and_cross_owner_rejection(
     )
     assert forbidden_malformed.status_code == 403
 
+    privileged_b = Principal(
+        subject=PRINCIPAL_B.subject,
+        display_name="Neutral B",
+        roles=("admin", "allow-all-tools"),
+    )
+    allowed_plan_for_b = make_execution_plan(privileged_b)
+    assert tuple(tool.tool_id for tool in allowed_plan_for_b.visible_tools) == (
+        "get_current_time",
+    )
+    with pytest.raises(ResourceForbiddenError, match="thread"):
+        await app.state.repository.create_run(
+            principal=privileged_b,
+            thread_id=thread_a,
+            message="Policy cannot grant ownership",
+            idempotency_key="policy-owner-bypass",
+            execution_plan=allowed_plan_for_b,
+        )
+
+    owner_plan, _ = await app.state.repository.get_run_evidence(
+        first_a.json()["run_id"], principal=PRINCIPAL_A
+    )
+    assert owner_plan is not None
+    assert [tool["tool_id"] for tool in owner_plan["visible_tools"]] == ["get_current_time"]
+    with pytest.raises(ResourceForbiddenError, match="run"):
+        await app.state.repository.get_run_evidence(
+            first_a.json()["run_id"], principal=privileged_b
+        )
+
     missing = await client_a.post("/api/threads/unknown/runs", json=body)
     assert missing.status_code == 404
     missing_malformed = await client_a.post(
@@ -320,6 +365,7 @@ async def test_cancel_and_retry_equivalent_post_cannot_cross_owner(
         thread_id=thread.thread_id,
         message="Original question",
         idempotency_key="original",
+        execution_plan=make_execution_plan(PRINCIPAL_A),
     )
     assert created is True
 
@@ -432,6 +478,7 @@ async def test_corrupt_actor_and_cross_thread_children_fail_closed(
         thread_id=thread_a.thread_id,
         message="Keep ownership coherent",
         idempotency_key="coherent",
+        execution_plan=make_execution_plan(PRINCIPAL_A),
     )
 
     now = utc_now()
@@ -485,14 +532,20 @@ async def test_internal_execution_never_reads_messages_from_an_inconsistent_acto
         thread_id=thread.thread_id,
         message="Old private question",
         idempotency_key="old-context",
+        execution_plan=make_execution_plan(PRINCIPAL_A),
     )
     assert await repository.start_run(old_run.run_id) is True
-    await repository.complete_run(old_run.run_id, "Old private answer")
+    await repository.complete_run(
+        old_run.run_id,
+        "Old private answer",
+        execution_outcome=terminal_outcome(PRINCIPAL_A, status="completed"),
+    )
     current_run, _ = await repository.create_run(
         principal=PRINCIPAL_A,
         thread_id=thread.thread_id,
         message="New question",
         idempotency_key="new-context",
+        execution_plan=make_execution_plan(PRINCIPAL_A),
     )
 
     async with repository._sessions() as session:  # noqa: SLF001

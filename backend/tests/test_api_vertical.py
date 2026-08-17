@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from httpx import AsyncClient
+from policy_fixtures import make_execution_plan, terminal_outcome
 
 from work_assistant.identity import ANONYMOUS_DEVELOPMENT_SUBJECT, Principal
 from work_assistant.repository import ActiveRunConflictError
@@ -121,6 +122,7 @@ async def test_idempotency_and_single_active_run_hold_under_concurrency(
     # depend on whether the fake Run completed before slower CI requests arrived.
     # The API's 409 mapping is covered above; this phase isolates the repository's
     # atomic one-active-Run invariant under genuinely overlapping creation calls.
+    execution_plan = make_execution_plan(TEST_PRINCIPAL)
     contenders = await asyncio.gather(
         *(
             app.state.repository.create_run(
@@ -128,6 +130,7 @@ async def test_idempotency_and_single_active_run_hold_under_concurrency(
                 thread_id=second_thread,
                 message="Current time in UTC",
                 idempotency_key=f"key-{index}",
+                execution_plan=execution_plan,
             )
             for index in range(10)
         ),
@@ -138,7 +141,11 @@ async def test_idempotency_and_single_active_run_hold_under_concurrency(
     assert len(created) == 1
     assert created[0][1] is True
     assert len(conflicts) == 9
-    await app.state.repository.cancel_run(created[0][0].run_id, principal=TEST_PRINCIPAL)
+    await app.state.repository.cancel_run(
+        created[0][0].run_id,
+        principal=TEST_PRINCIPAL,
+        execution_outcome=terminal_outcome(TEST_PRINCIPAL, status="cancelled"),
+    )
 
 
 async def test_cancel_is_terminal_and_late_agent_results_are_discarded(
@@ -177,14 +184,13 @@ async def test_cancel_and_event_append_reserve_distinct_sequences(
 ) -> None:
     _, app = app_client
     repository = app.state.repository
-    thread = await repository.create_thread(
-        principal=TEST_PRINCIPAL, title="Atomic event sequence"
-    )
+    thread = await repository.create_thread(principal=TEST_PRINCIPAL, title="Atomic event sequence")
     run, created = await repository.create_run(
         principal=TEST_PRINCIPAL,
         thread_id=thread.thread_id,
         message="Current time UTC",
         idempotency_key="cancel-event-race",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
     )
     assert created is True
     assert await repository.start_run(run.run_id) is True
@@ -199,7 +205,11 @@ async def test_cancel_and_event_append_reserve_distinct_sequences(
                 "label": "Read current time",
             },
         ),
-        repository.cancel_run(run.run_id, principal=TEST_PRINCIPAL),
+        repository.cancel_run(
+            run.run_id,
+            principal=TEST_PRINCIPAL,
+            execution_outcome=terminal_outcome(TEST_PRINCIPAL, status="cancelled"),
+        ),
     )
 
     assert cancelled.status == "cancelled"
@@ -225,6 +235,18 @@ async def test_errors_and_public_events_are_bounded(app_client: tuple[Any, Any])
     assert "traceback" not in invalid.text.casefold()
 
     thread_id = await create_thread(client)
+    injected_policy = await client.post(
+        f"/api/threads/{thread_id}/runs",
+        json={
+            "message": "Current time UTC",
+            "idempotency_key": "client-policy-injection",
+            "agent_id": "client-selected-agent",
+            "budget": {"max_tool_calls": 999},
+        },
+    )
+    assert injected_policy.status_code == 422
+    assert (await client.get(f"/api/threads/{thread_id}")).json()["runs"] == []
+
     run = (
         await client.post(
             f"/api/threads/{thread_id}/runs",
@@ -257,3 +279,50 @@ async def test_invalid_last_event_id_is_safe_422(app_client: tuple[Any, Any]) ->
     )
     assert response.status_code == 422
     await client.post(f"/api/runs/{run['run_id']}/cancel")
+
+
+async def test_repository_fail_stop_precedes_health_and_product_database_work(
+    app_client: tuple[Any, Any],
+    monkeypatch: Any,
+) -> None:
+    client, app = app_client
+    repository_called = False
+
+    async def must_not_list_threads(*_: Any, **__: Any) -> None:
+        nonlocal repository_called
+        repository_called = True
+        raise AssertionError("fatal service must reject before repository access")
+
+    monkeypatch.setattr(app.state.repository, "list_threads", must_not_list_threads)
+    app.state.run_service._fatal_error = "repository_cleanup_timeout"  # noqa: SLF001
+
+    health = await client.get("/health")
+    product = await client.get("/api/threads")
+
+    assert health.status_code == 503
+    assert health.json() == {"detail": {"code": "service_unavailable"}}
+    assert product.status_code == 503
+    assert product.json() == {"detail": {"code": "service_unavailable"}}
+    assert repository_called is False
+
+
+async def test_repository_fail_stop_during_authentication_blocks_route_database_work(
+    app_client: tuple[Any, Any],
+    monkeypatch: Any,
+) -> None:
+    client, app = app_client
+
+    async def authenticate_and_trip_fail_stop(*_: Any, **__: Any) -> Principal:
+        app.state.run_service._mark_fatal("repository_cleanup_timeout")  # noqa: SLF001
+        return TEST_PRINCIPAL
+
+    monkeypatch.setattr(
+        app.state.identity_provider,
+        "authenticate",
+        authenticate_and_trip_fail_stop,
+    )
+
+    response = await client.get("/api/threads")
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": {"code": "service_unavailable"}}

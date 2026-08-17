@@ -7,7 +7,18 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 RunStatus = Literal["created", "running", "completed", "failed", "cancelled"]
 MessageRole = Literal["user", "assistant"]
-RunFailureCode = Literal["run_timeout", "agent_execution_failed", "service_restarted"]
+RunFailureCode = Literal[
+    "run_timeout",
+    "agent_execution_failed",
+    "service_restarted",
+    "model_step_limit",
+    "tool_call_limit",
+    "repeated_tool_call",
+    "no_progress",
+    "tool_not_allowed",
+    "result_schema_invalid",
+    "source_validation_failed",
+]
 ProductEventType = Literal[
     "run.started",
     "tool.started",
@@ -49,6 +60,8 @@ class ProductEventValidationError(ValueError):
 
 
 class ThreadCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     title: str | None = Field(default=None, max_length=200)
 
     @field_validator("title")
@@ -63,6 +76,8 @@ class ThreadCreate(BaseModel):
 
 
 class RunCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     message: str = Field(min_length=1, max_length=8_000)
     idempotency_key: str = Field(min_length=1, max_length=128)
 

@@ -7,12 +7,33 @@ from pathlib import Path
 from typing import Any, cast, get_args
 
 import pytest
+from langchain_core.messages import AIMessage, ToolMessage
+from policy_fixtures import (
+    make_execution,
+    make_execution_plan,
+    make_settings,
+    terminal_outcome,
+)
 
-from work_assistant.agent_runtime import AgentResult, AgentRunner, ProductEvent
+import work_assistant.repository as repository_module
+from work_assistant.agent_runtime import (
+    AgentResult,
+    AgentRunner,
+    ProductEvent,
+    RuntimeCleanupTimeout,
+)
+from work_assistant.bootstrap import build_policy_kernel
+from work_assistant.context_builder import BuiltContext
 from work_assistant.db import Database
+from work_assistant.execution_policy import (
+    ExecutionOutcomeEvidence,
+    PolicyKernelConfigurationError,
+    RunExecution,
+    execute_tool_call,
+)
 from work_assistant.identity import Principal
 from work_assistant.models import EventRecord, RunRecord, utc_now
-from work_assistant.repository import ProductRepository
+from work_assistant.repository import ProductRepository, RepositoryUnavailableError
 from work_assistant.schemas import (
     Message,
     ProductEventValidationError,
@@ -22,7 +43,6 @@ from work_assistant.schemas import (
     validate_product_event,
 )
 from work_assistant.service import RunService
-from work_assistant.settings import Settings
 
 TEST_PRINCIPAL = Principal(subject="neutral-test-principal")
 
@@ -43,16 +63,15 @@ def service_for(
     *,
     run_timeout_seconds: float = 2,
 ) -> RunService:
-    settings = Settings(
-        app_env="test",
-        identity_provider_mode="anonymous",
-        database_url="sqlite+aiosqlite:///:memory:",
-        checkpoint_database_url="postgresql://unused:unused@localhost/unused",
-        model_mode="fake",
-        fake_step_delay_seconds=0,
+    settings = make_settings(
         run_timeout_seconds=run_timeout_seconds,
     )
-    return RunService(repository=repository, runner=runner, settings=settings)
+    return RunService(
+        repository=repository,
+        runner=runner,
+        policy_kernel=build_policy_kernel(settings),
+        settings=settings,
+    )
 
 
 class CapturingRunner:
@@ -60,8 +79,15 @@ class CapturingRunner:
         self.calls: list[tuple[str, str, list[tuple[str, str, str | None]]]] = []
 
     async def stream(
-        self, *, thread_id: str, run_id: str, messages: Sequence[Message]
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        messages: Sequence[Message],
+        execution: RunExecution,
+        built_context: BuiltContext,
     ) -> AsyncIterator[ProductEvent | AgentResult]:
+        assert built_context.conversation == tuple(messages)
         self.calls.append(
             (
                 thread_id,
@@ -70,35 +96,54 @@ class CapturingRunner:
             )
         )
         prompt = messages[-1].content
-        tool_call_id = f"tool-{run_id}"
-        yield ProductEvent(
-            "tool.started",
-            {
-                "tool_call_id": tool_call_id,
-                "name": "capture_context",
-                "label": "Capture conversation context",
-                "input_summary": prompt,
-            },
+        timezone = {
+            "请查询当前上海时间。": "Asia/Shanghai",
+            "那伦敦呢？": "Europe/London",
+            "再看看纽约。": "America/New_York",
+        }.get(prompt, "UTC")
+        tool_call_id = f"time-{run_id}"
+        tool_call = {
+            "id": tool_call_id,
+            "name": "get_current_time",
+            "args": {"timezone": timezone},
+            "type": "tool_call",
+        }
+        execution.before_model_call()
+        execution.after_model_response([AIMessage(content="", tool_calls=[tool_call])])
+
+        emitted: list[ProductEvent] = []
+
+        async def emit(event: ProductEvent) -> None:
+            emitted.append(event)
+
+        async def invoke(validated: dict[str, Any]) -> ToolMessage:
+            implementation = execution.tool_registry.require("get_current_time").implementation
+            output = await implementation.ainvoke(validated)
+            assert isinstance(output, str)
+            return ToolMessage(
+                content=output,
+                tool_call_id=tool_call_id,
+                name="get_current_time",
+            )
+
+        await execute_tool_call(
+            execution=execution,
+            tool_call_id=tool_call_id,
+            tool_id="get_current_time",
+            arguments={"timezone": timezone},
+            handler=invoke,
+            emit=emit,
         )
-        yield ProductEvent(
-            "tool.finished",
-            {
-                "tool_call_id": tool_call_id,
-                "name": "capture_context",
-                "label": "Capture conversation context",
-                "output_summary": "Context captured",
-            },
-        )
-        yield ProductEvent(
-            "source.added",
-            {
-                "source_id": "capture-source",
-                "label": "Capture source",
-                "description": "Deterministic test source",
-            },
-        )
+        for event in emitted:
+            yield event
+
+        execution.before_model_call()
+        execution.after_model_response([AIMessage(content=f"answer:{prompt}")])
         yield ProductEvent("message.delta", {"delta": f"answer:{prompt}"})
-        yield AgentResult(text=f"answer:{prompt}")
+        yield AgentResult(
+            text=f"answer:{prompt}",
+            source_ids=execution.generated_source_ids,
+        )
 
 
 class InvalidEventRunner:
@@ -107,20 +152,48 @@ class InvalidEventRunner:
         self._data = data
 
     async def stream(
-        self, *, thread_id: str, run_id: str, messages: Sequence[Message]
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        messages: Sequence[Message],
+        execution: RunExecution,
+        built_context: BuiltContext,
     ) -> AsyncIterator[ProductEvent | AgentResult]:
-        del thread_id, run_id, messages
+        del thread_id, run_id, messages, execution, built_context
         yield ProductEvent(self._event_type, self._data)
-        yield AgentResult(text="must not complete")
+        yield AgentResult(text="must not complete", source_ids=())
 
 
 class SlowRunner:
     async def stream(
-        self, *, thread_id: str, run_id: str, messages: Sequence[Message]
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        messages: Sequence[Message],
+        execution: RunExecution,
+        built_context: BuiltContext,
     ) -> AsyncIterator[ProductEvent | AgentResult]:
-        del thread_id, run_id, messages
-        await asyncio.sleep(0.05)
-        yield AgentResult(text="must time out")
+        del thread_id, run_id, messages, execution, built_context
+        await asyncio.Event().wait()
+        yield AgentResult(text="must time out", source_ids=())
+
+
+class FatalRuntimeRunner:
+    async def stream(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        messages: Sequence[Message],
+        execution: RunExecution,
+        built_context: BuiltContext,
+    ) -> AsyncIterator[ProductEvent | AgentResult]:
+        del thread_id, run_id, messages, execution, built_context
+        raise RuntimeCleanupTimeout("runtime_cleanup_timeout")
+        if False:  # pragma: no cover - make this an async generator.
+            yield AgentResult(text="unreachable", source_ids=())
 
 
 class CancellationSensitiveRepository:
@@ -136,9 +209,17 @@ class CancellationSensitiveRepository:
             completed_at=utc_now(),
         )
 
-    async def cancel_run(self, run_id: str, *, principal: Principal) -> RunView:
+    async def cancel_run(
+        self,
+        run_id: str,
+        *,
+        principal: Principal,
+        execution_outcome: ExecutionOutcomeEvidence,
+    ) -> RunView:
         del principal
         assert run_id == self.run.run_id
+        assert execution_outcome.status == "cancelled"
+        assert execution_outcome.stop_reason == "user_cancelled"
         return self.run
 
 
@@ -165,12 +246,13 @@ class RepositoryCallGate(CancellationSensitiveRepository):
 async def test_cancel_shields_inflight_repository_cleanup() -> None:
     repository = RepositoryCallGate()
     service = service_for(cast(ProductRepository, repository), CapturingRunner())
-    service._launch(repository.run.run_id)  # noqa: SLF001
+    service._launch(  # noqa: SLF001
+        repository.run.run_id,
+        make_execution(TEST_PRINCIPAL),
+    )
     await asyncio.wait_for(repository.start_entered.wait(), timeout=1)
 
-    cancelled = await service.cancel_run(
-        repository.run.run_id, principal=TEST_PRINCIPAL
-    )
+    cancelled = await service.cancel_run(repository.run.run_id, principal=TEST_PRINCIPAL)
     shutdown = asyncio.create_task(service.shutdown())
     await asyncio.sleep(0)
 
@@ -215,13 +297,9 @@ async def test_cancel_and_shutdown_request_worker_cancellation_once(
     if shutdown_first:
         shutdown = asyncio.create_task(service.shutdown())
         await asyncio.wait_for(cleanup_entered.wait(), timeout=1)
-        cancelled = await service.cancel_run(
-            repository.run.run_id, principal=TEST_PRINCIPAL
-        )
+        cancelled = await service.cancel_run(repository.run.run_id, principal=TEST_PRINCIPAL)
     else:
-        cancelled = await service.cancel_run(
-            repository.run.run_id, principal=TEST_PRINCIPAL
-        )
+        cancelled = await service.cancel_run(repository.run.run_id, principal=TEST_PRINCIPAL)
         await asyncio.wait_for(cleanup_entered.wait(), timeout=1)
         shutdown = asyncio.create_task(service.shutdown())
         await asyncio.sleep(0)
@@ -236,11 +314,48 @@ async def test_cancel_and_shutdown_request_worker_cancellation_once(
 
 class RaisingRunner:
     async def stream(
-        self, *, thread_id: str, run_id: str, messages: Sequence[Message]
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        messages: Sequence[Message],
+        execution: RunExecution,
+        built_context: BuiltContext,
     ) -> AsyncIterator[ProductEvent | AgentResult]:
-        del thread_id, run_id, messages
+        del thread_id, run_id, messages, execution, built_context
         yield ProductEvent("message.delta", {"delta": "safe prefix"})
         raise RuntimeError("provider-secret-sentinel")
+
+
+class CumulativeDeltaOverflowRunner:
+    async def stream(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        messages: Sequence[Message],
+        execution: RunExecution,
+        built_context: BuiltContext,
+    ) -> AsyncIterator[ProductEvent | AgentResult]:
+        del thread_id, run_id, messages, execution, built_context
+        yield ProductEvent("message.delta", {"delta": "safe prefix"})
+        yield ProductEvent("message.delta", {"delta": "x" * 8_000})
+        yield AgentResult(text="must not complete", source_ids=())
+
+
+class StreamResultMismatchRunner:
+    async def stream(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        messages: Sequence[Message],
+        execution: RunExecution,
+        built_context: BuiltContext,
+    ) -> AsyncIterator[ProductEvent | AgentResult]:
+        del thread_id, run_id, messages, execution, built_context
+        yield ProductEvent("message.delta", {"delta": "safe prefix"})
+        yield AgentResult(text="different terminal result", source_ids=())
 
 
 async def test_three_runs_keep_messages_events_and_context_isolated(
@@ -249,9 +364,7 @@ async def test_three_runs_keep_messages_events_and_context_isolated(
     repository = recovery_repository
     runner = CapturingRunner()
     service = service_for(repository, runner)
-    thread = await repository.create_thread(
-        principal=TEST_PRINCIPAL, title="Three-turn context"
-    )
+    thread = await repository.create_thread(principal=TEST_PRINCIPAL, title="Three-turn context")
     prompts = ("请查询当前上海时间。", "那伦敦呢？", "再看看纽约。")
     run_ids: list[str] = []
 
@@ -303,7 +416,33 @@ async def test_three_runs_keep_messages_events_and_context_isolated(
             "run.completed",
         ]
         tool_started = next(event for event in run.events if event.type == "tool.started")
-        assert tool_started.data["input_summary"] == prompts[index]
+        assert (
+            tool_started.data["input_summary"]
+            == (
+                "Asia/Shanghai",
+                "Europe/London",
+                "America/New_York",
+            )[index]
+        )
+        plan, outcome = await repository.get_run_evidence(
+            run.run_id,
+            principal=TEST_PRINCIPAL,
+        )
+        assert plan is not None
+        assert plan["agent_id"] == "default-work-assistant"
+        assert plan["visible_tools"] == [{"tool_id": "get_current_time", "version": "1.0.0"}]
+        assert outcome is not None
+        assert outcome["status"] == "completed"
+        assert outcome["result_validation"] == "passed"
+        assert outcome["accepted_source_ids"] == ["system-clock-iana-tzdb"]
+        usage = outcome["usage"]
+        assert usage is not None
+        assert usage["model_steps"] == 2
+        assert usage["tool_calls_attempted"] == 1
+        assert usage["tool_calls_succeeded"] == 1
+        assert usage["repeated_tool_calls"] == 0
+        assert usage["no_progress_steps"] == 0
+        assert usage["elapsed_ms"] >= 0
 
     assert len(runner.calls) == 3
     for index, (thread_id, run_id, captured) in enumerate(runner.calls):
@@ -324,17 +463,24 @@ async def test_three_runs_keep_messages_events_and_context_isolated(
 
 
 @pytest.mark.parametrize(
-    ("event_type", "data"),
+    ("event_type", "data", "expected_code"),
     [
-        pytest.param("future.runtime.event", {"marker": "private-runtime-payload"}, id="unknown"),
+        pytest.param(
+            "future.runtime.event",
+            {"marker": "private-runtime-payload"},
+            "agent_execution_failed",
+            id="unknown",
+        ),
         pytest.param(
             "provider.reasoning",
             {"reasoning": "private-runtime-payload"},
+            "agent_execution_failed",
             id="private",
         ),
         pytest.param(
             "run.completed",
             {"status": "completed", "marker": "private-runtime-payload"},
+            "agent_execution_failed",
             id="host-owned",
         ),
         pytest.param(
@@ -344,7 +490,18 @@ async def test_three_runs_keep_messages_events_and_context_isolated(
                 "name": "get_current_time",
                 "input_summary": "private-runtime-payload",
             },
+            "tool_not_allowed",
             id="bad-payload",
+        ),
+        pytest.param(
+            "source.added",
+            {
+                "source_id": "system-clock-iana-tzdb",
+                "label": "System clock with IANA timezone data",
+                "description": ("Current server clock converted with the requested IANA timezone."),
+            },
+            "source_validation_failed",
+            id="source-without-successful-tool-ledger",
         ),
     ],
 )
@@ -352,6 +509,7 @@ async def test_invalid_runtime_events_fail_without_persisting_or_skipping_sequen
     recovery_repository: ProductRepository,
     event_type: str,
     data: dict[str, Any],
+    expected_code: RunFailureCode,
 ) -> None:
     repository = recovery_repository
     service = service_for(repository, InvalidEventRunner(event_type, data))
@@ -375,9 +533,25 @@ async def test_invalid_runtime_events_fail_without_persisting_or_skipping_sequen
     assert [event.type for event in events] == ["run.started", "run.failed"]
     assert events[-1].data == {
         "status": "failed",
-        "error_code": "agent_execution_failed",
+        "error_code": expected_code,
     }
-    serialized = json.dumps([event.model_dump(mode="json") for event in events])
+    plan, outcome = await repository.get_run_evidence(
+        run.run_id,
+        principal=TEST_PRINCIPAL,
+    )
+    assert plan is not None
+    assert outcome is not None
+    assert outcome["status"] == "failed"
+    assert outcome["failure_code"] == expected_code
+    assert outcome["result_validation"] == "not_run"
+    assert outcome["accepted_source_ids"] == []
+    serialized = json.dumps(
+        {
+            "events": [event.model_dump(mode="json") for event in events],
+            "plan": plan,
+            "outcome": outcome,
+        }
+    )
     assert event_type not in serialized
     assert "private-runtime-payload" not in serialized
 
@@ -388,14 +562,13 @@ async def test_repository_rejects_invalid_events_before_reserving_sequence(
     recovery_repository: ProductRepository,
 ) -> None:
     repository = recovery_repository
-    thread = await repository.create_thread(
-        principal=TEST_PRINCIPAL, title="Repository validation"
-    )
+    thread = await repository.create_thread(principal=TEST_PRINCIPAL, title="Repository validation")
     run, created = await repository.create_run(
         principal=TEST_PRINCIPAL,
         thread_id=thread.thread_id,
         message="Keep the sequence contiguous",
         idempotency_key="repository-invalid-event",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
     )
     assert created is True
     assert await repository.start_run(run.run_id) is True
@@ -435,9 +608,7 @@ async def test_repository_rejects_invalid_events_before_reserving_sequence(
         assert current.last_seq == 1
         assert [
             event.seq
-            for event in await repository.get_events(
-                run.run_id, 0, principal=TEST_PRINCIPAL
-            )
+            for event in await repository.get_events(run.run_id, 0, principal=TEST_PRINCIPAL)
         ] == [1]
 
     appended = await repository.append_active_event(
@@ -447,11 +618,104 @@ async def test_repository_rejects_invalid_events_before_reserving_sequence(
     )
     assert appended is not None
     assert appended.seq == 2
-    await repository.cancel_run(run.run_id, principal=TEST_PRINCIPAL)
+    await repository.cancel_run(
+        run.run_id,
+        principal=TEST_PRINCIPAL,
+        execution_outcome=terminal_outcome(TEST_PRINCIPAL, status="cancelled"),
+    )
     assert [
-        event.seq
-        for event in await repository.get_events(run.run_id, 0, principal=TEST_PRINCIPAL)
+        event.seq for event in await repository.get_events(run.run_id, 0, principal=TEST_PRINCIPAL)
     ] == [1, 2, 3]
+
+
+@pytest.mark.parametrize(
+    ("operation", "execution_outcome", "expected_error"),
+    [
+        pytest.param(
+            "complete",
+            terminal_outcome(TEST_PRINCIPAL, status="cancelled"),
+            "execution_outcome_status_mismatch",
+            id="complete-status",
+        ),
+        pytest.param(
+            "fail",
+            terminal_outcome(TEST_PRINCIPAL, status="completed"),
+            "execution_outcome_status_mismatch",
+            id="fail-status",
+        ),
+        pytest.param(
+            "fail",
+            terminal_outcome(
+                TEST_PRINCIPAL,
+                status="failed",
+                failure_code="agent_execution_failed",
+            ),
+            "execution_outcome_failure_mismatch",
+            id="fail-code",
+        ),
+        pytest.param(
+            "cancel",
+            terminal_outcome(TEST_PRINCIPAL, status="completed"),
+            "execution_outcome_status_mismatch",
+            id="cancel-status",
+        ),
+    ],
+)
+async def test_repository_rejects_terminal_outcome_mismatches_without_mutation(
+    recovery_repository: ProductRepository,
+    operation: str,
+    execution_outcome: ExecutionOutcomeEvidence,
+    expected_error: str,
+) -> None:
+    repository = recovery_repository
+    thread = await repository.create_thread(
+        principal=TEST_PRINCIPAL,
+        title=f"Reject {operation} evidence mismatch",
+    )
+    run, created = await repository.create_run(
+        principal=TEST_PRINCIPAL,
+        thread_id=thread.thread_id,
+        message="Keep this Run active after rejected terminal evidence",
+        idempotency_key=f"terminal-mismatch-{operation}-{expected_error}",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
+    )
+    assert created is True
+    assert await repository.start_run(run.run_id) is True
+
+    with pytest.raises(PolicyKernelConfigurationError, match=expected_error):
+        if operation == "complete":
+            await repository.complete_run(
+                run.run_id,
+                "must not persist",
+                execution_outcome=execution_outcome,
+            )
+        elif operation == "fail":
+            await repository.fail_run(
+                run.run_id,
+                "run_timeout",
+                execution_outcome=execution_outcome,
+            )
+        else:
+            await repository.cancel_run(
+                run.run_id,
+                principal=TEST_PRINCIPAL,
+                execution_outcome=execution_outcome,
+            )
+
+    current = await repository.get_run(run.run_id, principal=TEST_PRINCIPAL)
+    assert current.status == "running"
+    assert current.last_seq == 1
+    assert current.completed_at is None
+    plan, persisted_outcome = await repository.get_run_evidence(
+        run.run_id,
+        principal=TEST_PRINCIPAL,
+    )
+    assert plan is not None
+    assert persisted_outcome is None
+    events = await repository.get_events(run.run_id, 0, principal=TEST_PRINCIPAL)
+    assert [event.type for event in events] == ["run.started"]
+    snapshot = await repository.get_thread(thread.thread_id, principal=TEST_PRINCIPAL)
+    assert [message.role for message in snapshot.messages] == ["user"]
 
 
 @pytest.mark.parametrize(
@@ -459,7 +723,7 @@ async def test_repository_rejects_invalid_events_before_reserving_sequence(
     [
         pytest.param(
             SlowRunner(),
-            0.005,
+            0.25,
             "run_timeout",
             ["run.started", "run.failed"],
             id="timeout",
@@ -503,8 +767,118 @@ async def test_service_failures_are_bounded_contiguous_and_do_not_persist_except
     assert [event.seq for event in events] == list(range(1, len(events) + 1))
     assert [event.type for event in events] == expected_types
     assert events[-1].data == {"status": "failed", "error_code": expected_code}
-    serialized = json.dumps([event.model_dump(mode="json") for event in events])
+    plan, outcome = await repository.get_run_evidence(
+        run.run_id,
+        principal=TEST_PRINCIPAL,
+    )
+    assert plan is not None
+    assert outcome is not None
+    assert outcome["status"] == "failed"
+    assert outcome["failure_code"] == expected_code
+    assert outcome["stop_reason"] == expected_code
+    assert outcome["result_validation"] == "not_run"
+    serialized = json.dumps(
+        {
+            "events": [event.model_dump(mode="json") for event in events],
+            "plan": plan,
+            "outcome": outcome,
+        }
+    )
     assert "provider-secret-sentinel" not in serialized
+
+    await service.shutdown()
+
+
+async def test_runtime_cleanup_failure_stops_service_without_reusing_repository(
+    recovery_repository: ProductRepository,
+) -> None:
+    repository = recovery_repository
+    service = service_for(repository, FatalRuntimeRunner())
+    thread = await repository.create_thread(
+        principal=TEST_PRINCIPAL,
+        title="Runtime fail-stop",
+    )
+    run = await service.create_run(
+        principal=TEST_PRINCIPAL,
+        thread_id=thread.thread_id,
+        message="Trip the Runtime cleanup boundary",
+        idempotency_key="runtime-cleanup-fatal",
+    )
+    await service.wait_for_idle()
+
+    assert service.is_healthy is False
+    with pytest.raises(RepositoryUnavailableError, match="runtime_cleanup_timeout"):
+        await repository.get_run(run.run_id, principal=TEST_PRINCIPAL)
+
+    fresh_repository = ProductRepository(repository._sessions)  # noqa: SLF001
+    stranded = await fresh_repository.get_run(run.run_id, principal=TEST_PRINCIPAL)
+    events = await fresh_repository.get_events(
+        run.run_id,
+        0,
+        principal=TEST_PRINCIPAL,
+    )
+    assert stranded.status == "running"
+    assert [event.type for event in events] == ["run.started"]
+
+    await service.shutdown()
+
+
+@pytest.mark.parametrize(
+    ("runner", "expected_result_validation"),
+    [
+        pytest.param(CumulativeDeltaOverflowRunner(), "failed", id="cumulative-overflow"),
+        pytest.param(StreamResultMismatchRunner(), "failed", id="stream-result-mismatch"),
+    ],
+)
+async def test_invalid_stream_results_fail_stably_without_assistant_commit(
+    recovery_repository: ProductRepository,
+    runner: AgentRunner,
+    expected_result_validation: str,
+) -> None:
+    repository = recovery_repository
+    service = service_for(repository, runner)
+    thread = await repository.create_thread(
+        principal=TEST_PRINCIPAL,
+        title="Invalid streamed result",
+    )
+    run = await service.create_run(
+        principal=TEST_PRINCIPAL,
+        thread_id=thread.thread_id,
+        message="Reject an invalid streamed result",
+        idempotency_key=f"invalid-stream-{expected_result_validation}",
+    )
+    await service.wait_for_idle()
+
+    failed = await repository.get_run(run.run_id, principal=TEST_PRINCIPAL)
+    assert failed.status == "failed"
+    events = await repository.get_events(run.run_id, 0, principal=TEST_PRINCIPAL)
+    assert [event.seq for event in events] == [1, 2, 3]
+    assert [event.type for event in events] == [
+        "run.started",
+        "message.delta",
+        "run.failed",
+    ]
+    assert events[1].data == {"delta": "safe prefix"}
+    assert events[-1].data == {
+        "status": "failed",
+        "error_code": "result_schema_invalid",
+    }
+    assert "message.completed" not in {event.type for event in events}
+    assert "run.completed" not in {event.type for event in events}
+
+    snapshot = await repository.get_thread(thread.thread_id, principal=TEST_PRINCIPAL)
+    assert [message.role for message in snapshot.messages] == ["user"]
+    _, outcome = await repository.get_run_evidence(
+        run.run_id,
+        principal=TEST_PRINCIPAL,
+    )
+    assert outcome is not None
+    assert outcome["status"] == "failed"
+    assert outcome["failure_code"] == "result_schema_invalid"
+    assert outcome["stop_reason"] == "result_schema_invalid"
+    assert outcome["result_validation"] == expected_result_validation
+    assert outcome["result_schema_version"] == "1.0.0"
+    assert outcome["result_source_ids"] == []
 
     await service.shutdown()
 
@@ -522,6 +896,7 @@ async def test_orphan_sweep_is_idempotent_preserves_terminals_and_allows_new_run
         thread_id=created_thread.thread_id,
         message="Created before restart",
         idempotency_key="created-orphan",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
     )
 
     running_thread = await repository.create_thread(
@@ -532,6 +907,7 @@ async def test_orphan_sweep_is_idempotent_preserves_terminals_and_allows_new_run
         thread_id=running_thread.thread_id,
         message="Running before restart",
         idempotency_key="running-orphan",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
     )
     assert await repository.start_run(running_orphan.run_id) is True
     await repository.append_active_event(
@@ -539,6 +915,51 @@ async def test_orphan_sweep_is_idempotent_preserves_terminals_and_allows_new_run
         "message.delta",
         {"delta": "partial result"},
     )
+    await repository.append_active_event(
+        running_orphan.run_id,
+        "tool.started",
+        {
+            "tool_call_id": "orphan-time",
+            "name": "get_current_time",
+            "label": "Read current time",
+            "input_summary": "UTC",
+        },
+    )
+    await repository.append_active_event(
+        running_orphan.run_id,
+        "tool.finished",
+        {
+            "tool_call_id": "orphan-time",
+            "name": "get_current_time",
+            "label": "Read current time",
+            "output_summary": "UTC: 2026-08-17T00:00:00+00:00",
+        },
+    )
+    await repository.append_active_event(
+        running_orphan.run_id,
+        "source.added",
+        {
+            "source_id": "system-clock-iana-tzdb",
+            "label": "System clock with IANA timezone data",
+            "description": ("Current server clock converted with the requested IANA timezone."),
+        },
+    )
+
+    legacy_thread = await repository.create_thread(
+        principal=TEST_PRINCIPAL,
+        title="Legacy orphan without policy evidence",
+    )
+    legacy_orphan, _ = await repository.create_run(
+        principal=TEST_PRINCIPAL,
+        thread_id=legacy_thread.thread_id,
+        message="Created before policy evidence existed",
+        idempotency_key="legacy-created-orphan",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
+    )
+    async with repository._sessions() as session, session.begin():  # noqa: SLF001
+        stored_legacy = await session.get(RunRecord, legacy_orphan.run_id)
+        assert stored_legacy is not None
+        stored_legacy.execution_plan = None
 
     completed_thread = await repository.create_thread(
         principal=TEST_PRINCIPAL, title="Completed terminal"
@@ -548,9 +969,14 @@ async def test_orphan_sweep_is_idempotent_preserves_terminals_and_allows_new_run
         thread_id=completed_thread.thread_id,
         message="Already complete",
         idempotency_key="completed-terminal",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
     )
     assert await repository.start_run(completed.run_id) is True
-    await repository.complete_run(completed.run_id, "completed answer")
+    await repository.complete_run(
+        completed.run_id,
+        "completed answer",
+        execution_outcome=terminal_outcome(TEST_PRINCIPAL, status="completed"),
+    )
 
     cancelled_thread = await repository.create_thread(
         principal=TEST_PRINCIPAL, title="Cancelled terminal"
@@ -560,9 +986,14 @@ async def test_orphan_sweep_is_idempotent_preserves_terminals_and_allows_new_run
         thread_id=cancelled_thread.thread_id,
         message="Already cancelled",
         idempotency_key="cancelled-terminal",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
     )
     assert await repository.start_run(cancelled.run_id) is True
-    await repository.cancel_run(cancelled.run_id, principal=TEST_PRINCIPAL)
+    await repository.cancel_run(
+        cancelled.run_id,
+        principal=TEST_PRINCIPAL,
+        execution_outcome=terminal_outcome(TEST_PRINCIPAL, status="cancelled"),
+    )
 
     terminal_event_counts = {
         completed.run_id: len(
@@ -572,9 +1003,27 @@ async def test_orphan_sweep_is_idempotent_preserves_terminals_and_allows_new_run
             await repository.get_events(cancelled.run_id, 0, principal=TEST_PRINCIPAL)
         ),
     }
+    terminal_evidence = {
+        completed.run_id: await repository.get_run_evidence(
+            completed.run_id,
+            principal=TEST_PRINCIPAL,
+        ),
+        cancelled.run_id: await repository.get_run_evidence(
+            cancelled.run_id,
+            principal=TEST_PRINCIPAL,
+        ),
+    }
     swept = await repository.fail_orphaned_runs()
-    assert {run.run_id for run in swept} == {created_orphan.run_id, running_orphan.run_id}
+    assert {run.run_id for run in swept} == {
+        created_orphan.run_id,
+        running_orphan.run_id,
+        legacy_orphan.run_id,
+    }
 
+    expected_sources = {
+        created_orphan.run_id: [],
+        running_orphan.run_id: ["system-clock-iana-tzdb"],
+    }
     for orphan_id in (created_orphan.run_id, running_orphan.run_id):
         orphan = await repository.get_run(orphan_id, principal=TEST_PRINCIPAL)
         events = await repository.get_events(orphan_id, 0, principal=TEST_PRINCIPAL)
@@ -585,18 +1034,52 @@ async def test_orphan_sweep_is_idempotent_preserves_terminals_and_allows_new_run
             "status": "failed",
             "error_code": "service_restarted",
         }
+        plan, outcome = await repository.get_run_evidence(
+            orphan_id,
+            principal=TEST_PRINCIPAL,
+        )
+        assert plan is not None
+        assert outcome is not None
+        assert outcome == {
+            "schema_version": "1.0.0",
+            "status": "failed",
+            "stop_reason": "service_restarted",
+            "failure_code": "service_restarted",
+            "usage": None,
+            "accepted_source_ids": expected_sources[orphan_id],
+            "result_source_ids": [],
+            "result_schema_version": None,
+            "result_validation": "not_run",
+        }
+
+    legacy = await repository.get_run(legacy_orphan.run_id, principal=TEST_PRINCIPAL)
+    legacy_events = await repository.get_events(
+        legacy_orphan.run_id,
+        0,
+        principal=TEST_PRINCIPAL,
+    )
+    assert legacy.status == "failed"
+    assert [event.type for event in legacy_events] == ["run.failed"]
+    assert legacy_events[0].data == {
+        "status": "failed",
+        "error_code": "service_restarted",
+    }
+    assert await repository.get_run_evidence(
+        legacy_orphan.run_id,
+        principal=TEST_PRINCIPAL,
+    ) == (None, None)
 
     orphan_event_counts = {
-        orphan_id: len(
-            await repository.get_events(orphan_id, 0, principal=TEST_PRINCIPAL)
+        orphan_id: len(await repository.get_events(orphan_id, 0, principal=TEST_PRINCIPAL))
+        for orphan_id in (
+            created_orphan.run_id,
+            running_orphan.run_id,
+            legacy_orphan.run_id,
         )
-        for orphan_id in (created_orphan.run_id, running_orphan.run_id)
     }
     assert await repository.fail_orphaned_runs() == []
     assert {
-        orphan_id: len(
-            await repository.get_events(orphan_id, 0, principal=TEST_PRINCIPAL)
-        )
+        orphan_id: len(await repository.get_events(orphan_id, 0, principal=TEST_PRINCIPAL))
         for orphan_id in orphan_event_counts
     } == orphan_event_counts
 
@@ -614,16 +1097,34 @@ async def test_orphan_sweep_is_idempotent_preserves_terminals_and_allows_new_run
             await repository.get_events(cancelled.run_id, 0, principal=TEST_PRINCIPAL)
         ),
     } == terminal_event_counts
+    assert {
+        completed.run_id: await repository.get_run_evidence(
+            completed.run_id,
+            principal=TEST_PRINCIPAL,
+        ),
+        cancelled.run_id: await repository.get_run_evidence(
+            cancelled.run_id,
+            principal=TEST_PRINCIPAL,
+        ),
+    } == terminal_evidence
 
     same_run, created = await repository.create_run(
         principal=TEST_PRINCIPAL,
         thread_id=created_thread.thread_id,
         message="Must return immutable old Run",
         idempotency_key="created-orphan",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
     )
     assert created is False
     assert same_run.run_id == created_orphan.run_id
     assert same_run.status == "failed"
+    same_plan, same_outcome = await repository.get_run_evidence(
+        same_run.run_id,
+        principal=TEST_PRINCIPAL,
+    )
+    assert same_plan is not None
+    assert same_outcome is not None
+    assert same_outcome["failure_code"] == "service_restarted"
 
     retry_runner = CapturingRunner()
     retry_service = service_for(repository, retry_runner)
@@ -635,58 +1136,162 @@ async def test_orphan_sweep_is_idempotent_preserves_terminals_and_allows_new_run
     )
     await retry_service.wait_for_idle()
     assert retry.run_id != created_orphan.run_id
-    assert (
-        await repository.get_run(retry.run_id, principal=TEST_PRINCIPAL)
-    ).status == "completed"
+    assert (await repository.get_run(retry.run_id, principal=TEST_PRINCIPAL)).status == "completed"
     assert (
         await repository.get_run(created_orphan.run_id, principal=TEST_PRINCIPAL)
     ).status == "failed"
     await retry_service.shutdown()
 
 
-async def test_failure_codes_are_frozen_and_stream_unavailable_cannot_be_terminal(
+async def test_orphan_sweep_rejects_active_run_with_terminal_outcome(
     recovery_repository: ProductRepository,
 ) -> None:
     repository = recovery_repository
-    frozen_codes = {"run_timeout", "agent_execution_failed", "service_restarted"}
+    thread = await repository.create_thread(
+        principal=TEST_PRINCIPAL,
+        title="Contradictory active audit evidence",
+    )
+    run, created = await repository.create_run(
+        principal=TEST_PRINCIPAL,
+        thread_id=thread.thread_id,
+        message="Do not overwrite a terminal outcome on an active Run",
+        idempotency_key="active-with-terminal-outcome",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
+    )
+    assert created is True
+    assert await repository.start_run(run.run_id) is True
+    stored_outcome = terminal_outcome(
+        TEST_PRINCIPAL,
+        status="failed",
+        failure_code="agent_execution_failed",
+    ).model_dump(mode="json")
+    async with repository._sessions() as session, session.begin():  # noqa: SLF001
+        stored = await session.get(RunRecord, run.run_id)
+        assert stored is not None
+        stored.execution_outcome = stored_outcome
+
+    with pytest.raises(
+        PolicyKernelConfigurationError,
+        match="active_run_execution_outcome_present",
+    ):
+        await repository.fail_orphaned_runs()
+
+    current = await repository.get_run(run.run_id, principal=TEST_PRINCIPAL)
+    assert current.status == "running"
+    assert current.last_seq == 1
+    plan, outcome = await repository.get_run_evidence(
+        run.run_id,
+        principal=TEST_PRINCIPAL,
+    )
+    assert plan is not None
+    assert outcome == stored_outcome
+    assert [
+        event.type
+        for event in await repository.get_events(
+            run.run_id,
+            0,
+            principal=TEST_PRINCIPAL,
+        )
+    ] == ["run.started"]
+
+
+async def test_failure_codes_are_frozen_and_stream_unavailable_cannot_be_terminal(
+    recovery_repository: ProductRepository,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = recovery_repository
+    frozen_codes = {
+        "run_timeout",
+        "agent_execution_failed",
+        "service_restarted",
+        "model_step_limit",
+        "tool_call_limit",
+        "repeated_tool_call",
+        "no_progress",
+        "tool_not_allowed",
+        "result_schema_invalid",
+        "source_validation_failed",
+    }
     assert set(get_args(RunFailureCode)) == frozen_codes
     for code in frozen_codes:
-        assert validate_product_event(
-            "run.failed",
-            {"status": "failed", "error_code": code},
-        )["error_code"] == code
+        assert (
+            validate_product_event(
+                "run.failed",
+                {"status": "failed", "error_code": code},
+            )["error_code"]
+            == code
+        )
     with pytest.raises(ProductEventValidationError):
         validate_product_event(
             "run.failed",
             {"status": "failed", "error_code": "stream_unavailable"},
         )
 
-    thread = await repository.create_thread(
-        principal=TEST_PRINCIPAL, title="Failure code rollback"
-    )
+    thread = await repository.create_thread(principal=TEST_PRINCIPAL, title="Failure code rollback")
     run, _ = await repository.create_run(
         principal=TEST_PRINCIPAL,
         thread_id=thread.thread_id,
         message="Reject connection-only state",
         idempotency_key="stream-unavailable",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
     )
     assert await repository.start_run(run.run_id) is True
-    with pytest.raises(ProductEventValidationError):
-        await repository.fail_run(run.run_id, cast(RunFailureCode, "stream_unavailable"))
+    original_validate = repository_module.validate_product_event
+
+    def reject_terminal_event(event_type: str, data: dict[str, Any]) -> dict[str, Any]:
+        if event_type == "run.failed":
+            raise ProductEventValidationError("synthetic terminal schema failure")
+        return original_validate(event_type, data)
+
+    # Use a valid failure/outcome pair so this reaches _event_record after the
+    # status/outcome UPDATE and proves the whole terminal transaction rolls back.
+    with monkeypatch.context() as patch_context:
+        patch_context.setattr(
+            repository_module,
+            "validate_product_event",
+            reject_terminal_event,
+        )
+        with pytest.raises(ProductEventValidationError):
+            await repository.fail_run(
+                run.run_id,
+                "run_timeout",
+                execution_outcome=terminal_outcome(
+                    TEST_PRINCIPAL,
+                    status="failed",
+                    failure_code="run_timeout",
+                ),
+            )
     still_running = await repository.get_run(run.run_id, principal=TEST_PRINCIPAL)
     assert still_running.status == "running"
     assert still_running.last_seq == 1
+    plan, outcome = await repository.get_run_evidence(
+        run.run_id,
+        principal=TEST_PRINCIPAL,
+    )
+    assert plan is not None
+    assert outcome is None
     assert [
-        event.type
-        for event in await repository.get_events(run.run_id, 0, principal=TEST_PRINCIPAL)
-    ] == [
-        "run.started"
-    ]
+        event.type for event in await repository.get_events(run.run_id, 0, principal=TEST_PRINCIPAL)
+    ] == ["run.started"]
 
-    await repository.fail_run(run.run_id, "run_timeout")
+    await repository.fail_run(
+        run.run_id,
+        "run_timeout",
+        execution_outcome=terminal_outcome(
+            TEST_PRINCIPAL,
+            status="failed",
+            failure_code="run_timeout",
+        ),
+    )
     events = await repository.get_events(run.run_id, 0, principal=TEST_PRINCIPAL)
     assert [event.seq for event in events] == [1, 2]
     assert events[-1].data["error_code"] == "run_timeout"
+    _, outcome = await repository.get_run_evidence(
+        run.run_id,
+        principal=TEST_PRINCIPAL,
+    )
+    assert outcome is not None
+    assert outcome["failure_code"] == "run_timeout"
 
 
 async def test_v01_result_missing_is_normalized_only_for_stored_event_reads(
@@ -697,14 +1302,13 @@ async def test_v01_result_missing_is_normalized_only_for_stored_event_reads(
     with pytest.raises(ProductEventValidationError):
         validate_product_event("run.failed", legacy)
 
-    thread = await repository.create_thread(
-        principal=TEST_PRINCIPAL, title="v0.1 compatibility"
-    )
+    thread = await repository.create_thread(principal=TEST_PRINCIPAL, title="v0.1 compatibility")
     run, _ = await repository.create_run(
         principal=TEST_PRINCIPAL,
         thread_id=thread.thread_id,
         message="Read the legacy terminal event",
         idempotency_key="legacy-result-missing",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
     )
     assert await repository.start_run(run.run_id) is True
     now = utc_now()
@@ -747,27 +1351,46 @@ async def test_failed_and_cancelled_user_messages_do_not_enter_later_context(
         thread_id=thread.thread_id,
         message="completed question",
         idempotency_key="completed",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
     )
     assert await repository.start_run(completed.run_id) is True
-    await repository.complete_run(completed.run_id, "completed answer")
+    await repository.complete_run(
+        completed.run_id,
+        "completed answer",
+        execution_outcome=terminal_outcome(TEST_PRINCIPAL, status="completed"),
+    )
 
     failed, _ = await repository.create_run(
         principal=TEST_PRINCIPAL,
         thread_id=thread.thread_id,
         message="failed question must stay out",
         idempotency_key="failed",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
     )
     assert await repository.start_run(failed.run_id) is True
-    await repository.fail_run(failed.run_id, "agent_execution_failed")
+    await repository.fail_run(
+        failed.run_id,
+        "agent_execution_failed",
+        execution_outcome=terminal_outcome(
+            TEST_PRINCIPAL,
+            status="failed",
+            failure_code="agent_execution_failed",
+        ),
+    )
 
     cancelled, _ = await repository.create_run(
         principal=TEST_PRINCIPAL,
         thread_id=thread.thread_id,
         message="cancelled question must stay out",
         idempotency_key="cancelled",
+        execution_plan=make_execution_plan(TEST_PRINCIPAL),
     )
     assert await repository.start_run(cancelled.run_id) is True
-    await repository.cancel_run(cancelled.run_id, principal=TEST_PRINCIPAL)
+    await repository.cancel_run(
+        cancelled.run_id,
+        principal=TEST_PRINCIPAL,
+        execution_outcome=terminal_outcome(TEST_PRINCIPAL, status="cancelled"),
+    )
 
     runner = CapturingRunner()
     service = service_for(repository, runner)

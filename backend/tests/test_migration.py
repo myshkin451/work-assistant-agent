@@ -28,6 +28,11 @@ def test_product_migration_is_reversible_and_owns_no_checkpoint_tables(tmp_path:
     database_path = tmp_path / "migration.db"
     config = migration_config(backend, database_path)
 
+    command.upgrade(config, "0002_principal_ownership")
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
+            "0002_principal_ownership"
+        )
     command.upgrade(config, "head")
     with sqlite3.connect(database_path) as connection:
         tables = {
@@ -66,8 +71,7 @@ async def test_v02_rows_are_quarantined_and_nonempty_downgrade_is_blocked(
     now = datetime.now(UTC).isoformat()
     with sqlite3.connect(database_path) as connection:
         connection.execute(
-            "INSERT INTO product_threads "
-            "(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO product_threads (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
             ("legacy-thread", "Legacy private conversation", now, now),
         )
         connection.execute(
@@ -104,13 +108,15 @@ async def test_v02_rows_are_quarantined_and_nonempty_downgrade_is_blocked(
         )
         connection.commit()
 
+    command.upgrade(config, "0002_principal_ownership")
     command.upgrade(config, "head")
     with sqlite3.connect(database_path) as connection:
         thread = connection.execute(
             "SELECT id, owner_subject, title FROM product_threads"
         ).fetchone()
         run = connection.execute(
-            "SELECT id, actor_subject, status, last_seq FROM product_runs"
+            "SELECT id, actor_subject, status, last_seq, execution_plan, execution_outcome "
+            "FROM product_runs"
         ).fetchone()
         counts = {
             table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
@@ -135,16 +141,11 @@ async def test_v02_rows_are_quarantined_and_nonempty_downgrade_is_blocked(
         run_indexes = {row[1] for row in connection.execute("PRAGMA index_list(product_runs)")}
         run_index_columns = {
             index_name: tuple(
-                row[2]
-                for row in connection.execute(
-                    f'PRAGMA index_info("{index_name}")'
-                )
+                row[2] for row in connection.execute(f'PRAGMA index_info("{index_name}")')
             )
             for index_name in run_indexes
         }
-        message_foreign_keys = list(
-            connection.execute("PRAGMA foreign_key_list(product_messages)")
-        )
+        message_foreign_keys = list(connection.execute("PRAGMA foreign_key_list(product_messages)"))
         event_foreign_keys = list(connection.execute("PRAGMA foreign_key_list(product_events)"))
         foreign_key_check = list(connection.execute("PRAGMA foreign_key_check"))
         message = connection.execute(
@@ -158,7 +159,7 @@ async def test_v02_rows_are_quarantined_and_nonempty_downgrade_is_blocked(
         LEGACY_UNOWNED_SUBJECT,
         "Legacy private conversation",
     )
-    assert run == ("legacy-run", LEGACY_UNOWNED_SUBJECT, "completed", 1)
+    assert run == ("legacy-run", LEGACY_UNOWNED_SUBJECT, "completed", 1, None, None)
     assert counts == {
         "product_threads": 1,
         "product_runs": 1,
@@ -176,9 +177,7 @@ async def test_v02_rows_are_quarantined_and_nonempty_downgrade_is_blocked(
         grouped: dict[int, list[tuple[int, str, str]]] = {}
         for row in rows:
             if row[2] == "product_runs":
-                grouped.setdefault(int(row[0]), []).append(
-                    (int(row[1]), str(row[3]), str(row[4]))
-                )
+                grouped.setdefault(int(row[0]), []).append((int(row[1]), str(row[3]), str(row[4])))
         return {
             tuple((source, target) for _, source, target in sorted(items))
             for items in grouped.values()
@@ -268,9 +267,62 @@ async def test_v02_rows_are_quarantined_and_nonempty_downgrade_is_blocked(
         assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
             "0002_principal_ownership"
         )
-        assert connection.execute(
-            "SELECT owner_subject FROM product_threads WHERE id = 'legacy-thread'"
-        ).fetchone()[0] == LEGACY_UNOWNED_SUBJECT
+        assert (
+            connection.execute(
+                "SELECT owner_subject FROM product_threads WHERE id = 'legacy-thread'"
+            ).fetchone()[0]
+            == LEGACY_UNOWNED_SUBJECT
+        )
+
+
+def test_v03_downgrade_refuses_to_discard_agent_policy_evidence(tmp_path: Path) -> None:
+    database_path = tmp_path / "agent-policy-evidence.db"
+    config = migration_config(BACKEND, database_path)
+    command.upgrade(config, "head")
+    now = datetime.now(UTC).isoformat()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO product_threads "
+            "(id, owner_subject, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("thread-v03", "neutral-owner", "Evidence", now, now),
+        )
+        connection.execute(
+            "INSERT INTO product_runs "
+            "(id, thread_id, actor_subject, idempotency_key, status, last_seq, "
+            "execution_plan, created_at, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "run-v03",
+                "thread-v03",
+                "neutral-owner",
+                "evidence-key",
+                "created",
+                0,
+                '{"schema_version":"1.0.0"}',
+                now,
+                None,
+            ),
+        )
+        connection.commit()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Agent policy evidence migration cannot discard recorded evidence",
+    ):
+        command.downgrade(config, "0002_principal_ownership")
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
+            "0003_agent_policy_evidence"
+        )
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(product_runs)")}
+        assert {"execution_plan", "execution_outcome"}.issubset(columns)
+        assert (
+            connection.execute(
+                "SELECT execution_plan FROM product_runs WHERE id = 'run-v03'"
+            ).fetchone()[0]
+            == '{"schema_version":"1.0.0"}'
+        )
 
 
 def test_v02_migration_rejects_inconsistent_child_links_before_schema_changes(
@@ -282,13 +334,11 @@ def test_v02_migration_rejects_inconsistent_child_links_before_schema_changes(
     now = datetime.now(UTC).isoformat()
     with sqlite3.connect(database_path) as connection:
         connection.execute(
-            "INSERT INTO product_threads "
-            "(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO product_threads (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
             ("thread-a", "A", now, now),
         )
         connection.execute(
-            "INSERT INTO product_threads "
-            "(id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            "INSERT INTO product_threads (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)",
             ("thread-b", "B", now, now),
         )
         connection.execute(
@@ -317,9 +367,7 @@ def test_v02_migration_rejects_inconsistent_child_links_before_schema_changes(
         thread_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(product_threads)")
         }
-        run_columns = {
-            row[1] for row in connection.execute("PRAGMA table_info(product_runs)")
-        }
+        run_columns = {row[1] for row in connection.execute("PRAGMA table_info(product_runs)")}
         assert "owner_subject" not in thread_columns
         assert "actor_subject" not in run_columns
         assert connection.execute("SELECT COUNT(*) FROM product_messages").fetchone()[0] == 1

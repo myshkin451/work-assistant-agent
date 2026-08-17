@@ -17,6 +17,8 @@ from .agent_runtime import (
     RuntimeConfigurationError,
     runtime_for_settings,
 )
+from .bootstrap import build_policy_kernel
+from .identity import Principal
 from .schemas import Message
 from .settings import Settings
 
@@ -30,25 +32,34 @@ async def _run(env_file: Path | None, timezone: str) -> int:
         settings = Settings(**settings_input)
         event_types: list[str] = []
         result: AgentResult | None = None
-        async with runtime_for_settings(settings) as runner:
+        kernel = build_policy_kernel(settings)
+        execution = kernel.prepare_run(
+            principal=Principal(subject="urn:work-assistant:principal:live-smoke")
+        )
+        async with runtime_for_settings(settings, policy_kernel=kernel) as runner:
             run_id = f"live-smoke-{uuid4()}"
+            messages = [
+                Message(
+                    message_id=f"live-smoke-{uuid4()}",
+                    role="user",
+                    content=f"What is the current time in {timezone}?",
+                    created_at=datetime.now(UTC),
+                    run_id=run_id,
+                )
+            ]
+            built_context = execution.build_context(messages)
             async for item in runner.stream(
                 thread_id=f"live-smoke-{uuid4()}",
                 run_id=run_id,
-                messages=[
-                    Message(
-                        message_id=f"live-smoke-{uuid4()}",
-                        role="user",
-                        content=f"What is the current time in {timezone}?",
-                        created_at=datetime.now(UTC),
-                        run_id=run_id,
-                    )
-                ],
+                messages=messages,
+                execution=execution,
+                built_context=built_context,
             ):
                 if isinstance(item, ProductEvent):
+                    execution.accept_runtime_event(item)
                     event_types.append(item.type)
                 else:
-                    result = item
+                    result = execution.validate_result(item)
         if result is None:
             raise RuntimeError("result_missing")
         summary = {

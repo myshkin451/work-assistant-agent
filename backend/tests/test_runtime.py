@@ -1,23 +1,73 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import Any, cast
 
 import pytest
 from langchain.agents.middleware import ModelRequest, ModelResponse
-from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
+from langchain.tools import tool
+from langchain_core.messages import AIMessage
+from langgraph.runtime import Runtime
+from policy_fixtures import make_execution, make_settings
 
 from work_assistant.agent_runtime import (
     AgentResult,
+    DeepSeekRuntimeContext,
     FakeAgentRunner,
     ProductEvent,
+    RuntimeCleanupTimeout,
     RuntimeConfigurationError,
-    enforce_single_time_tool_call,
+    RuntimeUnavailable,
+    _RuntimeLifecycle,
+    apply_model_policy,
+    get_current_time,
     read_current_time,
     runtime_for_settings,
+    validate_runtime_configuration,
 )
+from work_assistant.bootstrap import build_policy_kernel
+from work_assistant.context_builder import BuiltContext
+from work_assistant.identity import Principal
 from work_assistant.schemas import Message
-from work_assistant.settings import Settings
+
+TEST_PRINCIPAL = Principal(subject="neutral-runtime-principal")
+
+
+def message(content: str, run_id: str = "run") -> Message:
+    return Message(
+        message_id=f"message-{run_id}",
+        role="user",
+        content=content,
+        created_at=datetime.now(UTC),
+        run_id=run_id,
+    )
+
+
+async def collect_fake(
+    runner: FakeAgentRunner,
+    *,
+    messages: list[Message],
+    run_id: str,
+) -> tuple[list[ProductEvent], AgentResult]:
+    execution = make_execution(TEST_PRINCIPAL)
+    built = execution.build_context(messages)
+    events: list[ProductEvent] = []
+    result: AgentResult | None = None
+    async for item in runner.stream(
+        thread_id="thread",
+        run_id=run_id,
+        messages=messages,
+        execution=execution,
+        built_context=built,
+    ):
+        if isinstance(item, ProductEvent):
+            execution.accept_runtime_event(item)
+            events.append(item)
+        else:
+            result = execution.validate_result(item)
+    assert result is not None
+    return events, result
 
 
 def test_time_tool_validates_iana_timezone() -> None:
@@ -28,31 +78,19 @@ def test_time_tool_validates_iana_timezone() -> None:
         read_current_time("Not/A_Real_Zone")
 
 
-async def test_fake_runner_uses_public_tool_lifecycle() -> None:
-    runner = FakeAgentRunner(step_delay_seconds=0)
-    items: list[Any] = [
-        item
-        async for item in runner.stream(
-            thread_id="thread",
-            run_id="run",
-            messages=[
-                Message(
-                    message_id="message",
-                    role="user",
-                    content="What time is it in Europe/London?",
-                    created_at=datetime.now(UTC),
-                    run_id="run",
-                )
-            ],
-        )
-    ]
-    assert [item.type for item in items if isinstance(item, ProductEvent)][:3] == [
+async def test_fake_runner_uses_policy_guard_and_public_tool_lifecycle() -> None:
+    events, result = await collect_fake(
+        FakeAgentRunner(step_delay_seconds=0),
+        messages=[message("What time is it in Europe/London?")],
+        run_id="run",
+    )
+    assert [event.type for event in events][:3] == [
         "tool.started",
         "tool.finished",
         "source.added",
     ]
-    result = next(item for item in items if isinstance(item, AgentResult))
     assert "Europe/London" in result.text
+    assert result.source_ids == ("system-clock-iana-tzdb",)
 
 
 async def test_fake_runner_supports_the_chinese_multiturn_acceptance_prompts() -> None:
@@ -60,71 +98,156 @@ async def test_fake_runner_supports_the_chinese_multiturn_acceptance_prompts() -
     messages: list[Message] = []
     expected = ["Asia/Shanghai", "Europe/London", "America/New_York"]
     for index, prompt in enumerate(("请查询当前上海时间。", "那伦敦呢？", "再看看纽约。")):
-        messages.append(
-            Message(
-                message_id=f"message-{index}",
-                role="user",
-                content=prompt,
-                created_at=datetime.now(UTC),
-                run_id=f"run-{index}",
-            )
+        messages.append(message(prompt, f"run-{index}"))
+        events, _ = await collect_fake(
+            runner,
+            messages=messages,
+            run_id=f"run-{index}",
         )
-        items = [
-            item
-            async for item in runner.stream(
-                thread_id="thread",
-                run_id=f"run-{index}",
-                messages=messages,
-            )
-        ]
-        started = next(
-            item
-            for item in items
-            if isinstance(item, ProductEvent) and item.type == "tool.started"
-        )
+        started = next(event for event in events if event.type == "tool.started")
         assert started.data["input_summary"] == expected[index]
 
 
-@pytest.mark.parametrize(
-    ("messages", "expected_choice"),
-    [
-        ([HumanMessage(content="What time is it?")], "required"),
-        (
-            [
-                HumanMessage(content="What time is it?"),
-                ToolMessage(content="{}", tool_call_id="time-1"),
-            ],
-            "none",
-        ),
-    ],
-)
-async def test_time_agent_enforces_exactly_one_tool_choice(
-    messages: list[HumanMessage | ToolMessage], expected_choice: str
-) -> None:
-    choices: list[Any] = []
+async def test_model_hook_filters_tools_and_replaces_the_full_system_message() -> None:
+    @tool
+    def forbidden_probe() -> str:
+        """A Tool that must not be visible for this Run."""
+
+        return "forbidden"
+
+    execution = make_execution(TEST_PRINCIPAL)
+    built = execution.build_context([message("Answer directly")])
+
+    async def emit(event: ProductEvent) -> None:
+        del event
+
+    context = DeepSeekRuntimeContext(
+        execution=execution,
+        built_context=built,
+        emit=emit,
+    )
+    observed: dict[str, Any] = {}
 
     async def handler(request: ModelRequest[Any]) -> ModelResponse[Any]:
-        choices.append(request.tool_choice)
-        return ModelResponse(result=[AIMessage(content="done")])
+        observed["tools"] = [getattr(item, "name", None) for item in request.tools]
+        observed["system"] = request.system_message.text if request.system_message else None
+        observed["tool_choice"] = request.tool_choice
+        return ModelResponse(result=[AIMessage(content="safe direct answer")])
 
-    request = ModelRequest(model=cast(Any, object()), messages=messages)
-    await enforce_single_time_tool_call.awrap_model_call(request, handler)
-    assert choices == [expected_choice]
-
-
-async def test_deepseek_mode_fails_closed_without_key() -> None:
-    settings = Settings(
-        model_mode="deepseek",
-        deepseek_api_key=None,
-        checkpoint_database_url="postgresql://unused:unused@localhost/unused",
+    request = ModelRequest(
+        model=cast(Any, object()),
+        messages=[],
+        tools=[get_current_time, forbidden_probe],
+        runtime=Runtime(context=context),
     )
+    await apply_model_policy.awrap_model_call(request, handler)
+    assert observed == {
+        "tools": ["get_current_time"],
+        "system": built.system_prompt,
+        "tool_choice": "auto",
+    }
+    assert execution.usage().model_steps == 1
+
+
+async def test_runtime_configuration_fails_closed_before_checkpoint_work() -> None:
+    settings = make_settings(model_mode="deepseek", deepseek_api_key=None)
     with pytest.raises(RuntimeConfigurationError, match="deepseek_api_key_missing"):
-        # Validate before any checkpoint connection by constructing the runner path directly.
-        from work_assistant.agent_runtime import DeepSeekAgentRunner
+        validate_runtime_configuration(settings)
 
-        DeepSeekAgentRunner(settings=settings, checkpointer=None)  # type: ignore[arg-type]
-
-    # The default fake lane never needs or reads a model credential.
-    fake = Settings(model_mode="fake", deepseek_api_key=None)
-    async with runtime_for_settings(fake) as runner:
+    fake = make_settings(model_mode="fake", deepseek_api_key=None)
+    kernel = build_policy_kernel(fake)
+    async with runtime_for_settings(fake, policy_kernel=kernel) as runner:
         assert isinstance(runner, FakeAgentRunner)
+
+
+def test_context_type_remains_strict_and_does_not_need_principal_metadata() -> None:
+    execution = make_execution(TEST_PRINCIPAL)
+    built = execution.build_context([message("hello")])
+    assert isinstance(built, BuiltContext)
+    assert TEST_PRINCIPAL.subject not in built.system_prompt
+
+
+async def test_runtime_cleanup_timeout_cancels_once_and_permanently_fails_closed() -> None:
+    lifecycle = _RuntimeLifecycle(cleanup_grace_seconds=0.01)
+    entered = asyncio.Event()
+    cleanup_entered = asyncio.Event()
+    cleanup_release = asyncio.Event()
+    cancel_count = 0
+
+    async def stuck_producer() -> None:
+        nonlocal cancel_count
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancel_count += 1
+            cleanup_entered.set()
+            await cleanup_release.wait()
+            raise RuntimeError("late-runtime-cleanup") from None
+
+    producer = asyncio.create_task(stuck_producer())
+    await entered.wait()
+
+    with pytest.raises(RuntimeCleanupTimeout, match="runtime_cleanup_timeout"):
+        await lifecycle.finish_producer(producer)
+    await cleanup_entered.wait()
+
+    assert cancel_count == 1
+    assert lifecycle.is_healthy is False
+    with pytest.raises(RuntimeUnavailable, match="runtime_cleanup_timeout"):
+        lifecycle.require_healthy()
+
+    # Shutdown observes only for the same finite grace and returns while the
+    # already-cancelled producer is still quarantined.
+    await asyncio.wait_for(lifecycle.shutdown(), timeout=0.2)
+    assert cancel_count == 1
+    assert producer.done() is False
+    cleanup_release.set()
+    done, pending = await asyncio.wait({producer}, timeout=1)
+    assert done == {producer}
+    assert pending == set()
+    await asyncio.sleep(0)
+
+    assert cancel_count == 1
+    assert producer.done()
+    assert getattr(producer, "_log_traceback", True) is False
+
+
+async def test_runtime_normal_completion_is_observed_without_cancellation() -> None:
+    lifecycle = _RuntimeLifecycle(cleanup_grace_seconds=0.1)
+
+    async def completed_producer() -> None:
+        await asyncio.sleep(0)
+
+    producer = asyncio.create_task(completed_producer())
+    await lifecycle.finish_producer(producer, cancel=False)
+
+    assert producer.done()
+    assert producer.cancelling() == 0
+    assert lifecycle.is_healthy is True
+
+
+async def test_runtime_cleanup_bounds_langgraph_nested_cleanup_without_cancelling_it() -> None:
+    lifecycle = _RuntimeLifecycle(cleanup_grace_seconds=0.01)
+    entered = asyncio.Event()
+    nested_cleanup: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+
+    async def producer_with_nested_cleanup() -> None:
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            raise asyncio.CancelledError(nested_cleanup) from None
+
+    producer = asyncio.create_task(producer_with_nested_cleanup())
+    await entered.wait()
+
+    with pytest.raises(RuntimeCleanupTimeout, match="runtime_cleanup_timeout"):
+        await lifecycle.finish_producer(producer)
+
+    assert producer.cancelling() == 1
+    assert nested_cleanup.cancelled() is False
+    nested_cleanup.set_result(None)
+    await lifecycle.shutdown()
+    await asyncio.sleep(0)
+    assert nested_cleanup.cancelled() is False

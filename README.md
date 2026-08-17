@@ -5,6 +5,12 @@ chat experience. It owns stable Thread, Run, Message, Event, Tool, cancellation,
 replay, persistence, and subject-scoped ownership semantics while reusing
 LangChain and LangGraph for the model/Tool loop.
 
+Core 1.0 now also includes one versioned, startup-validated Agent definition, a
+fixed-precedence Context Builder, deterministic Principal/Agent/base-Tool
+capability intersection, bounded execution, validated result/source provenance,
+and immutable per-Run policy evidence. See the
+[`Agent policy kernel contract`](docs/contracts/agent-policy.md).
+
 The first vertical slice is deliberately small but complete: a user can ask for
 the current time and follow up with other places in the same conversation. The
 model uses a read-only time Tool once per Run, the UI streams stable product
@@ -83,6 +89,51 @@ cross-subject denial, cancellation, retry, SSE `after_seq`, `Last-Event-ID`, and
 re-authentication on reconnect. The development subject header is confined to
 loopback tests; it is not placed in frontend configuration, URLs, browser
 storage, product payloads, or smoke output.
+
+The bounded T-006 Compose lane uses the same Fake and Runtime policy hooks,
+checks stable stop codes and source provenance, and inspects only redacted
+server-side policy evidence:
+
+```bash
+set -euo pipefail
+export COMPOSE_DISABLE_ENV_FILE=1 APP_ENV=development
+export IDENTITY_PROVIDER_MODE=development_header MODEL_MODE=fake
+export MAX_MODEL_STEPS=3 MAX_TOOL_CALLS=2 MAX_IDENTICAL_TOOL_CALLS=1
+export MAX_NO_PROGRESS_STEPS=2 RUN_TIMEOUT_SECONDS=2
+export DATABASE_OPERATION_TIMEOUT_SECONDS=2
+export REPOSITORY_CLEANUP_GRACE_SECONDS=3 FAKE_STEP_DELAY_SECONDS=0.02
+export WORK_ASSISTANT_API_URL=http://127.0.0.1:8000
+export WORK_ASSISTANT_DATABASE_URL=postgresql://work_assistant:work_assistant@127.0.0.1:55432/work_assistant
+T006_COMPOSE=(docker compose --env-file /dev/null -p work-assistant-t006-e3)
+
+"${T006_COMPOSE[@]}" down --volumes --remove-orphans
+"${T006_COMPOSE[@]}" build backend frontend
+"${T006_COMPOSE[@]}" up -d --wait --wait-timeout 120 postgres
+"${T006_COMPOSE[@]}" run --rm --no-deps backend \
+  uv run --no-sync alembic upgrade 0002_principal_ownership
+backend/.venv/bin/python scripts/policy_compose_smoke.py prepare-v02-legacy
+"${T006_COMPOSE[@]}" run --rm --no-deps backend \
+  uv run --no-sync alembic upgrade head
+backend/.venv/bin/python scripts/policy_compose_smoke.py verify-v03-legacy
+"${T006_COMPOSE[@]}" up -d --no-build --wait --wait-timeout 120 backend frontend
+backend/.venv/bin/python scripts/policy_compose_smoke.py exercise
+```
+
+The fixed two-second deadline keeps the deliberate timeout case bounded without
+turning container scheduling into a 300 ms performance gate. The explicit
+database timeout and cleanup grace prevent ambient shell values from weakening
+the fail-stop contract. Development-header identity is required for the two
+neutral Principals; none of these settings is a production default.
+
+For a real PostgreSQL `0002 → 0003` upgrade proof, run the script's
+`prepare-v02-legacy` mode at revision `0002_principal_ownership`, upgrade to
+head, and then run `verify-v03-legacy`. The probe confirms that historical Runs
+remain honestly unversioned. The backend image normally upgrades to head before
+serving, so the migration proof must use the one-off commands above before the
+backend service starts. Migration `0003_agent_policy_evidence` takes an
+exclusive PostgreSQL table lock before its downgrade guard and refuses to
+discard any recorded T-006 evidence. Run it only in an application downtime
+window even though the database guard is the final safety boundary.
 
 Migration `0002_principal_ownership` requires a live database connection but an
 exclusive application downtime window. It preserves v0.2 rows under an

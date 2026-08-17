@@ -949,6 +949,13 @@ function friendlyRunError(failureCode: RunProjection['failureCode']) {
   if (failureCode === 'run_timeout') return '本次运行超时，未能完成。';
   if (failureCode === 'agent_execution_failed') return 'Agent 执行失败，未能完成本次运行。';
   if (failureCode === 'service_restarted') return '服务已重启，原运行已安全结束。';
+  if (failureCode === 'model_step_limit') return 'Agent 已达到本次推理步数上限，运行已安全停止。';
+  if (failureCode === 'tool_call_limit') return 'Agent 已达到本次工具调用上限，运行已安全停止。';
+  if (failureCode === 'repeated_tool_call') return '检测到重复工具调用，运行已安全停止。';
+  if (failureCode === 'no_progress') return 'Agent 连续未取得新进展，运行已安全停止。';
+  if (failureCode === 'tool_not_allowed') return 'Agent 请求了未获授权的工具，运行已安全停止。';
+  if (failureCode === 'result_schema_invalid') return 'Agent 返回结果不符合约定，未保存为回答。';
+  if (failureCode === 'source_validation_failed') return '回答来源校验失败，未保存为回答。';
   return '本次运行没有完成，请重试。';
 }
 
