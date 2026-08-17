@@ -38,7 +38,11 @@ class Settings(BaseSettings):
     allowed_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
     max_model_steps: int = Field(default=8, ge=2, le=32)
     max_tool_calls: int = Field(default=4, ge=1, le=16)
+    max_identical_tool_calls: int = Field(default=1, ge=1, le=5)
+    max_no_progress_steps: int = Field(default=2, ge=1, le=8)
     run_timeout_seconds: float = Field(default=120.0, gt=0, le=900)
+    database_operation_timeout_seconds: float = Field(default=2.0, ge=0.1, le=30)
+    repository_cleanup_grace_seconds: float = Field(default=3.0, ge=0.2, le=60)
     model_concurrency: int = Field(default=5, ge=1, le=50)
     fake_step_delay_seconds: float = Field(default=0.02, ge=0, le=10)
     sse_poll_interval_seconds: float = Field(default=0.05, gt=0, le=2)
@@ -48,6 +52,15 @@ class Settings(BaseSettings):
     def validate_identity_mode(self) -> Settings:
         if self.app_env == "production" and self.identity_provider_mode != "external":
             raise ValueError("production requires an external identity provider")
+        if self.app_env == "production" and self.model_mode == "fake":
+            raise ValueError("production requires a non-fake model profile")
+        if self.repository_cleanup_grace_seconds <= self.database_operation_timeout_seconds:
+            raise ValueError("repository cleanup grace must exceed the database timeout")
+        if (
+            self.database_url.startswith("postgresql+psycopg://")
+            and self.database_operation_timeout_seconds < 2
+        ):
+            raise ValueError("PostgreSQL database timeout must be at least two seconds")
         if self.app_env == "production":
             for origin in self.cors_origins:
                 hostname = urlsplit(origin).hostname

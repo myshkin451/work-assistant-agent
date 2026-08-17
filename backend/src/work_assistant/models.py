@@ -67,6 +67,15 @@ class RunRecord(Base):
     actor_subject: Mapped[str] = mapped_column(String(255), nullable=False)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="created")
     last_seq: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # T-006+ Runs freeze their evaluated policy at creation and write an outcome
+    # only in the winning terminal transaction. Pre-T-006 rows remain explicitly
+    # null rather than being assigned invented modern policy evidence.
+    execution_plan: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON(none_as_null=True), nullable=True
+    )
+    execution_outcome: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON(none_as_null=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 

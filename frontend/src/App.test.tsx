@@ -595,6 +595,13 @@ describe('employee chat vertical slice', () => {
       ['run_timeout', '本次运行超时，未能完成。'],
       ['agent_execution_failed', 'Agent 执行失败，未能完成本次运行。'],
       ['service_restarted', '服务已重启，原运行已安全结束。'],
+      ['model_step_limit', 'Agent 已达到本次推理步数上限，运行已安全停止。'],
+      ['tool_call_limit', 'Agent 已达到本次工具调用上限，运行已安全停止。'],
+      ['repeated_tool_call', '检测到重复工具调用，运行已安全停止。'],
+      ['no_progress', 'Agent 连续未取得新进展，运行已安全停止。'],
+      ['tool_not_allowed', 'Agent 请求了未获授权的工具，运行已安全停止。'],
+      ['result_schema_invalid', 'Agent 返回结果不符合约定，未保存为回答。'],
+      ['source_validation_failed', '回答来源校验失败，未保存为回答。'],
     ];
     const messages: Message[] = [];
     const runs: RunSnapshot[] = [];
@@ -642,7 +649,7 @@ describe('employee chat vertical slice', () => {
     for (const [, message] of cases) {
       expect(await screen.findByText(message)).toBeInTheDocument();
     }
-    expect(screen.getAllByRole('button', { name: '重新运行' })).toHaveLength(3);
+    expect(screen.getAllByRole('button', { name: '重新运行' })).toHaveLength(cases.length);
   });
 
   it('retries service_restarted as a new run and preserves the failed turn', async () => {

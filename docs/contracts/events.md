@@ -1,4 +1,4 @@
-# Product API and event contract v0.3
+# Product API and event contract v0.4
 
 The frontend uses the product contract below. It does not consume raw model,
 LangChain, LangGraph, or provider events.
@@ -98,6 +98,10 @@ Request and response bodies:
 - `POST /api/runs/{run_id}/cancel` returns the current `RunView` after recording
   the cancellation request or terminal cancellation.
 
+Thread and Run creation bodies are strict. Unknown fields, including a
+client-supplied Agent ID, budget, Principal role, or Tool policy, return `422`
+and cannot alter the server-evaluated execution plan.
+
 Authentication and resource errors are stable:
 
 - `401 {"detail":{"code":"authentication_required"}}` when no valid Principal exists;
@@ -171,11 +175,18 @@ Initial public event data:
 - `run.failed`: `{ "status": "failed", "error_code": RunFailureCode }`
 - `run.cancelled`: `{ "status": "cancelled" }`
 
-The public failure codes remain:
+The public failure codes are:
 
 - `run_timeout`
 - `agent_execution_failed`
 - `service_restarted`
+- `model_step_limit`
+- `tool_call_limit`
+- `repeated_tool_call`
+- `no_progress`
+- `tool_not_allowed`
+- `result_schema_invalid`
+- `source_validation_failed`
 
 `stream_unavailable` is a client connection state, not a Run failure code or
 terminal event. A failed Run remains immutable; retry creates a new Run with a
@@ -190,7 +201,10 @@ allocation and again when read into the public response model. Unknown types,
 extra payload fields, malformed values, and Runtime-private events are rejected.
 The Runtime adapter may emit only `tool.started`, `tool.finished`,
 `message.delta`, and `source.added`. Run lifecycle and `message.completed`
-events are Host-owned and committed with product state.
+events are Host-owned and committed with product state. Tool and source events
+are also checked against the current Run's reserved-call and successful-Tool
+ledger before persistence; a structurally valid event cannot invent a Tool call
+or source.
 
 The public payload contains user-facing Tool purpose, bounded result summaries,
 source references, text deltas, and errors. It never contains model reasoning,

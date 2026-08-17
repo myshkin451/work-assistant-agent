@@ -18,7 +18,12 @@ from .schemas import (
     ThreadList,
     ThreadSnapshot,
 )
-from .service import RunService
+from .service import (
+    RepositoryCleanupTimeout,
+    RunAdmissionTimeout,
+    RunService,
+    RunServiceUnavailable,
+)
 
 router = APIRouter()
 
@@ -84,6 +89,11 @@ CurrentOwnedThread = Annotated[None, Depends(_current_owned_thread)]
 
 @router.get("/health")
 async def health(request: Request) -> dict[str, str]:
+    if not _service(request).is_healthy:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "service_unavailable"},
+        )
     await request.app.state.database.healthcheck()
     return {"status": "ok"}
 
@@ -141,6 +151,16 @@ async def create_run(
         raise _forbidden("thread") from exc
     except ActiveRunConflictError as exc:
         raise HTTPException(status_code=409, detail={"code": "thread_has_active_run"}) from exc
+    except RunAdmissionTimeout as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "run_admission_timeout"},
+        ) from exc
+    except (RepositoryCleanupTimeout, RunServiceUnavailable) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "service_unavailable"},
+        ) from exc
 
 
 @router.post("/api/runs/{run_id}/cancel", response_model=RunView)
@@ -156,6 +176,11 @@ async def cancel_run(
         raise _not_found("run") from exc
     except ResourceForbiddenError as exc:
         raise _forbidden("run") from exc
+    except (RepositoryCleanupTimeout, RunServiceUnavailable, TimeoutError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "service_unavailable"},
+        ) from exc
 
 
 def _sse(event: EventEnvelope) -> str:
