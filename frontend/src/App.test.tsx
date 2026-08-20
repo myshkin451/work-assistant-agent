@@ -107,10 +107,10 @@ describe('employee chat vertical slice', () => {
     render(<App />);
 
     expect(
-      await screen.findByText('当前请求未通过身份认证，请完成认证后刷新页面。'),
+      await screen.findByText('登录已失效，请重新登录。'),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText('向 Work Assistant 提问')).toBeDisabled();
-    expect(screen.queryByText('从一个真实工具开始')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('输入消息')).toBeDisabled();
+    expect(screen.queryByText('今天想处理什么？')).not.toBeInTheDocument();
     for (const button of screen.getAllByRole('button', { name: '新建对话' })) {
       expect(button).toBeDisabled();
     }
@@ -154,11 +154,11 @@ describe('employee chat vertical slice', () => {
     expect(screen.getByText(privateSnapshot.title)).toBeInTheDocument();
     resolveSse(jsonResponse({ detail: { code: 'run_forbidden' } }, 403));
     expect(
-      await screen.findByText('当前身份无权访问这项会话或运行。'),
+      await screen.findByText('你没有权限查看这个对话。'),
     ).toBeInTheDocument();
     expect(screen.queryByText(privateMessage.content)).not.toBeInTheDocument();
     expect(screen.queryByText(privateSnapshot.title)).not.toBeInTheDocument();
-    expect(screen.getByLabelText('向 Work Assistant 提问')).toBeDisabled();
+    expect(screen.getByLabelText('输入消息')).toBeDisabled();
     expect(screen.queryByRole('button', { name: '停止运行' })).not.toBeInTheDocument();
   });
 
@@ -198,20 +198,20 @@ describe('employee chat vertical slice', () => {
     render(<App />);
 
     expect(await screen.findByText(userMessage.content)).toBeInTheDocument();
-    const composer = screen.getByLabelText('向 Work Assistant 提问');
+    const composer = screen.getByLabelText('输入消息');
     await user.type(composer, 'A 主体尚未发送完成的草稿');
     await user.click(screen.getByRole('button', { name: '发送消息' }));
     await user.click(screen.getByRole('button', { name: otherSummary.title }));
 
     expect(
-      await screen.findByText('无法访问这个会话。它可能不存在，或当前身份没有访问权限。'),
+      await screen.findByText('无法打开这个对话。你可以选择最近对话，或新建一个对话。'),
     ).toBeInTheDocument();
     expect(screen.getByRole('button', { name: summary.title })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: otherSummary.title })).toBeInTheDocument();
     resolveCreateRun(jsonResponse({ detail: { code: 'service_failure' } }, 500));
     await waitFor(() => {
       expect(screen.getByRole('alert')).toHaveTextContent(
-        '无法访问这个会话。它可能不存在，或当前身份没有访问权限。',
+        '无法打开这个对话。你可以选择最近对话，或新建一个对话。',
       );
     });
     expect(composer).toHaveValue('');
@@ -220,7 +220,7 @@ describe('employee chat vertical slice', () => {
     expect(screen.queryByText('A 主体尚未发送完成的草稿')).not.toBeInTheDocument();
   });
 
-  it('creates a real run and renders deduplicated product events, tools and sources', async () => {
+  it('connects SSE before the first snapshot resolves and renders deduplicated product events', async () => {
     window.history.replaceState(null, '', '/');
     const initialKey = '11111111-1111-4111-8111-111111111111';
     const initialThreadId = '22222222-2222-4222-8222-222222222222';
@@ -271,6 +271,11 @@ describe('employee chat vertical slice', () => {
       active_run: null,
     };
     let snapshotReads = 0;
+    let staleSnapshotResolved = false;
+    let resolveStaleSnapshot!: (response: Response) => void;
+    const staleSnapshot = new Promise<Response>((resolve) => {
+      resolveStaleSnapshot = resolve;
+    });
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       const url = String(input);
       const method = init?.method ?? 'GET';
@@ -282,7 +287,7 @@ describe('employee chat vertical slice', () => {
       }
       if (url === `/api/threads/${initialThreadId}` && method === 'GET') {
         snapshotReads += 1;
-        return jsonResponse(snapshotReads === 1 ? withUser : completedSnapshot);
+        return snapshotReads === 1 ? staleSnapshot : jsonResponse(completedSnapshot);
       }
       if (url === '/api/runs/run-1/events?after_seq=0') {
         return sseResponse([
@@ -318,14 +323,15 @@ describe('employee chat vertical slice', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    expect(await screen.findByText('从一个真实工具开始')).toBeInTheDocument();
+    expect(await screen.findByText('今天想处理什么？')).toBeInTheDocument();
     await user.type(
-      screen.getByLabelText('向 Work Assistant 提问'),
+      screen.getByLabelText('输入消息'),
       '请查询当前上海时间，并说明结果来自哪里。',
     );
     await user.click(screen.getByRole('button', { name: '发送消息' }));
 
     expect(await screen.findByText(assistantMessage.content)).toBeInTheDocument();
+    expect(staleSnapshotResolved).toBe(false);
     expect(screen.getByText('查询指定时区的当前时间')).toBeInTheDocument();
     expect(screen.getByText('系统时钟 · Asia/Shanghai')).toBeInTheDocument();
     expect(screen.queryByText('重复内容不应显示')).not.toBeInTheDocument();
@@ -347,6 +353,64 @@ describe('employee chat vertical slice', () => {
       '/api/runs/run-1/events?after_seq=0',
       expect.objectContaining({ credentials: 'include' }),
     );
+    staleSnapshotResolved = true;
+    resolveStaleSnapshot(jsonResponse(withUser));
+    await waitFor(() => expect(screen.queryByRole('button', { name: '停止运行' })).not.toBeInTheDocument());
+    expect(screen.getByText(assistantMessage.content)).toBeInTheDocument();
+  });
+
+  it('keeps a newer same-thread run active when an older refresh returns late', async () => {
+    const firstRun = { ...running, last_seq: 1 };
+    const firstSnapshot: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage],
+      runs: [runSnapshot(firstRun, [event(1, 'run.started', { status: 'running' })])],
+      active_run: firstRun,
+    };
+    const secondRun: RunView = {
+      ...running,
+      run_id: 'run-2',
+      created_at: '2026-08-12T12:01:00Z',
+    };
+    let threadReads = 0;
+    let resolveOldRefresh!: (response: Response) => void;
+    const oldRefresh = new Promise<Response>((resolve) => {
+      resolveOldRefresh = resolve;
+    });
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/api/threads' && method === 'GET') return jsonResponse({ items: [summary] });
+      if (url === '/api/threads/thread-1' && method === 'GET') {
+        threadReads += 1;
+        if (threadReads === 1) return jsonResponse(firstSnapshot);
+        return oldRefresh;
+      }
+      if (url === '/api/runs/run-1/events?after_seq=1') {
+        return sseResponse([event(2, 'run.completed', { status: 'completed' })]);
+      }
+      if (url === '/api/threads/thread-1/runs' && method === 'POST') {
+        return jsonResponse(secondRun);
+      }
+      if (url === '/api/runs/run-2/events?after_seq=0') {
+        return new Promise<Response>(() => undefined);
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+    render(<App />);
+
+    const composer = await screen.findByLabelText('输入消息');
+    await waitFor(() => expect(composer).toBeEnabled());
+    await user.type(composer, '继续查询下一项');
+    await user.click(screen.getByRole('button', { name: '发送消息' }));
+    expect(await screen.findByRole('button', { name: '停止运行' })).toBeInTheDocument();
+
+    resolveOldRefresh(jsonResponse(firstSnapshot));
+    await waitFor(() => expect(screen.getByRole('button', { name: '停止运行' })).toBeInTheDocument());
+    expect(composer).toBeDisabled();
+    expect(screen.getByText('继续查询下一项')).toBeInTheDocument();
   });
 
   it('restores an active run and continues SSE from the snapshot last seq', async () => {
@@ -463,7 +527,7 @@ describe('employee chat vertical slice', () => {
     render(<App />);
 
     expect(await screen.findByText(assistantMessage.content)).toBeInTheDocument();
-    expect(await screen.findByText('已完成')).toBeInTheDocument();
+    expect(screen.queryByText('已完成')).not.toBeInTheDocument();
     await waitFor(() => expect(listReads).toBeGreaterThan(1));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
@@ -578,10 +642,10 @@ describe('employee chat vertical slice', () => {
       expect(screen.getByText(`系统时钟 · ${timezone}`)).toBeInTheDocument();
       expect(screen.getByText(answer)).toBeInTheDocument();
     }
-    expect(screen.getAllByText('已完成')).toHaveLength(3);
+    expect(screen.queryByText('已完成')).not.toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: '其他对话' }));
-    expect(await screen.findByText('从一个真实工具开始')).toBeInTheDocument();
+    expect(await screen.findByText('今天想处理什么？')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '查询上海当前时间' }));
     expect(await screen.findByText('伦敦现在是 13:00。')).toBeInTheDocument();
 
@@ -611,24 +675,24 @@ describe('employee chat vertical slice', () => {
 
     expect(await screen.findByText('连接中断')).toBeInTheDocument();
     expect(
-      screen.getByText('实时连接暂不可用。运行状态未被改为失败；请刷新页面重新连接。'),
+      screen.getByText('连接中断，刷新页面后可继续查看。'),
     ).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '重新运行' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '停止运行' })).toBeInTheDocument();
   });
 
   it('renders every frozen run failure code with a deterministic message', async () => {
     const cases: Array<[RunFailureCode, string]> = [
-      ['run_timeout', '本次运行超时，未能完成。'],
-      ['agent_execution_failed', 'Agent 执行失败，未能完成本次运行。'],
-      ['service_restarted', '服务已重启，原运行已安全结束。'],
-      ['model_step_limit', 'Agent 已达到本次推理步数上限，运行已安全停止。'],
-      ['tool_call_limit', 'Agent 已达到本次工具调用上限，运行已安全停止。'],
-      ['repeated_tool_call', '检测到重复工具调用，运行已安全停止。'],
-      ['no_progress', 'Agent 连续未取得新进展，运行已安全停止。'],
-      ['tool_not_allowed', 'Agent 请求了未获授权的工具，运行已安全停止。'],
-      ['result_schema_invalid', 'Agent 返回结果不符合约定，未保存为回答。'],
-      ['source_validation_failed', '回答来源校验失败，未保存为回答。'],
+      ['run_timeout', '等待时间过长，这次回答没有完成。'],
+      ['agent_execution_failed', '这次没有生成完整回答，请重试。'],
+      ['service_restarted', '服务刚刚恢复，请重试这条消息。'],
+      ['model_step_limit', '这次没有生成完整回答，请重试。'],
+      ['tool_call_limit', '这次没有生成完整回答，请重试。'],
+      ['repeated_tool_call', '这次没有生成完整回答，请重试。'],
+      ['no_progress', '这次没有生成完整回答，请重试。'],
+      ['tool_not_allowed', '当前请求暂时无法处理。'],
+      ['result_schema_invalid', '这次回答不完整，未予展示。'],
+      ['source_validation_failed', '来源未通过校验，这次回答未予展示。'],
     ];
     const messages: Message[] = [];
     const runs: RunSnapshot[] = [];
@@ -673,10 +737,14 @@ describe('employee chat vertical slice', () => {
     vi.stubGlobal('fetch', fetchMock);
     render(<App />);
 
+    const expectedCounts = new Map<string, number>();
     for (const [, message] of cases) {
-      expect(await screen.findByText(message)).toBeInTheDocument();
+      expectedCounts.set(message, (expectedCounts.get(message) ?? 0) + 1);
     }
-    expect(screen.getAllByRole('button', { name: '重新运行' })).toHaveLength(cases.length);
+    for (const [message, count] of expectedCounts) {
+      expect(await screen.findAllByText(message)).toHaveLength(count);
+    }
+    expect(screen.getAllByRole('button', { name: '重试' })).toHaveLength(cases.length);
   });
 
   it('retries service_restarted as a new run and preserves the failed turn', async () => {
@@ -784,12 +852,12 @@ describe('employee chat vertical slice', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    expect(await screen.findByText('服务已重启，原运行已安全结束。')).toBeInTheDocument();
+    expect(await screen.findByText('服务刚刚恢复，请重试这条消息。')).toBeInTheDocument();
     expect(screen.getByText('已停止')).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: '重新运行' }));
+    await user.click(screen.getByRole('button', { name: '重试' }));
 
     expect(await screen.findByText(retryAssistant.content)).toBeInTheDocument();
-    expect(screen.getByText('服务已重启，原运行已安全结束。')).toBeInTheDocument();
+    expect(screen.getByText('服务刚刚恢复，请重试这条消息。')).toBeInTheDocument();
     const runPosts = fetchMock.mock.calls.filter(
       ([input, init]) =>
         String(input) === '/api/threads/thread-1/runs' && (init?.method ?? 'GET') === 'POST',
@@ -848,7 +916,7 @@ describe('employee chat vertical slice', () => {
 
     const stop = await screen.findByRole('button', { name: '停止运行' });
     await user.click(stop);
-    expect(await screen.findByText('本次运行已停止。')).toBeInTheDocument();
+    expect(await screen.findByText('已停止回答。')).toBeInTheDocument();
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         '/api/runs/run-1/cancel',

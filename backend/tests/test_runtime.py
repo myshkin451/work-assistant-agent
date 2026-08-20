@@ -8,7 +8,7 @@ from typing import Any, cast
 import pytest
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain.tools import tool
-from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage, SystemMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langgraph.runtime import Runtime
 from policy_fixtures import make_execution, make_settings
 
@@ -21,6 +21,7 @@ from work_assistant.agent_runtime import (
     RuntimeCleanupTimeout,
     RuntimeConfigurationError,
     RuntimeUnavailable,
+    _request_final_answer,
     _RuntimeLifecycle,
     apply_model_policy,
     get_current_time,
@@ -168,30 +169,37 @@ async def test_model_hook_filters_tools_and_replaces_the_full_system_message() -
         observed["tools"] = [getattr(item, "name", None) for item in request.tools]
         observed["system"] = request.system_message.text if request.system_message else None
         observed["tool_choice"] = request.tool_choice
-        return ModelResponse(result=[AIMessage(content="safe direct answer")])
+        return ModelResponse(
+            result=[
+                AIMessage(
+                    content="safe hidden preamble",
+                    tool_calls=[
+                        {
+                            "id": "visible-time",
+                            "name": "get_current_time",
+                            "args": {"timezone": "UTC"},
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        )
 
     request = ModelRequest(
         model=cast(Any, model),
         messages=[],
-        tools=[get_current_time, forbidden_probe],
+        tools=[get_current_time, forbidden_probe, _request_final_answer],
         runtime=Runtime(context=context),
     )
     await apply_model_policy.awrap_model_call(request, handler)
-    assert observed == {
-        "tools": ["get_current_time"],
-        "system": built.system_prompt,
-        "tool_choice": "auto",
-    }
-    assert model.model_kwargs == [{}]
-    assert len(model.received_messages) == 1
-    assert isinstance(model.received_messages[0][0], SystemMessage)
-    assert model.received_messages[0][0].content == built.system_prompt
-    assert [event.data for event in emitted] == [
-        {"delta": "safe "},
-        {"delta": "direct answer"},
-    ]
-    assert "".join(cast(str, event.data["delta"]) for event in emitted) == "safe direct answer"
-    assert execution.usage().model_steps == 2
+    assert observed["tools"] == ["get_current_time", "host__finalize_answer"]
+    assert observed["tool_choice"] == "required"
+    assert cast(str, observed["system"]).startswith(built.system_prompt)
+    assert "that exact batch contains" in cast(str, observed["system"])
+    assert model.model_kwargs == []
+    assert model.received_messages == []
+    assert emitted == []
+    assert execution.usage().model_steps == 1
 
 
 async def test_runtime_configuration_fails_closed_before_checkpoint_work() -> None:

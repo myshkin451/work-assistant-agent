@@ -231,20 +231,37 @@ are also checked against the current Run's reserved-call and successful-Tool
 ledger before persistence; a structurally valid event cannot invent a Tool call
 or source.
 
-Agent and Tool-decision model rounds never produce public text deltas. Once the
-Agent reaches a terminal draft, the Host makes one separately budgeted,
-deadline-bounded presentation call against the same model without binding any
-Tool or function schema. Only allowlisted answer-text chunks from that provider
-stream may become `message.delta`; reasoning, Tool arguments, unknown blocks,
-and raw provider metadata are never serialized. The first safe non-empty text
-block is emitted while the provider stream is still open, including for a short
-answer; subsequent text is coalesced into bounded blocks to reduce persistence
-write amplification. A terminal-only adapter is rejected: the Host does not
-split the completed answer after generation to simulate streaming. The ordered
-delta concatenation must equal the committed `message.completed` content
-byte-for-byte. The presentation call consumes one additional model step, so a
-custom Agent budget must reserve that step; the Host never bypasses the declared
-budget to obtain a terminal answer.
+Agent and Tool-decision model rounds never produce public text deltas or a
+complete hidden draft for later rewriting. With visible external Tools, a direct
+answer requires a Host-private, argument-free finalization signal. A successful
+model turn reaches the finalizer immediately after Tool completion only when it
+contains one or more registered terminal-eligible Tools plus exactly one
+no-argument, no-text control declaring that same batch complete, and all Tool
+handlers succeed. A terminal-eligible Tool batch without the control reaches
+`after_agent` and jumps back to the model; it is not guessed complete. A mixed
+terminal/non-terminal batch without the control returns to the model, while a
+control mixed with any non-terminal Tool fails closed. With no visible external
+Tool, the first model call is already the finalizer. The control signal is not a
+public Tool, source, event, or Tool-budget attempt, and it cannot carry answer
+text.
+
+The finalizer is separately model-budgeted and deadline-bounded where a decision
+round preceded it. It calls the same raw model without binding any Tool or
+function schema and receives the trusted system Context plus conversation and
+successful Tool messages. Tool parsing, source registration, lifecycle events,
+ownership, and final result validation still run before terminal persistence;
+Tool output is never promoted directly into answer text. Only allowlisted answer
+text chunks from the provider stream may become `message.delta`; reasoning,
+Tool arguments, unknown blocks, and raw provider metadata are never serialized.
+
+The first safe non-empty provider text block is emitted while the stream is open,
+including for a short answer. Later text flushes when either 64 characters are
+buffered or 80 milliseconds elapse while generation is still active; the tail
+flushes on provider completion. A terminal-only adapter is rejected: the Host
+does not split a completed answer after generation to simulate streaming. The
+ordered delta concatenation must equal the final Runtime message and committed
+`message.completed` content byte-for-byte. The Host never bypasses declared
+model-step or total-deadline budgets to obtain a terminal answer.
 
 The public payload contains user-facing Tool purpose, bounded result summaries,
 source references, text deltas, and errors. It never contains model reasoning,

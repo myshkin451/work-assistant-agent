@@ -21,6 +21,11 @@ TIME_SOURCE = {
     "label": "System clock with IANA timezone data",
     "description": "Current server clock converted with the requested IANA timezone.",
 }
+_TERMINAL_TOOL_DESCRIPTION_SUFFIX = (
+    " Host routing: this Tool is terminal-eligible. Include the Host finalization "
+    "control in the same Tool-call batch only when that exact batch supplies every "
+    "external fact needed for the user's complete request; otherwise continue planning."
+)
 
 
 class CapabilityConfigurationError(RuntimeError):
@@ -68,6 +73,7 @@ class RegisteredTool:
     implementation: BaseTool = field(repr=False)
     summarize_input: InputSummarizer = field(repr=False)
     parse_output: OutputParser = field(repr=False)
+    terminal_after_success: bool = False
 
     def __post_init__(self) -> None:
         if len(self.tool_id) > 128 or re.fullmatch(IDENTIFIER_PATTERN, self.tool_id) is None:
@@ -81,6 +87,8 @@ class RegisteredTool:
         if not self.label.strip() or len(self.label) > 200:
             raise CapabilityConfigurationError("registered_tool_invalid")
         if not callable(self.summarize_input) or not callable(self.parse_output):
+            raise CapabilityConfigurationError("registered_tool_invalid")
+        if not isinstance(self.terminal_after_success, bool):
             raise CapabilityConfigurationError("registered_tool_invalid")
 
 
@@ -116,7 +124,17 @@ class ToolRegistry:
 
     @property
     def enabled_implementations(self) -> list[BaseTool]:
-        return [record.implementation for record in self._records.values() if record.enabled]
+        implementations: list[BaseTool] = []
+        for record in self._records.values():
+            if not record.enabled:
+                continue
+            update: dict[str, Any] = {"return_direct": record.terminal_after_success}
+            if record.terminal_after_success:
+                update["description"] = (
+                    record.implementation.description.rstrip() + _TERMINAL_TOOL_DESCRIPTION_SUFFIX
+                )
+            implementations.append(record.implementation.model_copy(update=update))
+        return implementations
 
     def require(self, tool_id: str) -> RegisteredTool:
         record = self._records.get(tool_id)
@@ -288,12 +306,13 @@ def default_tool_registry() -> ToolRegistry:
         [
             RegisteredTool(
                 tool_id="get_current_time",
-                version="1.0.0",
+                version="1.1.0",
                 enabled=True,
                 label="Read current time",
                 implementation=get_current_time,
                 summarize_input=_time_input_summary,
                 parse_output=_parse_time_output,
+                terminal_after_success=True,
             )
         ]
     )

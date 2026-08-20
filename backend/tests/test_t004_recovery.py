@@ -444,7 +444,12 @@ async def test_three_runs_keep_messages_events_and_context_isolated(
         )
         assert plan is not None
         assert plan["agent_id"] == "default-work-assistant"
-        assert plan["visible_tools"] == [{"tool_id": "get_current_time", "version": "1.0.0"}]
+        assert plan["visible_tools"] == [
+            {
+                "tool_id": "get_current_time",
+                "version": "1.1.0",
+            }
+        ]
         assert outcome is not None
         assert outcome["status"] == "completed"
         assert outcome["result_validation"] == "passed"

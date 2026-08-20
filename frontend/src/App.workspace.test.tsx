@@ -81,7 +81,7 @@ describe('conversation workspace navigation', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    expect(await screen.findByText('从一个真实工具开始')).toBeInTheDocument();
+    expect(await screen.findByText('今天想处理什么？')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '新建对话' }));
     await user.click(screen.getByRole('button', { name: '新建对话' }));
 
@@ -135,8 +135,8 @@ describe('conversation workspace navigation', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await screen.findByText('从一个真实工具开始');
-    await user.type(screen.getByLabelText('向 Work Assistant 提问'), '创建后切换');
+    await screen.findByText('今天想处理什么？');
+    await user.type(screen.getByLabelText('输入消息'), '创建后切换');
     await user.click(screen.getByRole('button', { name: '发送消息' }));
     expect(screen.getByRole('button', { name: '新建对话' })).toBeDisabled();
     expect(screen.getByRole('button', { name: threadA.title })).toBeDisabled();
@@ -239,7 +239,7 @@ describe('conversation workspace navigation', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    await screen.findByText('从一个真实工具开始');
+    await screen.findByText('今天想处理什么？');
     const trigger = screen.getByRole('button', { name: '打开对话导航' });
     await user.click(trigger);
     const drawer = screen.getByRole('dialog', { name: '对话导航' });

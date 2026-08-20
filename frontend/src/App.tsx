@@ -45,6 +45,12 @@ import {
 
 const EMPTY_TITLE = '新对话';
 
+const publicSourceCopy: Record<string, string> = {
+  'System clock with IANA time data': 'IANA 时区系统时钟',
+  'Current server clock converted with the requested IANA timezone.':
+    '由系统时钟按指定 IANA 时区换算。',
+};
+
 const iconPaths = {
   plus: 'M12 5v14M5 12h14',
   send: 'M12 19V5M6 11l6-6 6 6',
@@ -218,6 +224,109 @@ function projectionsFromSnapshot(snapshot: ThreadSnapshot): ProjectionMap {
   return projections;
 }
 
+function mergeProjectionMapsMonotonic(
+  current: ProjectionMap,
+  incoming: ProjectionMap,
+): ProjectionMap {
+  const next = { ...current };
+  for (const [runId, candidate] of Object.entries(incoming)) {
+    const existing = current[runId];
+    if (!existing) {
+      next[runId] = candidate;
+      continue;
+    }
+    if (candidate.lastSeq < existing.lastSeq) continue;
+    if (candidate.lastSeq === existing.lastSeq) {
+      next[runId] = {
+        ...existing,
+        assistantText: existing.assistantText || candidate.assistantText,
+        tools: existing.tools.length >= candidate.tools.length ? existing.tools : candidate.tools,
+        sources:
+          existing.sources.length >= candidate.sources.length
+            ? existing.sources
+            : candidate.sources,
+        ...(isTerminalStatus(candidate.run.status)
+          ? { run: candidate.run, connection: 'closed' as const, cancelling: false }
+          : {}),
+      };
+      continue;
+    }
+    next[runId] = {
+      ...candidate,
+      connection: isTerminalStatus(candidate.run.status) ? 'closed' : existing.connection,
+      cancelling: existing.cancelling,
+    };
+  }
+  return next;
+}
+
+function messagesMatch(left: Message, right: Message) {
+  if (left.message_id === right.message_id) return true;
+  if (left.role !== right.role) return false;
+  if (left.run_id && right.run_id) return left.run_id === right.run_id;
+  return left.role === 'user' && left.content === right.content;
+}
+
+function mergeThreadSnapshotMonotonic(
+  current: ThreadSnapshot | null,
+  incoming: ThreadSnapshot,
+  pending?: Message,
+) {
+  const base = pending ? mergeOptimisticMessage(incoming, pending) : incoming;
+  if (!current || current.thread_id !== incoming.thread_id) return base;
+
+  const messages = [...base.messages];
+  for (const message of current.messages) {
+    if (!messages.some((candidate) => messagesMatch(candidate, message))) messages.push(message);
+  }
+
+  const runs = [...base.runs];
+  for (const run of current.runs) {
+    const index = runs.findIndex((candidate) => candidate.run_id === run.run_id);
+    if (index < 0) runs.push(run);
+    else if ((runs[index]?.last_seq ?? 0) < run.last_seq) runs[index] = run;
+  }
+
+  let activeRun = base.active_run;
+  if (activeRun) {
+    const currentRun = current.runs.find((candidate) => candidate.run_id === activeRun?.run_id);
+    if (
+      currentRun &&
+      isTerminalStatus(currentRun.status) &&
+      currentRun.last_seq >= activeRun.last_seq
+    ) {
+      activeRun = null;
+    }
+  }
+  if (current.active_run && current.active_run.run_id !== activeRun?.run_id) {
+    const mergedCurrentRun = runs.find(
+      (candidate) => candidate.run_id === current.active_run?.run_id,
+    );
+    const currentCreatedAt = Date.parse(current.active_run.created_at);
+    const incomingCreatedAt = activeRun ? Date.parse(activeRun.created_at) : Number.NaN;
+    const currentIsNoOlder =
+      !activeRun ||
+      !Number.isFinite(currentCreatedAt) ||
+      !Number.isFinite(incomingCreatedAt) ||
+      currentCreatedAt >= incomingCreatedAt;
+    if (
+      mergedCurrentRun &&
+      !isTerminalStatus(mergedCurrentRun.status) &&
+      currentIsNoOlder
+    ) {
+      activeRun = current.active_run;
+    }
+  }
+  if (!activeRun && current.active_run) {
+    const incomingRun = base.runs.find(
+      (candidate) => candidate.run_id === current.active_run?.run_id,
+    );
+    if (!incomingRun || !isTerminalStatus(incomingRun.status)) activeRun = current.active_run;
+  }
+
+  return { ...base, messages, runs, active_run: activeRun };
+}
+
 function titleFromMessage(message: string) {
   const collapsed = message.replace(/\s+/g, ' ').trim();
   return collapsed.length > 28 ? `${collapsed.slice(0, 28)}…` : collapsed || EMPTY_TITLE;
@@ -244,7 +353,7 @@ function mergeOptimisticMessage(snapshot: ThreadSnapshot, pending: Message) {
 
 function displayError(error: unknown) {
   if (error instanceof ApiError) return error.message;
-  return '无法连接服务，请确认后端已经启动。';
+  return '暂时无法连接，请稍后重试。';
 }
 
 function isAccessError(error: unknown): error is ApiError {
@@ -317,8 +426,10 @@ export function App() {
     if (accessBlockedRef.current) return null;
     const fresh = await getThread(threadId);
     if (!accessBlockedRef.current && selectedThreadRef.current === threadId) {
-      setSnapshot(fresh);
-      setProjectionsByRunId(projectionsFromSnapshot(fresh));
+      setSnapshot((current) => mergeThreadSnapshotMonotonic(current, fresh));
+      setProjectionsByRunId((current) =>
+        mergeProjectionMapsMonotonic(current, projectionsFromSnapshot(fresh)),
+      );
     }
     return fresh;
   }, []);
@@ -458,7 +569,7 @@ export function App() {
           // One inaccessible URL is a route-level failure. Keep the caller's
           // own thread list available; active-run authorization failures still
           // use the global fail-closed path in connectRun.
-          setError('无法访问这个会话。它可能不存在，或当前身份没有访问权限。');
+          setError('无法打开这个对话。你可以选择最近对话，或新建一个对话。');
         } else if (!blockAccess(openError)) {
           setError(displayError(openError));
         }
@@ -511,7 +622,7 @@ export function App() {
       setSnapshot(null);
       setProjectionsByRunId({});
       setLoading(false);
-      setError('这个页面地址无效。请从历史会话进入，或开始一个新对话。');
+      setError('这个对话链接无效。请从最近对话进入，或新建一个对话。');
     };
 
     const handlePopState = () => applyLocation();
@@ -690,27 +801,25 @@ export function App() {
         }));
       }
 
-      let projectionToConnect = initialProjection;
-      let shouldConnect = !isTerminalStatus(run.status);
-      try {
-        const fresh = await getThread(threadId);
-        if (selectedThreadRef.current === threadId) {
-          const merged = mergeOptimisticMessage(fresh, persistedPending);
-          const projections = projectionsFromSnapshot(merged);
-          setSnapshot(merged);
-          setProjectionsByRunId(projections);
-          projectionToConnect = projections[run.run_id] ?? initialProjection;
-          shouldConnect =
-            fresh.active_run?.run_id === run.run_id &&
-            !isTerminalStatus(projectionToConnect.run.status);
-        }
-      } catch (snapshotError) {
-        if (blockAccess(snapshotError)) return;
-        // The optimistic user message remains visible while the event stream proceeds.
+      if (selectedThreadRef.current === threadId && !isTerminalStatus(run.status)) {
+        connectRun(run, initialProjection);
       }
-      if (selectedThreadRef.current === threadId && shouldConnect) {
-        connectRun(run, projectionToConnect);
-      }
+      void getThread(threadId)
+        .then((fresh) => {
+          if (accessBlockedRef.current || selectedThreadRef.current !== threadId) return;
+          const projections = projectionsFromSnapshot(fresh);
+          setSnapshot((current) =>
+            mergeThreadSnapshotMonotonic(current, fresh, persistedPending),
+          );
+          setProjectionsByRunId((current) =>
+            mergeProjectionMapsMonotonic(current, projections),
+          );
+        })
+        .catch((snapshotError: unknown) => {
+          blockAccess(snapshotError);
+          // The optimistic message and live event stream remain authoritative
+          // while a background snapshot is temporarily unavailable.
+        });
       void refreshThreads().catch((refreshError: unknown) => {
         if (blockAccess(refreshError)) return;
         if (selectedThreadRef.current === threadId) setError(displayError(refreshError));
@@ -759,7 +868,7 @@ export function App() {
         (message) => message.role === 'user' && message.run_id === runId,
       );
       if (!original) {
-        setError('无法找到这次运行的原始问题。');
+        setError('无法重试这条消息，请重新发送问题。');
         return;
       }
       await startMessage(original.content, false);
@@ -1111,11 +1220,7 @@ function Sidebar(props: ThreadNavigationProps) {
   return (
     <aside className="sidebar" aria-label="对话导航">
       <div className="brand">
-        <span className="brand-mark">W</span>
-        <div>
-          <strong>Work Assistant</strong>
-          <span>智能工作助手</span>
-        </div>
+        <strong>工作助手</strong>
       </div>
       <ThreadNavigation {...props} />
     </aside>
@@ -1185,8 +1290,7 @@ function MobileDrawer({ triggerRef, onClose, ...navigationProps }: MobileDrawerP
       >
         <div className="mobile-drawer-heading">
           <div className="brand compact">
-            <span className="brand-mark">W</span>
-            <strong>Work Assistant</strong>
+            <strong>工作助手</strong>
           </div>
           <button ref={closeButtonRef} type="button" aria-label="关闭对话导航" onClick={onClose}>
             <Icon name="close" />
@@ -1210,11 +1314,8 @@ function LoadingState() {
 function EmptyState() {
   return (
     <div className="empty-state">
-      <span className="empty-icon">
-        <Icon name="time" />
-      </span>
-      <h1>从一个真实工具开始</h1>
-      <p>例如：请查询当前上海时间，并说明结果来自哪里。</p>
+      <h1>今天想处理什么？</h1>
+      <p>可以直接提问，也可以继续最近的对话。</p>
     </div>
   );
 }
@@ -1267,34 +1368,37 @@ function AssistantTurn({
             <span />
             <span />
             <span />
-            正在处理
+            正在回答…
           </div>
         ) : null}
         {run.status === 'failed' ? (
           <div className="run-notice error run-notice-row" role="alert">
             <span>{friendlyRunError(failureCode)}</span>
             <button className="retry-button" type="button" onClick={onRetry} disabled={retryDisabled}>
-              重新运行
+              重试
             </button>
           </div>
         ) : null}
         {isWorking && connection === 'unavailable' ? (
           <div className="run-notice connection" role="status">
-            实时连接暂不可用。运行状态未被改为失败；请刷新页面重新连接。
+            连接中断，刷新页面后可继续查看。
           </div>
         ) : null}
-        {run.status === 'cancelled' ? <div className="run-notice">本次运行已停止。</div> : null}
+        {run.status === 'cancelled' ? <div className="run-notice">已停止回答。</div> : null}
         {sources.length > 0 ? (
           <div className="sources" aria-label="回答来源">
-            <strong>来源</strong>
-            <ul>
-              {sources.map((source) => (
+            <strong>参考来源</strong>
+            <ol>
+              {sources.map((source, index) => (
                 <li key={source.source_id}>
-                  <span>{source.label}</span>
-                  <small>{source.description}</small>
+                  <span className="source-index">{index + 1}.</span>
+                  <div>
+                    <span>{publicSourceCopy[source.label] ?? source.label}</span>
+                    <small>{publicSourceCopy[source.description] ?? source.description}</small>
+                  </div>
                 </li>
               ))}
-            </ul>
+            </ol>
           </div>
         ) : null}
       </div>
@@ -1303,17 +1407,12 @@ function AssistantTurn({
 }
 
 function friendlyRunError(failureCode: RunProjection['failureCode']) {
-  if (failureCode === 'run_timeout') return '本次运行超时，未能完成。';
-  if (failureCode === 'agent_execution_failed') return 'Agent 执行失败，未能完成本次运行。';
-  if (failureCode === 'service_restarted') return '服务已重启，原运行已安全结束。';
-  if (failureCode === 'model_step_limit') return 'Agent 已达到本次推理步数上限，运行已安全停止。';
-  if (failureCode === 'tool_call_limit') return 'Agent 已达到本次工具调用上限，运行已安全停止。';
-  if (failureCode === 'repeated_tool_call') return '检测到重复工具调用，运行已安全停止。';
-  if (failureCode === 'no_progress') return 'Agent 连续未取得新进展，运行已安全停止。';
-  if (failureCode === 'tool_not_allowed') return 'Agent 请求了未获授权的工具，运行已安全停止。';
-  if (failureCode === 'result_schema_invalid') return 'Agent 返回结果不符合约定，未保存为回答。';
-  if (failureCode === 'source_validation_failed') return '回答来源校验失败，未保存为回答。';
-  return '本次运行没有完成，请重试。';
+  if (failureCode === 'run_timeout') return '等待时间过长，这次回答没有完成。';
+  if (failureCode === 'service_restarted') return '服务刚刚恢复，请重试这条消息。';
+  if (failureCode === 'tool_not_allowed') return '当前请求暂时无法处理。';
+  if (failureCode === 'result_schema_invalid') return '这次回答不完整，未予展示。';
+  if (failureCode === 'source_validation_failed') return '来源未通过校验，这次回答未予展示。';
+  return '这次没有生成完整回答，请重试。';
 }
 
 function RunStatusLabel({
@@ -1325,14 +1424,12 @@ function RunStatusLabel({
   connection: RunProjection['connection'];
   cancelling: boolean;
 }) {
-  let label = '准备中';
-  if (status === 'completed') label = '已完成';
-  else if (status === 'failed') label = '失败';
-  else if (status === 'cancelled') label = '已停止';
-  else if (cancelling) label = '正在停止';
-  else if (connection === 'reconnecting') label = '正在重新连接';
+  if (isTerminalStatus(status)) return null;
+  let label = '正在准备回答…';
+  if (cancelling) label = '正在停止…';
+  else if (connection === 'reconnecting') label = '正在恢复连接…';
   else if (connection === 'unavailable') label = '连接中断';
-  else if (status === 'running') label = '运行中';
+  else if (status === 'running') label = '正在回答…';
   return <span className={`run-status ${status}`}>{label}</span>;
 }
 
@@ -1347,6 +1444,7 @@ function ToolRun({
 }) {
   const completed = tools.filter((tool) => tool.status === 'completed').length;
   const stopped = isTerminalStatus(runStatus) ? tools.length - completed : 0;
+  const activeTool = [...tools].reverse().find((tool) => tool.status !== 'completed');
   return (
     <details className="tool-run" open={working}>
       <summary>
@@ -1357,12 +1455,12 @@ function ToolRun({
         />
         <strong>
           {working
-            ? '正在调用工具'
+            ? `正在查询${activeTool ? `：${activeTool.label}` : '…'}`
             : stopped > 0
-              ? `${completed} 个完成，${stopped} 个已停止`
-              : `已完成 ${completed} 个工具步骤`}
+              ? '查询已停止'
+              : '查询记录'}
         </strong>
-        <span>查看详情</span>
+        <span>详情</span>
       </summary>
       <div className="tool-list">
         {tools.map((tool) => (
@@ -1386,10 +1484,10 @@ function ToolRun({
             </div>
             <span>
               {tool.status === 'completed'
-                ? '完成'
+                ? '已查询'
                 : isTerminalStatus(runStatus)
                   ? '已停止'
-                  : '运行中'}
+                  : '查询中'}
             </span>
           </div>
         ))}
@@ -1423,19 +1521,18 @@ function Composer({
     <div className="composer-dock">
       <form className="composer" onSubmit={onSubmit}>
         <label className="sr-only" htmlFor="message-input">
-          向 Work Assistant 提问
+          输入消息
         </label>
         <textarea
           id="message-input"
           value={value}
-          placeholder="向 Work Assistant 提问…"
-          rows={2}
+          placeholder="输入消息"
+          rows={1}
           disabled={disabled || active}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={onKeyDown}
         />
-        <div className="composer-footer">
-          <span>Enter 发送，Shift + Enter 换行</span>
+        <div className="composer-actions">
           {active ? (
             <button
               className="stop-button"
@@ -1458,7 +1555,6 @@ function Composer({
           )}
         </div>
       </form>
-      <p>工具结果和重要信息应通过来源继续核对。</p>
     </div>
   );
 }

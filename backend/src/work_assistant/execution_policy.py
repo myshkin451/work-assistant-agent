@@ -367,6 +367,12 @@ class RunExecution:
         if tool_calls:
             self.reserve_tool_calls(tool_calls)
 
+    def record_finalizer_signal(self) -> None:
+        """Record one Host-private finalization decision without consuming Tool budget."""
+
+        self.ensure_deadline()
+        self._record_progress("host-control:finalize-answer")
+
     def reserve_tool_calls(self, tool_calls: Sequence[dict[str, Any]]) -> None:
         self.ensure_deadline()
         if not tool_calls:

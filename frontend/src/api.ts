@@ -43,13 +43,13 @@ async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
 }
 
 function publicErrorMessage(status: number) {
-  if (status === 401) return '当前请求未通过身份认证，请完成认证后刷新页面。';
-  if (status === 403) return '当前身份无权访问这项会话或运行。';
-  if (status === 404) return '请求的会话不存在。';
-  if (status === 409) return '这个会话已有任务正在运行。';
-  if (status === 422) return '提交内容不符合要求。';
-  if (status >= 500) return '服务暂时不可用，请稍后重试。';
-  return '请求没有成功，请重试。';
+  if (status === 401) return '登录已失效，请重新登录。';
+  if (status === 403) return '你没有权限查看这个对话。';
+  if (status === 404) return '这个对话不存在或已被删除。';
+  if (status === 409) return '上一条消息仍在处理中。';
+  if (status === 422) return '请检查输入内容。';
+  if (status >= 500) return '暂时无法连接，请稍后重试。';
+  return '暂时无法完成请求，请重试。';
 }
 
 export const listThreads = async () => {

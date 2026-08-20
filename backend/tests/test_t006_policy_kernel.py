@@ -559,6 +559,13 @@ def test_execution_plan_is_versioned_bounded_and_contains_no_sensitive_values() 
     assert execution.plan_evidence.agent_schema_version == "1.0.0"
     assert execution.plan_evidence.agent_id == "default-work-assistant"
     assert execution.plan_evidence.visible_tools[0].tool_id == "get_current_time"
+    assert execution.plan_evidence.visible_tools[0].version == "1.1.0"
+    registry = default_tool_registry()
+    assert registry.require("get_current_time").implementation.return_direct is False
+    assert registry.enabled_implementations[0].return_direct is True
+    assert "exact batch supplies every external fact" in (
+        registry.enabled_implementations[0].description
+    )
     assert execution.plan_evidence.prompt_sha256 == execution.agent.prompt.sha256
     assert execution.agent.prompt.instructions not in serialized
     for forbidden in (

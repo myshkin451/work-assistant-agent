@@ -55,11 +55,40 @@ intersection AgentDefinition.base_tools
 ```
 
 The resulting ordered Tool IDs and versions are frozen in the Run's execution
-plan. The model middleware filters its Tool list to that decision. Immediately
-before a Tool implementation is invoked, the Host validates the reserved call,
-validated arguments, current registry state, original Agent/base scope, and
-Principal policy again. A policy exception denies all capabilities; a later
-policy denial cannot reach the Tool implementation.
+plan. `terminal_after_success` is Runtime behavior of that versioned RegisteredTool,
+not an unversioned execution-plan field: changing it requires a RegisteredTool
+version bump so persisted plan evidence and its digest reveal the semantic
+change. The flag defaults to false. An extension owner may enable it only for the
+declared request range whose same-turn batch can be known to supply every
+external fact needed for a complete answer; the owner remains responsible for
+that support-range completeness contract.
+
+The model middleware filters its Tool list to the per-Run capability decision.
+Immediately before a Tool implementation is invoked, the Host validates the
+reserved call, validated arguments, current registry state, original Agent/base
+scope, and Principal policy again. A policy exception denies all capabilities;
+a later policy denial cannot reach the Tool implementation.
+
+A terminal-eligible Tool alone never proves that the user's requested fact set
+is complete. Locked `create_agent` routing reaches `after_agent` after it runs,
+then the Host jumps back to the model for an explicit completion decision. The
+Host skips that additional decision round only when one model response contains
+both (a) one or more terminal-eligible Tools and (b) exactly one no-argument,
+no-text finalization control declaring that exact batch complete, and every Tool
+handler succeeds. A batch that mixes the control with a non-terminal Tool fails
+closed; a mixed Tool batch without the control returns to the model. Tool result
+parsing, source registration, public Tool events, budget usage, and result
+validation are never skipped. Raw Tool text is finalizer input and never becomes
+answer text directly.
+
+For a direct answer while external Tools are visible, the model must select a
+Host-private, no-argument finalization signal instead of generating a complete
+hidden draft. That control signal is not an external capability, consumes no
+Tool-call budget, emits no Tool event, and carries no answer text. A direct
+hidden draft, repeated, argument-bearing, text-bearing, or invalidly mixed signal
+fails closed. If no external Tool is visible, the Host starts the structurally
+Tool-free answer stream immediately and does not perform a separate decision
+call.
 
 This capability decision can only add denials. The exact Thread owner and Run
 actor checks from the Principal/ownership contract remain a separate,
