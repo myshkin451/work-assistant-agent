@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   createInitialRun,
+  getAccountUsage,
   parseProductEvent,
   readSseEvents,
   streamRunEvents,
@@ -125,6 +126,46 @@ describe('product event boundary', () => {
 });
 
 describe('thread workspace API boundary', () => {
+  it('reads only the current account scope with credentialed no-store GET', async () => {
+    const response = {
+      account: {
+        display_name: '当前用户',
+        organization: null,
+        extensions: { session_expires_at: null, permission_summary: null },
+      },
+      scope: {
+        range: '30d',
+        from_at: null,
+        to_at: '2026-08-20T12:00:00Z',
+        thread_id: 'thread/with space',
+      },
+      runs: { total: 0, completed: 0, failed: 0, cancelled: 0, active: 0 },
+      model_calls: { value: 0, availability: 'complete' },
+      retries: { value: 0, availability: 'complete' },
+      input_tokens: { value: 0, availability: 'complete' },
+      output_tokens: { value: 0, availability: 'complete' },
+      cached_tokens: { value: 0, availability: 'complete' },
+      reasoning_tokens: { value: 0, availability: 'complete' },
+      total_tokens: { value: 0, availability: 'complete' },
+    };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(response), {
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(getAccountUsage('30d', 'thread/with space')).resolves.toEqual(response);
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/account/usage?range=30d&thread_id=thread%2Fwith+space',
+      expect.objectContaining({
+        credentials: 'include',
+        cache: 'no-store',
+        headers: { Accept: 'application/json' },
+      }),
+    );
+  });
+
   it('sends only the frozen initial-run fields and receives summary plus run', async () => {
     const thread = {
       thread_id: '11111111-1111-4111-8111-111111111111',

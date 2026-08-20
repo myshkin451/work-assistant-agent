@@ -6,7 +6,7 @@ import re
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Protocol, cast
+from typing import Any, Literal, Protocol, cast
 from weakref import WeakSet
 
 from langchain.agents import create_agent
@@ -48,6 +48,86 @@ from .execution_policy import (
 )
 from .schemas import Message
 from .settings import Settings
+from .usage import ProviderTokenUsage
+
+_PROVIDER_USAGE_METADATA_KEY = "work_assistant_provider_usage"
+
+
+def _reported_nonnegative_int(source: dict[str, Any], key: str) -> int | None:
+    if key not in source:
+        return None
+    value = source[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise AgentExecutionFailed("provider_usage_invalid")
+    return cast(int, value)
+
+
+def _auditable_provider_usage(raw_usage: object) -> ProviderTokenUsage | None:
+    if raw_usage is None:
+        return None
+    if not isinstance(raw_usage, dict):
+        raise AgentExecutionFailed("provider_usage_invalid")
+    prompt_details = raw_usage.get("prompt_tokens_details")
+    completion_details = raw_usage.get("completion_tokens_details")
+    if prompt_details is not None and not isinstance(prompt_details, dict):
+        raise AgentExecutionFailed("provider_usage_invalid")
+    if completion_details is not None and not isinstance(completion_details, dict):
+        raise AgentExecutionFailed("provider_usage_invalid")
+    cached_tokens = (
+        _reported_nonnegative_int(prompt_details, "cached_tokens")
+        if isinstance(prompt_details, dict) and "cached_tokens" in prompt_details
+        else _reported_nonnegative_int(raw_usage, "prompt_cache_hit_tokens")
+    )
+    reasoning_tokens = (
+        _reported_nonnegative_int(completion_details, "reasoning_tokens")
+        if isinstance(completion_details, dict) and "reasoning_tokens" in completion_details
+        else None
+    )
+    values = {
+        "input_tokens": _reported_nonnegative_int(raw_usage, "prompt_tokens"),
+        "output_tokens": _reported_nonnegative_int(raw_usage, "completion_tokens"),
+        "cached_tokens": cached_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "total_tokens": _reported_nonnegative_int(raw_usage, "total_tokens"),
+    }
+    if all(value is None for value in values.values()):
+        return None
+    return ProviderTokenUsage(**values)
+
+
+def _usage_from_message(message: AIMessage | AIMessageChunk) -> ProviderTokenUsage | None:
+    payload = message.response_metadata.get(_PROVIDER_USAGE_METADATA_KEY)
+    if payload is None:
+        return None
+    try:
+        return ProviderTokenUsage.model_validate(payload)
+    except ValueError as exc:
+        raise AgentExecutionFailed("provider_usage_invalid") from exc
+
+
+class _AuditableChatDeepSeek(ChatDeepSeek):
+    """Keep only raw numeric usage presence through LangChain normalization."""
+
+    def _convert_chunk_to_generation_chunk(
+        self,
+        chunk: dict[str, Any],
+        default_chunk_class: type[Any],
+        base_generation_info: dict[str, Any] | None,
+    ) -> Any:
+        generation = super()._convert_chunk_to_generation_chunk(
+            chunk,
+            default_chunk_class,
+            base_generation_info,
+        )
+        usage = _auditable_provider_usage(chunk.get("usage"))
+        if usage is not None and generation is not None and isinstance(
+            generation.message, AIMessageChunk
+        ):
+            generation.message.response_metadata = {
+                **generation.message.response_metadata,
+                _PROVIDER_USAGE_METADATA_KEY: usage.model_dump(mode="json"),
+            }
+        return generation
 
 
 class RuntimeConfigurationError(Exception):
@@ -142,6 +222,41 @@ class FakeAgentRunner:
     def __init__(self, *, step_delay_seconds: float = 0.02) -> None:
         self._delay = step_delay_seconds
 
+    @staticmethod
+    async def _model_response(
+        execution: RunExecution,
+        messages: Sequence[BaseMessage],
+        *,
+        call_kind: Literal["direct", "decision", "finalizer"],
+    ) -> None:
+        # These are explicit scripted-model metadata values, never estimates
+        # derived from prompt or answer text.
+        scripted_usage = {
+            "direct": ProviderTokenUsage(
+                input_tokens=80,
+                output_tokens=24,
+                cached_tokens=0,
+                total_tokens=104,
+            ),
+            "decision": ProviderTokenUsage(
+                input_tokens=96,
+                output_tokens=12,
+                cached_tokens=0,
+                total_tokens=108,
+            ),
+            "finalizer": ProviderTokenUsage(
+                input_tokens=144,
+                output_tokens=36,
+                cached_tokens=0,
+                total_tokens=180,
+            ),
+        }[call_kind]
+        execution.before_model_call()
+        attempt_id = await execution.begin_provider_attempt(call_kind=call_kind)
+        execution.observe_provider_usage(attempt_id, scripted_usage)
+        await execution.finish_provider_attempt(attempt_id, status="succeeded")
+        execution.after_model_response(messages)
+
     async def stream(
         self,
         *,
@@ -158,23 +273,29 @@ class FakeAgentRunner:
 
         if "[policy:deadline]" in message:
             execution.before_model_call()
+            await execution.begin_provider_attempt(call_kind="direct")
             await asyncio.sleep(execution.agent.budget.deadline_seconds + 0.05)
             raise AssertionError("deadline guard did not cancel the fake adapter")
 
         if "[policy:model-step-limit]" in message:
             for index in range(execution.agent.budget.max_model_steps + 1):
-                execution.before_model_call()
-                execution.after_model_response([AIMessage(content=f"bounded-progress-{index}")])
+                await self._model_response(
+                    execution,
+                    [AIMessage(content=f"bounded-progress-{index}")],
+                    call_kind="decision",
+                )
             raise AssertionError("model-step guard did not stop the fake adapter")
 
         if "[policy:no-progress]" in message:
             for _ in range(execution.agent.budget.max_no_progress_steps + 2):
-                execution.before_model_call()
-                execution.after_model_response([AIMessage(content="")])
+                await self._model_response(
+                    execution,
+                    [AIMessage(content="")],
+                    call_kind="decision",
+                )
             raise AssertionError("no-progress guard did not stop the fake adapter")
 
         if "[policy:tool-call-limit]" in message:
-            execution.before_model_call()
             calls = [
                 _tool_call(
                     call_id=f"time-limit-{index}",
@@ -183,12 +304,16 @@ class FakeAgentRunner:
                 )
                 for index in range(execution.agent.budget.max_tool_calls + 1)
             ]
-            execution.after_model_response([AIMessage(content="", tool_calls=calls)])
+            await self._model_response(
+                execution,
+                [AIMessage(content="", tool_calls=calls)],
+                call_kind="decision",
+            )
             raise AssertionError("Tool-call guard did not stop the fake adapter")
 
         if "[policy:tool-denied]" in message:
-            execution.before_model_call()
-            execution.after_model_response(
+            await self._model_response(
+                execution,
                 [
                     AIMessage(
                         content="",
@@ -200,7 +325,8 @@ class FakeAgentRunner:
                             )
                         ],
                     )
-                ]
+                ],
+                call_kind="decision",
             )
             raise AssertionError("capability guard did not stop the fake adapter")
 
@@ -219,9 +345,12 @@ class FakeAgentRunner:
             )
         )
         if is_direct:
-            execution.before_model_call()
             text = "This request can be answered without an external Tool."
-            execution.after_model_response([AIMessage(content=text)])
+            await self._model_response(
+                execution,
+                [AIMessage(content=text)],
+                call_kind="direct",
+            )
             for delta in _split_text(text):
                 await asyncio.sleep(self._delay)
                 yield ProductEvent("message.delta", {"delta": delta})
@@ -235,8 +364,11 @@ class FakeAgentRunner:
             name="get_current_time",
             arguments={"timezone": timezone_name},
         )
-        execution.before_model_call()
-        execution.after_model_response([AIMessage(content="", tool_calls=[first_call])])
+        await self._model_response(
+            execution,
+            [AIMessage(content="", tool_calls=[first_call])],
+            call_kind="decision",
+        )
         emitted: list[ProductEvent] = []
 
         async def emit(event: ProductEvent) -> None:
@@ -266,8 +398,8 @@ class FakeAgentRunner:
             yield event
 
         if "[policy:repeat-tool]" in message:
-            execution.before_model_call()
-            execution.after_model_response(
+            await self._model_response(
+                execution,
                 [
                     AIMessage(
                         content="",
@@ -279,7 +411,8 @@ class FakeAgentRunner:
                             )
                         ],
                     )
-                ]
+                ],
+                call_kind="decision",
             )
             raise AssertionError("repeat-call guard did not stop the fake adapter")
 
@@ -293,8 +426,11 @@ class FakeAgentRunner:
             f"The current time in {result['timezone']} is {result['local_time']} "
             f"(UTC offset {result['utc_offset']})."
         )
-        execution.before_model_call()
-        execution.after_model_response([AIMessage(content=text)])
+        await self._model_response(
+            execution,
+            [AIMessage(content=text)],
+            call_kind="finalizer",
+        )
         for delta in _split_text(text):
             await asyncio.sleep(self._delay)
             yield ProductEvent("message.delta", {"delta": delta})
@@ -448,6 +584,8 @@ def _stream_flush_prefix_length(text: str) -> int:
 async def _stream_final_response(
     request: ModelRequest[DeepSeekRuntimeContext],
     context: DeepSeekRuntimeContext,
+    *,
+    call_kind: Literal["direct", "finalizer"],
 ) -> str:
     forbidden_settings = _FINALIZER_FORBIDDEN_MODEL_SETTINGS.intersection(request.model_settings)
     if forbidden_settings or request.tools or request.tool_choice not in {None, "none"}:
@@ -467,76 +605,93 @@ async def _stream_final_response(
     flush_at: float | None = None
 
     # This call is structurally Tool-free: it uses the unbound BaseChatModel
-    # directly and passes neither request.tools nor a Tool choice. That provider
-    # protocol invariant removes the single-call ambiguity where text can precede
-    # a later Tool call. Any contrary provider signal fails the Run closed; text
-    # already emitted before such a violation can only remain on that failed Run.
-    async with asyncio.timeout(context.execution.remaining_seconds):
-        provider_stream = request.model.astream(messages, **request.model_settings)
-        provider_iterator = provider_stream.__aiter__()
-        next_chunk: asyncio.Future[AIMessageChunk] = asyncio.ensure_future(anext(provider_iterator))
-        try:
-            while True:
-                if flush_at is not None and loop.time() >= flush_at:
-                    if not public_buffer:
-                        raise AgentExecutionFailed("finalizer_flush_state_invalid")
-                    if len(public_buffer) < _STREAM_DELTA_MIN_PHRASE_CHARS:
-                        # A lone slow token is exactly the visibly choppy case
-                        # this buffer is meant to avoid. Keep the provider bytes
-                        # private until a short phrase arrives or the real stream
-                        # closes; the terminal tail is still emitted verbatim.
+    # directly and passes neither request.tools nor a Tool choice. The attempt is
+    # durably admitted before the first provider byte can be requested.
+    attempt_id = await context.execution.begin_provider_attempt(call_kind=call_kind)
+    attempt_status: Literal["succeeded", "failed", "cancelled"] = "failed"
+    try:
+        async with asyncio.timeout(context.execution.remaining_seconds):
+            provider_stream = request.model.astream(messages, **request.model_settings)
+            provider_iterator = provider_stream.__aiter__()
+            next_chunk: asyncio.Future[AIMessageChunk] = asyncio.ensure_future(
+                anext(provider_iterator)
+            )
+            try:
+                while True:
+                    if flush_at is not None and loop.time() >= flush_at:
+                        if not public_buffer:
+                            raise AgentExecutionFailed("finalizer_flush_state_invalid")
+                        if len(public_buffer) < _STREAM_DELTA_MIN_PHRASE_CHARS:
+                            # Keep a lone slow token private until a short phrase
+                            # arrives or the real provider stream closes.
+                            flush_at = None
+                            continue
+                        await _emit_stream_chunk(context, public_buffer)
+                        public_buffer = ""
                         flush_at = None
                         continue
-                    await _emit_stream_chunk(context, public_buffer)
-                    public_buffer = ""
-                    flush_at = None
-                    continue
-                wait_seconds = None if flush_at is None else max(0.0, flush_at - loop.time())
-                done, _ = await asyncio.wait({next_chunk}, timeout=wait_seconds)
-                if not done:
-                    if not public_buffer:
-                        raise AgentExecutionFailed("finalizer_flush_state_invalid")
-                    if len(public_buffer) < _STREAM_DELTA_MIN_PHRASE_CHARS:
-                        flush_at = None
-                        continue
-                    await _emit_stream_chunk(context, public_buffer)
-                    public_buffer = ""
-                    flush_at = None
-                    continue
-
-                try:
-                    chunk = next_chunk.result()
-                except StopAsyncIteration:
-                    break
-                next_chunk = asyncio.ensure_future(anext(provider_iterator))
-
-                if not isinstance(chunk, AIMessageChunk):
-                    raise AgentExecutionFailed("finalizer_chunk_invalid")
-                delta = _public_stream_chunk_text(chunk)
-                if not delta:
-                    continue
-                text_chars += len(delta)
-                if text_chars > max_answer_chars:
-                    raise ResultSchemaInvalid
-                text_parts.append(delta)
-                public_buffer += delta
-                if not has_non_whitespace and delta.strip():
-                    has_non_whitespace = True
-                if not has_non_whitespace:
-                    continue
-                if flush_at is None:
-                    flush_at = loop.time() + _STREAM_DELTA_MAX_WAIT_SECONDS
-                while (prefix_length := _stream_flush_prefix_length(public_buffer)) > 0:
-                    public_delta = public_buffer[:prefix_length]
-                    public_buffer = public_buffer[prefix_length:]
-                    await _emit_stream_chunk(context, public_delta)
-                    flush_at = (
-                        loop.time() + _STREAM_DELTA_MAX_WAIT_SECONDS if public_buffer else None
+                    wait_seconds = (
+                        None if flush_at is None else max(0.0, flush_at - loop.time())
                     )
-        finally:
-            if not next_chunk.done():
-                next_chunk.cancel()
-            await asyncio.gather(next_chunk, return_exceptions=True)
+                    done, _ = await asyncio.wait({next_chunk}, timeout=wait_seconds)
+                    if not done:
+                        if not public_buffer:
+                            raise AgentExecutionFailed("finalizer_flush_state_invalid")
+                        if len(public_buffer) < _STREAM_DELTA_MIN_PHRASE_CHARS:
+                            flush_at = None
+                            continue
+                        await _emit_stream_chunk(context, public_buffer)
+                        public_buffer = ""
+                        flush_at = None
+                        continue
+
+                    try:
+                        chunk = next_chunk.result()
+                    except StopAsyncIteration:
+                        break
+                    next_chunk = asyncio.ensure_future(anext(provider_iterator))
+
+                    if not isinstance(chunk, AIMessageChunk):
+                        raise AgentExecutionFailed("finalizer_chunk_invalid")
+                    usage = _usage_from_message(chunk)
+                    if usage is not None:
+                        context.execution.observe_provider_usage(attempt_id, usage)
+                    delta = _public_stream_chunk_text(chunk)
+                    if not delta:
+                        continue
+                    text_chars += len(delta)
+                    if text_chars > max_answer_chars:
+                        raise ResultSchemaInvalid
+                    text_parts.append(delta)
+                    public_buffer += delta
+                    if not has_non_whitespace and delta.strip():
+                        has_non_whitespace = True
+                    if not has_non_whitespace:
+                        continue
+                    if flush_at is None:
+                        flush_at = loop.time() + _STREAM_DELTA_MAX_WAIT_SECONDS
+                    while (prefix_length := _stream_flush_prefix_length(public_buffer)) > 0:
+                        public_delta = public_buffer[:prefix_length]
+                        public_buffer = public_buffer[prefix_length:]
+                        await _emit_stream_chunk(context, public_delta)
+                        flush_at = (
+                            loop.time() + _STREAM_DELTA_MAX_WAIT_SECONDS
+                            if public_buffer
+                            else None
+                        )
+            finally:
+                if not next_chunk.done():
+                    next_chunk.cancel()
+                await asyncio.gather(next_chunk, return_exceptions=True)
+        attempt_status = "succeeded"
+    except asyncio.CancelledError:
+        attempt_status = "cancelled"
+        raise
+    finally:
+        await context.execution.finish_provider_attempt(
+            attempt_id,
+            status=attempt_status,
+        )
 
     final_text = "".join(text_parts)
     if not final_text.strip():
@@ -683,8 +838,29 @@ async def _invoke_initial_decision_with_retry(
     handler: Callable[[ModelRequest[DeepSeekRuntimeContext]], Awaitable[ModelResponse[Any]]],
     context: DeepSeekRuntimeContext,
 ) -> ModelResponse[Any]:
+    async def invoke_attempt(attempt_id: str) -> ModelResponse[Any]:
+        attempt_status: Literal["succeeded", "failed", "cancelled"] = "failed"
+        try:
+            response = await handler(request)
+            for message in response.result:
+                if isinstance(message, AIMessage):
+                    usage = _usage_from_message(message)
+                    if usage is not None:
+                        context.execution.observe_provider_usage(attempt_id, usage)
+            attempt_status = "succeeded"
+            return response
+        except asyncio.CancelledError:
+            attempt_status = "cancelled"
+            raise
+        finally:
+            await context.execution.finish_provider_attempt(
+                attempt_id,
+                status=attempt_status,
+            )
+
+    first_attempt_id = await context.execution.begin_provider_attempt(call_kind="decision")
     try:
-        return await handler(request)
+        return await invoke_attempt(first_attempt_id)
     except APIConnectionError:
         if (
             not _can_retry_initial_decision(context)
@@ -695,7 +871,11 @@ async def _invoke_initial_decision_with_retry(
         async with asyncio.timeout(context.execution.remaining_seconds):
             await asyncio.sleep(_FIRST_DECISION_RETRY_BACKOFF_SECONDS)
             context.execution.before_model_call()
-            return await handler(request)
+            retry_attempt_id = await context.execution.begin_provider_attempt(
+                call_kind="decision",
+                retry_of=first_attempt_id,
+            )
+            return await invoke_attempt(retry_attempt_id)
 
 
 @wrap_model_call
@@ -728,7 +908,11 @@ async def apply_model_policy(
         if context.final_response_text is not None:
             raise AgentExecutionFailed("multiple_terminal_model_responses")
         direct_request = controlled_request.override(tools=[], tool_choice="none")
-        final_text = await _stream_final_response(direct_request, context)
+        final_text = await _stream_final_response(
+            direct_request,
+            context,
+            call_kind="direct",
+        )
         final_message = AIMessage(content=final_text)
         context.execution.after_model_response([final_message])
         context.final_response_text = final_text
@@ -911,7 +1095,11 @@ async def finalize_after_agent(state: AgentState[Any], runtime: Any) -> dict[str
         tool_choice="none",
         system_message=SystemMessage(content=context.built_context.system_prompt),
     )
-    final_text = await _stream_final_response(finalizer_request, context)
+    final_text = await _stream_final_response(
+        finalizer_request,
+        context,
+        call_kind="finalizer",
+    )
     final_message = AIMessage(content=final_text, name=decision_message.name)
     context.execution.after_model_response([final_message])
     context.final_response_text = final_text
@@ -983,7 +1171,7 @@ class DeepSeekAgentRunner:
         policy_kernel: AgentPolicyKernel,
     ) -> None:
         validate_runtime_configuration(settings)
-        model = ChatDeepSeek(  # type: ignore[call-arg]  # upstream stub uses model_name
+        model = _AuditableChatDeepSeek(  # type: ignore[call-arg]  # upstream stub uses model_name
             model=settings.deepseek_model,
             api_key=settings.deepseek_api_key,
             base_url=settings.deepseek_base_url,

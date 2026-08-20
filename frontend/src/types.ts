@@ -15,6 +15,34 @@ export type Message = {
 
 export type RunStatus = 'created' | 'running' | 'completed' | 'failed' | 'cancelled';
 
+export type UsageAvailability =
+  | 'complete'
+  | 'partial'
+  | 'unavailable'
+  | 'unknown'
+  | 'pending';
+
+export type UsageMetric = {
+  value: number | null;
+  availability: UsageAvailability;
+};
+
+export type RunUsage = {
+  schema_version: '1.0.0' | null;
+  state: 'final' | 'unknown' | 'pending';
+  model_call_count: number | null;
+  retry_count: number | null;
+  input_tokens: UsageMetric;
+  output_tokens: UsageMetric;
+  cached_tokens: UsageMetric;
+  reasoning_tokens: UsageMetric;
+  total_tokens: UsageMetric;
+  time_to_first_visible_ms: number | null;
+  generation_duration_ms: number | null;
+  run_duration_ms: number | null;
+  error_category: string | null;
+};
+
 export type RunView = {
   run_id: string;
   thread_id: string;
@@ -22,6 +50,40 @@ export type RunView = {
   last_seq: number;
   created_at: string;
   completed_at: string | null;
+  usage: RunUsage;
+};
+
+export type AccountUsageRange = '7d' | '30d' | 'all';
+
+export type AccountUsageResponse = {
+  account: {
+    display_name: string;
+    organization: string | null;
+    extensions: {
+      session_expires_at: string | null;
+      permission_summary: string | null;
+    };
+  };
+  scope: {
+    range: AccountUsageRange;
+    from_at: string | null;
+    to_at: string;
+    thread_id: string | null;
+  };
+  runs: {
+    total: number;
+    completed: number;
+    failed: number;
+    cancelled: number;
+    active: number;
+  };
+  model_calls: UsageMetric;
+  retries: UsageMetric;
+  input_tokens: UsageMetric;
+  output_tokens: UsageMetric;
+  cached_tokens: UsageMetric;
+  reasoning_tokens: UsageMetric;
+  total_tokens: UsageMetric;
 };
 
 export type RunSnapshot = RunView & {

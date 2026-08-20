@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unicodedata
+from datetime import datetime
 from typing import Protocol
 
 from fastapi import Request
@@ -14,6 +15,34 @@ ANONYMOUS_DEVELOPMENT_SUBJECT = "urn:work-assistant:principal:anonymous-developm
 DEVELOPMENT_PRINCIPAL_HEADER = "X-Work-Assistant-Dev-Subject"
 
 
+class PrincipalDisplayExtensions(BaseModel):
+    """Optional, pre-sanitized account facts supplied by an identity adapter."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    session_expires_at: datetime | None = None
+    permission_summary: str | None = Field(default=None, min_length=1, max_length=200)
+
+    @field_validator("session_expires_at")
+    @classmethod
+    def require_aware_expiry(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("session expiry must include a timezone")
+        return value
+
+    @field_validator("permission_summary")
+    @classmethod
+    def clean_permission_summary(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = " ".join(value.split())
+        if not value or any(
+            unicodedata.category(character).startswith("C") for character in value
+        ):
+            raise ValueError("permission summary is not display safe")
+        return value
+
+
 class Principal(BaseModel):
     """Authenticated application identity without credential material."""
 
@@ -24,6 +53,9 @@ class Principal(BaseModel):
     organization: str | None = Field(default=None, max_length=200)
     roles: tuple[str, ...] = ()
     session_id: str | None = Field(default=None, max_length=255)
+    display_extensions: PrincipalDisplayExtensions = Field(
+        default_factory=PrincipalDisplayExtensions
+    )
 
     @field_validator("subject")
     @classmethod
@@ -34,6 +66,18 @@ class Principal(BaseModel):
             raise ValueError("principal subject uses a reserved internal namespace")
         if any(unicodedata.category(character).startswith("C") for character in value):
             raise ValueError("principal subject must not contain control characters")
+        return value
+
+    @field_validator("display_name", "organization")
+    @classmethod
+    def clean_display_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = " ".join(value.split())
+        if not value or any(
+            unicodedata.category(character).startswith("C") for character in value
+        ):
+            raise ValueError("principal display text is invalid")
         return value
 
     @field_validator("roles")
@@ -64,7 +108,7 @@ class AnonymousIdentityProvider:
 
     _principal = Principal(
         subject=ANONYMOUS_DEVELOPMENT_SUBJECT,
-        display_name="Anonymous development principal",
+        display_name="当前用户",
     )
 
     async def authenticate(self, request: Request) -> Principal:

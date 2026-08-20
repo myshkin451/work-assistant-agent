@@ -15,6 +15,7 @@ import {
   cancelRun,
   createInitialRun,
   createRun,
+  getAccountUsage,
   getThread,
   listThreads,
   streamRunEvents,
@@ -32,6 +33,8 @@ import {
   isRunFailureCode,
   isTerminalStatus,
   type Message,
+  type AccountUsageRange,
+  type AccountUsageResponse,
   type ProductEvent,
   type RunProjection,
   type RunSnapshot,
@@ -62,6 +65,7 @@ const iconPaths = {
   down: 'M6 9l6 6 6-6',
   edit: 'M4 20h4L19 9l-4-4L4 16v4z M13.5 6.5l4 4',
   menu: 'M4 7h16M4 12h16M4 17h16',
+  account: 'M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M5 21a7 7 0 0 1 14 0',
 } as const;
 
 function Icon({ name }: { name: keyof typeof iconPaths }) {
@@ -385,6 +389,11 @@ export function App() {
   const [renameInput, setRenameInput] = useState('');
   const [renameSaving, setRenameSaving] = useState(false);
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
+  const [accountOpen, setAccountOpen] = useState(false);
+  const [accountUsage, setAccountUsage] = useState<AccountUsageResponse | null>(null);
+  const [accountRange, setAccountRange] = useState<AccountUsageRange>('30d');
+  const [accountLoading, setAccountLoading] = useState(false);
+  const [accountError, setAccountError] = useState<string | null>(null);
   const selectedThreadRef = useRef<string | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
   const submittingRef = useRef(false);
@@ -412,6 +421,10 @@ export function App() {
     setMobileNavOpen(false);
     setRenaming(false);
     setRenameSaving(false);
+    setAccountOpen(false);
+    setAccountUsage(null);
+    setAccountLoading(false);
+    setAccountError(null);
     setError(displayError(accessError));
     return true;
   }, []);
@@ -423,6 +436,39 @@ export function App() {
     setThreads(items);
     return items;
   }, []);
+
+  const loadAccount = useCallback(
+    async (range: AccountUsageRange) => {
+      if (accessBlockedRef.current) return;
+      setAccountLoading(true);
+      setAccountError(null);
+      try {
+        const usage = await getAccountUsage(range);
+        if (!accessBlockedRef.current) setAccountUsage(usage);
+      } catch (usageError) {
+        if (!blockAccess(usageError)) setAccountError(displayError(usageError));
+      } finally {
+        if (!accessBlockedRef.current) setAccountLoading(false);
+      }
+    },
+    [blockAccess],
+  );
+
+  const openAccount = useCallback(() => {
+    if (accessBlockedRef.current) return;
+    setAccountOpen(true);
+    setMobileNavOpen(false);
+    setRenaming(false);
+    void loadAccount(accountRange);
+  }, [accountRange, loadAccount]);
+
+  const changeAccountRange = useCallback(
+    (range: AccountUsageRange) => {
+      setAccountRange(range);
+      void loadAccount(range);
+    },
+    [loadAccount],
+  );
 
   const refreshSnapshot = useCallback(async (threadId: string) => {
     if (accessBlockedRef.current) return null;
@@ -588,6 +634,7 @@ export function App() {
   const openThread = useCallback(
     async (threadId: string, historyMode: HistoryMode = 'push') => {
       if (accessBlockedRef.current) return;
+      setAccountOpen(false);
       if (historyMode !== 'none' && window.location.pathname !== threadPath(threadId)) {
         writeThreadRoute(threadId, historyMode);
       }
@@ -651,6 +698,7 @@ export function App() {
     setMobileNavOpen(false);
     setRenaming(false);
     setShowJumpToLatest(false);
+    setAccountOpen(false);
   }, []);
 
   useEffect(() => {
@@ -1061,10 +1109,12 @@ export function App() {
     <div className="app-shell">
       <Sidebar
         threads={threads}
-        activeThreadId={snapshot?.thread_id ?? null}
+        activeThreadId={accountOpen ? null : (snapshot?.thread_id ?? null)}
+        accountActive={accountOpen}
         disabled={accessBlocked || admittingInitialRun}
         onOpenThread={(threadId) => void openThread(threadId)}
         onNewThread={startNewThread}
+        onOpenAccount={openAccount}
       />
 
       <main className="chat-main">
@@ -1082,7 +1132,11 @@ export function App() {
             <Icon name="menu" />
           </button>
           <div className="topbar-title">
-            {renaming && snapshot ? (
+            {accountOpen ? (
+              <div className="title-row">
+                <strong>我的使用情况</strong>
+              </div>
+            ) : renaming && snapshot ? (
               <form className="rename-form" onSubmit={(event) => void saveRename(event)}>
                 <label className="sr-only" htmlFor="thread-title-input">
                   对话标题
@@ -1118,7 +1172,17 @@ export function App() {
           </div>
         </header>
 
-        <div className="conversation-region">
+        {accountOpen ? (
+          <AccountPage
+            usage={accountUsage}
+            range={accountRange}
+            loading={accountLoading}
+            error={accountError}
+            onRangeChange={changeAccountRange}
+          />
+        ) : (
+          <>
+            <div className="conversation-region">
           <div
             className="conversation-scroll"
             ref={conversationScrollRef}
@@ -1192,29 +1256,33 @@ export function App() {
               回到最新
             </button>
           ) : null}
-        </div>
+            </div>
 
-        <Composer
-          value={input}
-          active={active}
-          cancelling={activeProjection?.cancelling ?? false}
-          disabled={loading || submitting || accessBlocked}
-          onChange={setInput}
-          onKeyDown={handleComposerKeyDown}
-          onSubmit={handleSubmit}
-          onStop={() => void stopRun()}
-        />
+            <Composer
+              value={input}
+              active={active}
+              cancelling={activeProjection?.cancelling ?? false}
+              disabled={loading || submitting || accessBlocked}
+              onChange={setInput}
+              onKeyDown={handleComposerKeyDown}
+              onSubmit={handleSubmit}
+              onStop={() => void stopRun()}
+            />
+          </>
+        )}
       </main>
 
       {mobileNavOpen ? (
         <MobileDrawer
           triggerRef={mobileNavButtonRef}
           threads={threads}
-          activeThreadId={snapshot?.thread_id ?? null}
+          activeThreadId={accountOpen ? null : (snapshot?.thread_id ?? null)}
+          accountActive={accountOpen}
           disabled={accessBlocked || admittingInitialRun}
           onClose={() => setMobileNavOpen(false)}
           onOpenThread={(threadId) => void openThread(threadId)}
           onNewThread={startNewThread}
+          onOpenAccount={openAccount}
         />
       ) : null}
     </div>
@@ -1224,16 +1292,20 @@ export function App() {
 type ThreadNavigationProps = {
   threads: ThreadSummary[];
   activeThreadId: string | null;
+  accountActive: boolean;
   onOpenThread: (threadId: string) => void;
   onNewThread: () => void;
+  onOpenAccount: () => void;
   disabled: boolean;
 };
 
 function ThreadNavigation({
   threads,
   activeThreadId,
+  accountActive,
   onOpenThread,
   onNewThread,
+  onOpenAccount,
   disabled,
 }: ThreadNavigationProps) {
   return (
@@ -1263,6 +1335,16 @@ function ThreadNavigation({
           ))
         )}
       </div>
+      <button
+        className={accountActive ? 'account-nav active' : 'account-nav'}
+        type="button"
+        onClick={onOpenAccount}
+        aria-current={accountActive ? 'page' : undefined}
+        disabled={disabled}
+      >
+        <Icon name="account" />
+        我的使用情况
+      </button>
     </>
   );
 }
@@ -1349,6 +1431,193 @@ function MobileDrawer({ triggerRef, onClose, ...navigationProps }: MobileDrawerP
         </div>
         <ThreadNavigation {...navigationProps} />
       </aside>
+    </div>
+  );
+}
+
+const accountRangeLabels: Record<AccountUsageRange, string> = {
+  '7d': '近 7 天',
+  '30d': '近 30 天',
+  all: '全部',
+};
+
+function usageMetricText(metric: AccountUsageResponse['total_tokens']) {
+  if (metric.availability === 'complete' && metric.value !== null) {
+    return new Intl.NumberFormat('zh-CN').format(metric.value);
+  }
+  if (metric.availability === 'pending') return '计算中';
+  return '暂不可用';
+}
+
+function usageCountText(metric: AccountUsageResponse['model_calls']) {
+  const value = usageMetricText(metric);
+  return metric.availability === 'complete' ? `${value} 次` : value;
+}
+
+function AccountPage({
+  usage,
+  range,
+  loading,
+  error,
+  onRangeChange,
+}: {
+  usage: AccountUsageResponse | null;
+  range: AccountUsageRange;
+  loading: boolean;
+  error: string | null;
+  onRangeChange: (range: AccountUsageRange) => void;
+}) {
+  if (!usage && loading) {
+    return (
+      <section className="account-region account-loading" role="status">
+        <span className="loading-dot" />
+        正在整理你的使用情况…
+      </section>
+    );
+  }
+
+  if (!usage) {
+    return (
+      <section className="account-region">
+        <div className="account-message" role="alert">
+          {error || '暂时无法查看使用情况，请稍后重试。'}
+        </div>
+      </section>
+    );
+  }
+
+  const incompleteTokens = [
+    usage.input_tokens,
+    usage.output_tokens,
+    usage.cached_tokens,
+    usage.reasoning_tokens,
+    usage.total_tokens,
+  ].some((metric) => metric.availability !== 'complete');
+  const completedSummary = [
+    `${usage.runs.completed} 次已完成`,
+    ...(usage.runs.active ? [`${usage.runs.active} 次处理中`] : []),
+    ...(usage.runs.cancelled ? [`${usage.runs.cancelled} 次已取消`] : []),
+    ...(usage.runs.failed ? [`${usage.runs.failed} 次未完成`] : []),
+  ].join('，');
+
+  return (
+    <div className="account-region" aria-busy={loading}>
+      <section className="account-page" aria-label="个人账户与使用情况">
+        <header className="account-intro">
+          <p>个人账户</p>
+          <h1>{usage.account.display_name}</h1>
+          <span>
+            {usage.account.organization || '你的账户信息和使用情况仅在当前身份下显示。'}
+          </span>
+        </header>
+
+        <nav className="account-range" aria-label="使用情况时间范围">
+          {(Object.keys(accountRangeLabels) as AccountUsageRange[]).map((item) => (
+            <button
+              key={item}
+              type="button"
+              className={item === range ? 'active' : undefined}
+              aria-current={item === range ? 'page' : undefined}
+              onClick={() => onRangeChange(item)}
+              disabled={loading}
+            >
+              {accountRangeLabels[item]}
+            </button>
+          ))}
+        </nav>
+
+        {error ? (
+          <div className="account-message" role="alert">
+            {error}
+          </div>
+        ) : null}
+
+        <section className="account-overview" aria-labelledby="account-overview-title">
+          <div>
+            <p id="account-overview-title">这段时间</p>
+            <strong>{usage.runs.total}</strong>
+            <span>次提问</span>
+          </div>
+          <p>{completedSummary}</p>
+        </section>
+
+        <section className="usage-section" aria-labelledby="model-usage-title">
+          <header>
+            <h2 id="model-usage-title">模型使用</h2>
+            <p>只统计实际发起的调用，重试会单独计入。</p>
+          </header>
+          <dl className="usage-rows compact">
+            <div>
+              <dt>模型调用</dt>
+              <dd>{usageCountText(usage.model_calls)}</dd>
+            </div>
+            <div>
+              <dt>其中重试</dt>
+              <dd>{usageCountText(usage.retries)}</dd>
+            </div>
+          </dl>
+        </section>
+
+        <section className="usage-section" aria-labelledby="token-usage-title">
+          <header>
+            <h2 id="token-usage-title">Token 用量</h2>
+            <p>仅显示模型服务实际返回并能完整归入这段时间的数据。</p>
+          </header>
+          <dl className="usage-rows">
+            <div>
+              <dt>输入</dt>
+              <dd>{usageMetricText(usage.input_tokens)}</dd>
+            </div>
+            <div>
+              <dt>输出</dt>
+              <dd>{usageMetricText(usage.output_tokens)}</dd>
+            </div>
+            <div>
+              <dt>缓存复用</dt>
+              <dd>{usageMetricText(usage.cached_tokens)}</dd>
+            </div>
+            <div>
+              <dt>推理</dt>
+              <dd>{usageMetricText(usage.reasoning_tokens)}</dd>
+            </div>
+            <div className="usage-total">
+              <dt>合计</dt>
+              <dd>{usageMetricText(usage.total_tokens)}</dd>
+            </div>
+          </dl>
+          {incompleteTokens ? (
+            <p className="usage-note">部分用量项目暂未提供，已明确标为暂不可用。</p>
+          ) : null}
+        </section>
+
+        {usage.account.extensions.permission_summary ||
+        usage.account.extensions.session_expires_at ? (
+          <section className="usage-section account-access" aria-labelledby="account-access-title">
+            <header>
+              <h2 id="account-access-title">账户状态</h2>
+            </header>
+            <dl className="usage-rows compact">
+              {usage.account.extensions.permission_summary ? (
+                <div>
+                  <dt>可用范围</dt>
+                  <dd>{usage.account.extensions.permission_summary}</dd>
+                </div>
+              ) : null}
+              {usage.account.extensions.session_expires_at ? (
+                <div>
+                  <dt>登录有效期</dt>
+                  <dd>
+                    {new Intl.DateTimeFormat('zh-CN', {
+                      dateStyle: 'medium',
+                      timeStyle: 'short',
+                    }).format(new Date(usage.account.extensions.session_expires_at))}
+                  </dd>
+                </div>
+              ) : null}
+            </dl>
+          </section>
+        ) : null}
+      </section>
     </div>
   );
 }

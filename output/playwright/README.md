@@ -77,3 +77,29 @@ byte-exact with `message.completed`. The final mobile console check reported zer
 errors and zero warnings. Generated Playwright session files, raw prompts,
 answers, headers, and credentials were not retained as separate evidence; the
 checked-in screenshots intentionally show only the neutral public UI result.
+
+## T-010
+
+These screenshots were finalized on 2026-08-21 from the isolated, loopback-only
+`work-assistant-agent-t010` Compose project with PostgreSQL and the public
+anonymous development identity. No company account, interface, fixture, Prompt,
+Tool body, customer data, credential, or internal Trace appears in the retained
+images.
+
+- `account-desktop-1440x900.png`: the restrained desktop current-account view,
+  opened from the sidebar, with question, provider-call, retry, Token, and
+  unavailable-field states.
+- `account-entry-mobile-390x844.png`: the accessible mobile conversation drawer
+  with the same **我的使用情况** entry at the bottom.
+- `account-mobile-390x844.png`: the account view at 390×844; the accessibility
+  snapshot also confirmed the lower Token rows beyond the viewport.
+
+The representative browser flow used persisted product data, switched between
+the account range controls, and reported zero console errors and zero warnings.
+The deterministic Fake E3 paths covered both a Tool answer and an exact
+owner-scoped usage aggregate. The separate one-Run live DeepSeek E4 lane used
+`deepseek-v4-flash` and returned 1,202 input, 48 output, 512 cached, and 1,250
+total Tokens across two provider calls with zero retries. Reasoning Tokens were
+absent and remained unavailable. Terminal SSE, REST, idempotent replay, and the
+same Thread's account aggregate were byte-for-byte equal. This browser capture
+is product E3 evidence, not provider or company-business proof.

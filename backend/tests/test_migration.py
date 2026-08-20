@@ -125,9 +125,13 @@ async def test_v02_rows_are_quarantined_and_nonempty_downgrade_is_blocked(
             "SELECT id, owner_subject, title FROM product_threads"
         ).fetchone()
         run = connection.execute(
-            "SELECT id, actor_subject, status, last_seq, execution_plan, execution_outcome "
+            "SELECT id, actor_subject, status, last_seq, execution_plan, execution_outcome, "
+            "metering_version, first_visible_at, usage_metrics "
             "FROM product_runs"
         ).fetchone()
+        attempt_count = connection.execute(
+            "SELECT COUNT(*) FROM product_model_attempts"
+        ).fetchone()[0]
         counts = {
             table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
             for table in (
@@ -169,7 +173,18 @@ async def test_v02_rows_are_quarantined_and_nonempty_downgrade_is_blocked(
         LEGACY_UNOWNED_SUBJECT,
         "Legacy private conversation",
     )
-    assert run == ("legacy-run", LEGACY_UNOWNED_SUBJECT, "completed", 1, None, None)
+    assert run == (
+        "legacy-run",
+        LEGACY_UNOWNED_SUBJECT,
+        "completed",
+        1,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    assert attempt_count == 0
     assert counts == {
         "product_threads": 1,
         "product_runs": 1,
@@ -333,6 +348,50 @@ def test_v03_downgrade_refuses_to_discard_agent_policy_evidence(tmp_path: Path) 
             ).fetchone()[0]
             == '{"schema_version":"1.0.0"}'
         )
+
+
+def test_v04_downgrade_refuses_to_discard_run_usage_evidence(tmp_path: Path) -> None:
+    database_path = tmp_path / "run-usage-evidence.db"
+    config = migration_config(BACKEND, database_path)
+    command.upgrade(config, "head")
+    now = datetime.now(UTC).isoformat()
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "INSERT INTO product_threads "
+            "(id, owner_subject, title, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("thread-v04", "neutral-owner", "Metering", now, now),
+        )
+        connection.execute(
+            "INSERT INTO product_runs "
+            "(id, thread_id, actor_subject, idempotency_key, status, last_seq, "
+            "metering_version, created_at, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "run-v04",
+                "thread-v04",
+                "neutral-owner",
+                "metering-key",
+                "created",
+                0,
+                "1.0.0",
+                now,
+                None,
+            ),
+        )
+        connection.commit()
+
+    with pytest.raises(
+        RuntimeError,
+        match="Run usage metering migration cannot discard recorded evidence",
+    ):
+        command.downgrade(config, "0003_agent_policy_evidence")
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT version_num FROM alembic_version").fetchone()[0] == (
+            "0004_run_usage_metering"
+        )
+        assert connection.execute(
+            "SELECT metering_version FROM product_runs WHERE id = 'run-v04'"
+        ).fetchone()[0] == "1.0.0"
 
 
 def test_v02_migration_rejects_inconsistent_child_links_before_schema_changes(

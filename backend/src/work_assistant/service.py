@@ -6,7 +6,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Protocol
 
-from openai import APIConnectionError
+from openai import APIConnectionError, APIError
 
 from .agent_runtime import AgentResult, AgentRunner, ProductEvent, RuntimeFatalError
 from .execution_policy import (
@@ -27,6 +27,7 @@ from .schemas import (
     validate_runtime_event,
 )
 from .settings import Settings
+from .usage import ModelAttemptFinish, ModelAttemptStart, ModelAttemptUsage, RunErrorCategory
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +38,31 @@ def _safe_exception_log_fields(exc: Exception) -> tuple[str, str]:
     if isinstance(exc, RuntimeError):
         return "runtime_error", "RuntimeError"
     return "unexpected", "UnclassifiedError"
+
+
+def _policy_error_category(exc: PolicyViolation) -> RunErrorCategory:
+    if exc.failure_code == "run_timeout":
+        return "timeout"
+    if exc.failure_code in {
+        "model_step_limit",
+        "tool_call_limit",
+        "repeated_tool_call",
+        "no_progress",
+    }:
+        return "limit"
+    if exc.failure_code == "tool_not_allowed":
+        return "access_or_input"
+    if exc.failure_code in {"result_schema_invalid", "source_validation_failed"}:
+        return "validation"
+    if exc.stop_reason.startswith("tool_"):
+        return "tool"
+    return "internal"
+
+
+def _exception_error_category(exc: Exception) -> RunErrorCategory:
+    if isinstance(exc, APIError):
+        return "provider"
+    return "internal"
 
 
 class RepositoryCleanupTimeout(RuntimeError):
@@ -250,17 +276,27 @@ class RunService:
         # attempted again until the process has restarted with a clean pool.
         self._require_repository_safe()
         execution = self._executions.get(run_id)
+        usage_known = execution is not None
         if execution is None:
             # A terminal idempotent cancel will ignore this fresh snapshot. An
             # active Run without an in-process execution is not expected in the
             # supported single-executor topology because startup closes orphans.
             execution = self._policy_kernel.prepare_run(principal=principal)
         terminal_lock = self._terminal_locks.get(run_id)
+        task = self._tasks.get(run_id)
+        if task is not None:
+            # Stop new provider progress first. The usage ledger then flushes any
+            # terminal usage already observed before cancellation can freeze the
+            # Run, without waiting for unrelated Runtime cleanup.
+            self._request_cancel(task)
+        if usage_known:
+            await execution.settle_provider_usage_for_terminal()
 
         async def commit_cancel() -> RunView:
             outcome = execution.outcome(
                 status="cancelled",
                 stop_reason="user_cancelled",
+                usage_known=usage_known,
             )
             return await self._repository_call(
                 lambda: self.repository.cancel_run(
@@ -279,9 +315,6 @@ class RunService:
             # wins, the append observes the immutable terminal Run and is ignored.
             async with terminal_lock:
                 view = await commit_cancel()
-        task = self._tasks.get(run_id)
-        if task is not None:
-            self._request_cancel(task)
         return view
 
     async def stream_events(
@@ -336,6 +369,30 @@ class RunService:
 
     def _launch(self, run_id: str, execution: RunExecution) -> None:
         self._require_healthy()
+
+        async def start_attempt(start: ModelAttemptStart) -> None:
+            await self._repository_call(
+                lambda: self.repository.start_model_attempt(run_id, start),
+                deadline_at=execution.deadline_at,
+            )
+
+        async def finish_attempt(finish: ModelAttemptFinish) -> None:
+            await self._repository_call(
+                lambda: self.repository.finish_model_attempt(run_id, finish),
+                deadline_at=self._terminal_deadline(),
+            )
+
+        async def persist_usage(observed: ModelAttemptUsage) -> None:
+            await self._repository_call(
+                lambda: self.repository.record_model_attempt_usage(run_id, observed),
+                deadline_at=self._terminal_deadline(),
+            )
+
+        execution.bind_usage_persistence(
+            start_writer=start_attempt,
+            finish_writer=finish_attempt,
+            usage_writer=persist_usage,
+        )
         task = asyncio.create_task(
             self._execute(run_id, execution),
             name=f"product-run-{run_id}",
@@ -448,6 +505,7 @@ class RunService:
                     run_id,
                     validated_result.text,
                     execution_outcome=outcome,
+                    error_category=None,
                 ),
             )
         except asyncio.CancelledError:
@@ -475,12 +533,14 @@ class RunService:
                     run_id,
                     "run_timeout",
                     execution_outcome=outcome,
+                    error_category="timeout",
                 ),
             )
         except PolicyViolation as exc:
             if isinstance(exc, ResultSchemaInvalid):
                 execution.record_result_validation_failure()
             failure_code = exc.failure_code
+            error_category = _policy_error_category(exc)
             outcome = execution.outcome(
                 status="failed",
                 stop_reason=exc.stop_reason,
@@ -492,16 +552,18 @@ class RunService:
                     run_id,
                     failure_code,
                     execution_outcome=outcome,
+                    error_category=error_category,
                 ),
             )
         except Exception as exc:
             # Provider responses and exception text are intentionally not persisted.
-            error_category, exception_type = _safe_exception_log_fields(exc)
+            log_category, exception_type = _safe_exception_log_fields(exc)
+            persisted_error_category = _exception_error_category(exc)
             logger.warning(
                 "run_execution_failed",
                 extra={
                     "run_id": run_id,
-                    "error_category": error_category,
+                    "error_category": log_category,
                     "exception_type": exception_type,
                 },
             )
@@ -516,6 +578,7 @@ class RunService:
                     run_id,
                     "agent_execution_failed",
                     execution_outcome=outcome,
+                    error_category=persisted_error_category,
                 ),
             )
 

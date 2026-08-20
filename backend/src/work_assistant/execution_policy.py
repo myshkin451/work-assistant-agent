@@ -27,6 +27,16 @@ from .capabilities import (
 from .context_builder import BuiltContext, ContextBuilder
 from .identity import Principal
 from .schemas import Message, RunFailureCode
+from .usage import (
+    AttemptFinishWriter,
+    AttemptStartWriter,
+    AttemptUsageWriter,
+    ModelCallKind,
+    ProviderTokenUsage,
+    RunErrorCategory,
+    RunUsage,
+    RunUsageLedger,
+)
 
 EXECUTION_PLAN_SCHEMA_VERSION: Literal["1.0.0"] = "1.0.0"
 EXECUTION_OUTCOME_SCHEMA_VERSION: Literal["1.0.0"] = "1.0.0"
@@ -218,8 +228,12 @@ class ExecutionOutcomeEvidence(_FrozenEvidence):
         if self.status == "completed":
             if self.result_validation != "passed" or self.usage is None:
                 raise ValueError("a completed outcome requires a validated result and usage")
-        if self.usage is None and self.failure_code != "service_restarted":
-            raise ValueError("only a restart orphan may have unknown usage")
+        if (
+            self.usage is None
+            and self.failure_code != "service_restarted"
+            and self.status != "cancelled"
+        ):
+            raise ValueError("only a restart orphan or detached cancellation may lack usage")
         if (self.result_validation == "not_run") != (self.result_schema_version is None):
             raise ValueError("result validation and schema evidence disagree")
         if not set(self.result_source_ids).issubset(self.accepted_source_ids):
@@ -298,6 +312,7 @@ class RunExecution:
         self.context_builder = context_builder
         self._clock = clock
         self._started_at = clock()
+        self._provider_usage = RunUsageLedger(clock=clock)
         self.deadline_at = self._started_at + agent.budget.deadline_seconds
         self._model_steps = 0
         self._tool_calls_attempted = 0
@@ -354,6 +369,48 @@ class RunExecution:
         self._model_steps += 1
         if self._model_steps > self.agent.budget.max_model_steps:
             raise ModelStepLimitExceeded
+
+    def bind_usage_persistence(
+        self,
+        *,
+        start_writer: AttemptStartWriter,
+        finish_writer: AttemptFinishWriter,
+        usage_writer: AttemptUsageWriter,
+    ) -> None:
+        self._provider_usage.bind_persistence(
+            start_writer=start_writer,
+            finish_writer=finish_writer,
+            usage_writer=usage_writer,
+        )
+
+    async def begin_provider_attempt(
+        self,
+        *,
+        call_kind: ModelCallKind,
+        retry_of: str | None = None,
+    ) -> str:
+        self.ensure_deadline()
+        return await self._provider_usage.begin_attempt(
+            call_kind=call_kind,
+            retry_of=retry_of,
+        )
+
+    def observe_provider_usage(self, attempt_id: str, usage: ProviderTokenUsage) -> None:
+        self._provider_usage.observe_usage(attempt_id, usage)
+
+    async def finish_provider_attempt(
+        self,
+        attempt_id: str,
+        *,
+        status: Literal["succeeded", "failed", "cancelled"],
+    ) -> None:
+        await self._provider_usage.finish_attempt(attempt_id, status=status)
+
+    async def settle_provider_usage_for_terminal(self) -> None:
+        await self._provider_usage.settle_for_terminal()
+
+    def run_usage(self, *, error_category: RunErrorCategory | None) -> RunUsage:
+        return self._provider_usage.snapshot(error_category=error_category)
 
     def after_model_response(self, messages: Sequence[BaseMessage]) -> None:
         tool_calls: list[dict[str, Any]] = []
@@ -558,6 +615,7 @@ class RunExecution:
 
         self.validate_runtime_event(event)
         if event.type == "message.delta":
+            self._provider_usage.record_first_visible()
             return
         if event.type == "tool.started":
             self._persisted_started.add(cast(str, event.data.get("tool_call_id")))

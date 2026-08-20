@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
 from .authorization import ResourceForbiddenError
@@ -18,6 +18,7 @@ from .repository import (
     ResourceNotFoundError,
 )
 from .schemas import (
+    AccountUsageResponse,
     EventEnvelope,
     InitialRunResponse,
     RunCreate,
@@ -27,6 +28,7 @@ from .schemas import (
     ThreadSnapshot,
     ThreadSummary,
     ThreadUpdate,
+    UsageRange,
 )
 from .service import (
     RepositoryCleanupTimeout,
@@ -187,6 +189,23 @@ async def create_initial_run(
 @router.get("/api/threads", response_model=ThreadList)
 async def list_threads(request: Request, principal: CurrentPrincipal) -> ThreadList:
     return ThreadList(items=await _repository(request).list_threads(principal=principal))
+
+
+@router.get("/api/account/usage", response_model=AccountUsageResponse)
+async def get_account_usage(
+    request: Request,
+    principal: CurrentPrincipal,
+    usage_range: Annotated[UsageRange, Query(alias="range")] = "30d",
+    thread_id: str | None = None,
+) -> AccountUsageResponse:
+    try:
+        return await _repository(request).get_account_usage(
+            principal=principal,
+            usage_range=usage_range,
+            thread_id=thread_id,
+        )
+    except ResourceNotFoundError as exc:
+        raise _not_found("usage_scope") from exc
 
 
 @router.get("/api/threads/{thread_id}", response_model=ThreadSnapshot)

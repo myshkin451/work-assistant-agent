@@ -248,6 +248,11 @@ async def test_first_visible_tool_decision_retries_one_connection_error() -> Non
     assert context.first_decision_retry_used is True
     assert execution.usage().model_steps == 2
     assert execution.usage().tool_calls_attempted == 1
+    provider_usage = execution.run_usage(error_category=None)
+    assert provider_usage.model_call_count == 2
+    assert provider_usage.retry_count == 1
+    assert provider_usage.total_tokens.value is None
+    assert provider_usage.total_tokens.availability == "unavailable"
     assert emitted == []
 
 
@@ -283,6 +288,10 @@ async def test_connection_error_is_not_retried_after_a_public_event() -> None:
     assert attempts == 1
     assert context.first_decision_retry_used is False
     assert execution.usage().model_steps == 1
+    provider_usage = execution.run_usage(error_category="provider")
+    assert provider_usage.model_call_count == 1
+    assert provider_usage.retry_count == 0
+    assert provider_usage.error_category == "provider"
 
 
 async def test_runtime_configuration_fails_closed_before_checkpoint_work() -> None:
