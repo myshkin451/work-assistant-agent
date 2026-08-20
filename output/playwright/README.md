@@ -46,3 +46,34 @@ owned history item; A's 390x844 view had no horizontal overflow. Browser storage
 DOM, and URL checks again contained no subject. This post-fix rerun retained no
 additional screenshot, trace, HAR, or raw-header artifact because the code change
 was confined to backend task cancellation and did not change the rendered UI.
+
+## T-008
+
+These screenshots were captured on 2026-08-20 from the isolated, loopback-only
+`work-assistant-t008-e3` Docker Compose project. The stack used public anonymous
+identity, PostgreSQL, the neutral time Tool, and either the deterministic Fake
+or the locked DeepSeek provider. No company account, interface, prompt, fixture,
+or business data was used.
+
+- `t008-fake-scroll-desktop.png`: the desktop Fake lane after enough persisted
+  turns to overflow the conversation. A new delta arrived while the user was at
+  the top; `scrollTop` stayed at zero and the explicit "回到最新" control appeared.
+- `t008-deepseek-desktop.png`: the one live DeepSeek E4 Run. Heading, list,
+  table, blockquote, inline code, safe external link, Tool summary, and structured
+  source are rendered by the product UI.
+- `t008-deepseek-mobile.png`: the same persisted E4 Thread at 390×844 with no
+  document-level horizontal overflow and a locally scrollable Markdown table.
+- `t008-deepseek-mobile-drawer.png`: the accessible mobile conversation drawer;
+  focus moved to its close button, Escape returned focus to the menu trigger, and
+  the conversation remained visible behind the overlay.
+
+The Fake browser lane also exercised local blank drafts, first-question
+admission, independent stable Thread URLs, inline rename, direct refresh, list
+switching, and browser back/forward. Repeated "新建对话" clicks did not add a
+persisted Thread. The live DeepSeek page produced eight non-terminal visible DOM
+text changes before completion; replayed persisted SSE evidence had ten
+`message.delta` events with contiguous unique `seq`, and their concatenation was
+byte-exact with `message.completed`. The final mobile console check reported zero
+errors and zero warnings. Generated Playwright session files, raw prompts,
+answers, headers, and credentials were not retained as separate evidence; the
+checked-in screenshots intentionally show only the neutral public UI result.

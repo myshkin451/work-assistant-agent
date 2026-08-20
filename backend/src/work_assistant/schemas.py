@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from datetime import datetime
 from typing import Any, Literal, cast
 
@@ -50,9 +51,7 @@ PRODUCT_EVENT_TYPES = frozenset(
         "run.cancelled",
     }
 )
-RUNTIME_EVENT_TYPES = frozenset(
-    {"tool.started", "tool.finished", "message.delta", "source.added"}
-)
+RUNTIME_EVENT_TYPES = frozenset({"tool.started", "tool.finished", "message.delta", "source.added"})
 
 
 class ProductEventValidationError(ValueError):
@@ -70,6 +69,24 @@ class ThreadCreate(BaseModel):
         if value is None:
             return None
         value = value.strip()
+        if not value:
+            raise ValueError("title must not be blank")
+        return value
+
+
+class ThreadUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=1, max_length=200)
+
+    @field_validator("title", mode="before")
+    @classmethod
+    def clean_title(cls, value: object) -> object:
+        if not isinstance(value, str):
+            return value
+        if any(unicodedata.category(character).startswith("C") for character in value):
+            raise ValueError("title must not contain control characters")
+        value = " ".join(value.split())
         if not value:
             raise ValueError("title must not be blank")
         return value
@@ -118,6 +135,13 @@ class RunView(BaseModel):
     last_seq: int
     created_at: datetime
     completed_at: datetime | None
+
+
+class InitialRunResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    thread: ThreadSummary
+    run: RunView
 
 
 class _StrictPayload(BaseModel):
@@ -201,9 +225,7 @@ def validate_runtime_event(
     return cast(RuntimeEventType, event_type), validate_product_event(event_type, data)
 
 
-def normalize_stored_product_event(
-    event_type: str, data: dict[str, Any]
-) -> dict[str, Any]:
+def normalize_stored_product_event(event_type: str, data: dict[str, Any]) -> dict[str, Any]:
     """Map the one v0.1 failure code to the frozen v0.2 public contract on read."""
     normalized = dict(data)
     if event_type == "run.failed" and normalized.get("error_code") == "agent_result_missing":

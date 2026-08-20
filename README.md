@@ -11,13 +11,19 @@ capability intersection, bounded execution, validated result/source provenance,
 and immutable per-Run policy evidence. See the
 [`Agent policy kernel contract`](docs/contracts/agent-policy.md).
 
-The first vertical slice is deliberately small but complete: a user can ask for
-the current time and follow up with other places in the same conversation. The
-model uses a read-only time Tool once per Run, the UI streams stable product
-events and sources, and PostgreSQL preserves every turn for refresh, history
-switching, reconnect, and failure recovery.
+The first vertical slice is deliberately small but complete: every conversation
+has a stable `/threads/{thread_id}` URL, a local blank draft is persisted only
+with its first valid question, and the owner can switch, rename, refresh, or use
+browser back/forward navigation. The model uses a read-only time Tool, emits
+validated answer deltas while the final response is being generated, and renders
+safe CommonMark/GFM. PostgreSQL preserves every turn and monotonic SSE sequence
+for reconnect, replay, cancellation, source validation, and failure recovery.
 
-![Completed time Tool run](output/playwright/t003-normal-flow.png)
+![T-008 live DeepSeek conversation workspace](output/playwright/t008/t008-deepseek-desktop.png)
+
+The screenshot above is a loopback-only browser E4 capture from the locked
+DeepSeek provider. Additional desktop scrolling and 390×844 mobile evidence is
+catalogued in [`output/playwright/README.md`](output/playwright/README.md).
 
 ## Stack
 
@@ -42,6 +48,11 @@ Open `http://localhost:5173`. The checked-in default uses deterministic fake
 mode, no model credential, and the explicitly configured single-Principal
 `anonymous` development identity. To use DeepSeek, set `MODEL_MODE=deepseek`
 and provide `DEEPSEEK_API_KEY` only in a local ignored secret source.
+
+`/` is an unsaved new-conversation view. A persisted conversation uses
+`/threads/{thread_id}`; opening that URL directly or refreshing it reconstructs
+the owner-scoped snapshot and resumes an active SSE stream from its last
+accepted sequence.
 
 Compose binds the database, API, and web UI to `127.0.0.1` only. Anonymous mode
 is not a production identity system and must not be exposed to a LAN or the
@@ -71,6 +82,19 @@ message content:
 ```bash
 python3 scripts/compose_smoke.py
 ```
+
+The T-008 lane additionally exercises atomic first-turn creation, concurrent
+idempotent replay, a deliberate live SSE disconnect/resume, byte-exact delta /
+terminal equality, rename persistence, and redacted first-delta timing:
+
+```bash
+python3 scripts/t008_stream_smoke.py \
+  --lane t008_compose_e3 --model fake --initial-requests 20
+```
+
+For a live provider, add `--minimum-deltas 3` and use a redacted model label.
+The output contains only event counts, character counts, timings, booleans, and
+bounded identifiers; it never prints the prompt, answer, Tool result, or Secret.
 
 For the two-Principal ownership lane, start an isolated Compose project with the
 development header provider and a deliberately slow fake Run so cancellation is

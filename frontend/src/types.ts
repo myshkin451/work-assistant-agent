@@ -34,6 +34,11 @@ export type ThreadSnapshot = ThreadSummary & {
   active_run: RunView | null;
 };
 
+export type InitialRunResponse = {
+  thread: ThreadSummary;
+  run: RunView;
+};
+
 export const productEventTypes = [
   'run.started',
   'tool.started',

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import unicodedata
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import uuid4
@@ -47,6 +48,14 @@ class ActiveRunConflictError(Exception):
     pass
 
 
+class InitialThreadExistsError(Exception):
+    pass
+
+
+class IdempotencyMismatchError(Exception):
+    pass
+
+
 class RepositoryUnavailableError(RuntimeError):
     """No new transaction may start after the product pool fails closed."""
 
@@ -69,6 +78,16 @@ def _aware(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=UTC)
     return value.astimezone(UTC)
+
+
+def _initial_thread_title(message: str) -> str:
+    visible = "".join(
+        character
+        for character in message
+        if not unicodedata.category(character).startswith("C") or character.isspace()
+    )
+    collapsed = " ".join(visible.split()) or "New conversation"
+    return f"{collapsed[:28]}…" if len(collapsed) > 28 else collapsed
 
 
 def _thread_summary(record: ThreadRecord) -> ThreadSummary:
@@ -155,6 +174,109 @@ class ProductRepository:
             active_run=None,
         )
 
+    async def create_initial_run(
+        self,
+        *,
+        principal: Principal,
+        thread_id: str,
+        message: str,
+        idempotency_key: str,
+        execution_plan: ExecutionPlanEvidence,
+    ) -> tuple[ThreadSummary, RunView, bool]:
+        """Atomically persist a client-addressable Thread and its first Run."""
+
+        self._require_available()
+        validated_plan = validate_execution_plan(execution_plan)
+        now = utc_now()
+        thread = ThreadRecord(
+            id=thread_id,
+            owner_subject=principal.subject,
+            title=_initial_thread_title(message),
+            created_at=now,
+            updated_at=now,
+        )
+        run = RunRecord(
+            id=str(uuid4()),
+            thread_id=thread_id,
+            idempotency_key=idempotency_key,
+            actor_subject=principal.subject,
+            status="created",
+            last_seq=0,
+            execution_plan=validated_plan,
+            execution_outcome=None,
+            created_at=now,
+        )
+        user_message = MessageRecord(
+            id=str(uuid4()),
+            thread_id=thread_id,
+            run_id=run.id,
+            role="user",
+            content=message,
+            created_at=now,
+        )
+        try:
+            async with self._sessions() as session, session.begin():
+                existing_thread = await session.scalar(
+                    select(ThreadRecord).where(ThreadRecord.id == thread_id).with_for_update()
+                )
+                if existing_thread is not None:
+                    existing_run = await self._resolve_initial_run_replay(
+                        session,
+                        thread=existing_thread,
+                        principal=principal,
+                        message=message,
+                        idempotency_key=idempotency_key,
+                    )
+                    return _thread_summary(existing_thread), _run_view(existing_run), False
+
+                # Flush each parent before its child while retaining one transaction.
+                # PostgreSQL and FK-enabled SQLite therefore either commit all three
+                # product records or leave no empty Thread behind.
+                session.add(thread)
+                await session.flush()
+                session.add(run)
+                await session.flush()
+                session.add(user_message)
+                await session.flush()
+            return _thread_summary(thread), _run_view(run), True
+        except IntegrityError:
+            # A concurrent creator may have won the Thread primary-key race after
+            # our initial lookup. Re-read the committed winner, re-authorize, and
+            # return it only when this is an exact idempotent replay.
+            async with self._sessions() as session:
+                existing_thread = await session.get(ThreadRecord, thread_id)
+                if existing_thread is None:
+                    raise
+                existing_run = await self._resolve_initial_run_replay(
+                    session,
+                    thread=existing_thread,
+                    principal=principal,
+                    message=message,
+                    idempotency_key=idempotency_key,
+                )
+                return _thread_summary(existing_thread), _run_view(existing_run), False
+
+    async def rename_thread(
+        self,
+        thread_id: str,
+        *,
+        principal: Principal,
+        title: str,
+    ) -> ThreadSummary:
+        self._require_available()
+        async with self._sessions() as session, session.begin():
+            thread = await session.scalar(
+                select(ThreadRecord).where(ThreadRecord.id == thread_id).with_for_update()
+            )
+            if thread is None:
+                raise ResourceNotFoundError("thread")
+            self._require_thread_owner(thread, principal)
+            await self._require_thread_run_consistency(session, thread)
+            thread.title = title
+            thread.updated_at = utc_now()
+            await session.flush()
+        return _thread_summary(thread)
+
     async def list_threads(self, *, principal: Principal) -> list[ThreadSummary]:
         self._require_available()
         async with self._sessions() as session:
@@ -166,6 +288,41 @@ class ProductRepository:
                 )
             ).all()
         return [_thread_summary(record) for record in records]
+
+    async def _resolve_initial_run_replay(
+        self,
+        session: AsyncSession,
+        *,
+        thread: ThreadRecord,
+        principal: Principal,
+        message: str,
+        idempotency_key: str,
+    ) -> RunRecord:
+        self._require_thread_owner(thread, principal)
+        await self._require_thread_run_consistency(session, thread)
+        existing = await session.scalar(
+            select(RunRecord).where(
+                RunRecord.thread_id == thread.id,
+                RunRecord.idempotency_key == idempotency_key,
+            )
+        )
+        if existing is None:
+            raise InitialThreadExistsError
+        self._require_run_actor(existing, principal, resource_kind="thread")
+        user_messages = (
+            await session.scalars(
+                select(MessageRecord).where(
+                    MessageRecord.run_id == existing.id,
+                    MessageRecord.thread_id == thread.id,
+                    MessageRecord.role == "user",
+                )
+            )
+        ).all()
+        if len(user_messages) != 1:
+            raise ResourceNotFoundError("run_ownership")
+        if user_messages[0].content != message:
+            raise IdempotencyMismatchError
+        return existing
 
     async def get_thread(self, thread_id: str, *, principal: Principal) -> ThreadSnapshot:
         self._require_available()

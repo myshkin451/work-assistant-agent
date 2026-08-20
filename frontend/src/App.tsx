@@ -2,21 +2,32 @@ import {
   Fragment,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type FormEvent,
   type KeyboardEvent,
+  type RefObject,
 } from 'react';
 import {
   ApiError,
   cancelRun,
+  createInitialRun,
   createRun,
-  createThread,
   getThread,
   listThreads,
   streamRunEvents,
+  updateThread,
 } from './api';
+import { MarkdownMessage } from './MarkdownMessage';
+import {
+  parseThreadRoute,
+  threadPath,
+  type HistoryMode,
+  writeBlankRoute,
+  writeThreadRoute,
+} from './threadRoute';
 import {
   isRunFailureCode,
   isTerminalStatus,
@@ -41,6 +52,10 @@ const iconPaths = {
   time: 'M12 7v5l3 2 M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18',
   source: 'M5 4h14v16H5z M8 8h8M8 12h8M8 16h5',
   chat: 'M4 5h16v12H8l-4 3z',
+  close: 'M6 6l12 12M18 6L6 18',
+  down: 'M6 9l6 6 6-6',
+  edit: 'M4 20h4L19 9l-4-4L4 16v4z M13.5 6.5l4 4',
+  menu: 'M4 7h16M4 12h16M4 17h16',
 } as const;
 
 function Icon({ name }: { name: keyof typeof iconPaths }) {
@@ -236,6 +251,14 @@ function isAccessError(error: unknown): error is ApiError {
   return error instanceof ApiError && (error.status === 401 || error.status === 403);
 }
 
+type InitialAttempt = {
+  threadId: string;
+  idempotencyKey: string;
+  message: string;
+};
+
+const FOLLOW_BOTTOM_THRESHOLD = 80;
+
 export function App() {
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
   const [snapshot, setSnapshot] = useState<ThreadSnapshot | null>(null);
@@ -243,13 +266,22 @@ export function App() {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [admittingInitialRun, setAdmittingInitialRun] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [accessBlocked, setAccessBlocked] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [renameInput, setRenameInput] = useState('');
+  const [renameSaving, setRenameSaving] = useState(false);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const selectedThreadRef = useRef<string | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
   const submittingRef = useRef(false);
   const accessBlockedRef = useRef(false);
-  const conversationEndRef = useRef<HTMLDivElement | null>(null);
+  const initialAttemptRef = useRef<InitialAttempt | null>(null);
+  const conversationScrollRef = useRef<HTMLDivElement | null>(null);
+  const followOutputRef = useRef(true);
+  const mobileNavButtonRef = useRef<HTMLButtonElement | null>(null);
 
   const blockAccess = useCallback((accessError: unknown) => {
     if (accessBlockedRef.current) return true;
@@ -263,8 +295,12 @@ export function App() {
     setProjectionsByRunId({});
     setInput('');
     setSubmitting(false);
+    setAdmittingInitialRun(false);
     setLoading(false);
     setAccessBlocked(true);
+    setMobileNavOpen(false);
+    setRenaming(false);
+    setRenameSaving(false);
     setError(displayError(accessError));
     return true;
   }, []);
@@ -388,10 +424,17 @@ export function App() {
   );
 
   const openThread = useCallback(
-    async (threadId: string) => {
+    async (threadId: string, historyMode: HistoryMode = 'push') => {
       if (accessBlockedRef.current) return;
+      if (historyMode !== 'none' && window.location.pathname !== threadPath(threadId)) {
+        writeThreadRoute(threadId, historyMode);
+      }
       streamAbortRef.current?.abort();
       selectedThreadRef.current = threadId;
+      followOutputRef.current = true;
+      setShowJumpToLatest(false);
+      setMobileNavOpen(false);
+      setRenaming(false);
       setLoading(true);
       setError(null);
       setSnapshot(null);
@@ -410,7 +453,13 @@ export function App() {
           );
         }
       } catch (openError) {
-        if (!blockAccess(openError) && selectedThreadRef.current === threadId) {
+        if (selectedThreadRef.current !== threadId) return;
+        if (openError instanceof ApiError && (openError.status === 403 || openError.status === 404)) {
+          // One inaccessible URL is a route-level failure. Keep the caller's
+          // own thread list available; active-run authorization failures still
+          // use the global fail-closed path in connectRun.
+          setError('无法访问这个会话。它可能不存在，或当前身份没有访问权限。');
+        } else if (!blockAccess(openError)) {
           setError(displayError(openError));
         }
       } finally {
@@ -420,30 +469,73 @@ export function App() {
     [blockAccess, connectRun],
   );
 
-  useEffect(() => {
-    let disposed = false;
-    void refreshThreads()
-      .then((items) => {
-        if (disposed) return;
-        if (items[0]) return openThread(items[0].thread_id);
-        setLoading(false);
-      })
-      .catch((initialError: unknown) => {
-        if (!disposed) {
-          if (!blockAccess(initialError)) {
-            setError(displayError(initialError));
-            setLoading(false);
-          }
-        }
-      });
-    return () => {
-      disposed = true;
-      streamAbortRef.current?.abort();
-    };
-  }, [blockAccess, openThread, refreshThreads]);
+  const showBlankThread = useCallback((historyMode: HistoryMode = 'push') => {
+    if (accessBlockedRef.current) return;
+    streamAbortRef.current?.abort();
+    selectedThreadRef.current = null;
+    initialAttemptRef.current = null;
+    followOutputRef.current = true;
+    if (
+      historyMode !== 'none' &&
+      (window.location.pathname !== '/' || historyMode === 'replace')
+    ) {
+      writeBlankRoute(historyMode);
+    }
+    setSnapshot(null);
+    setProjectionsByRunId({});
+    setInput('');
+    setLoading(false);
+    setError(null);
+    setMobileNavOpen(false);
+    setRenaming(false);
+    setShowJumpToLatest(false);
+  }, []);
 
   useEffect(() => {
-    conversationEndRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' });
+    let disposed = false;
+
+    const applyLocation = () => {
+      if (disposed || accessBlockedRef.current) return;
+      const route = parseThreadRoute();
+      if (route.kind === 'thread') {
+        void openThread(route.threadId, 'none');
+        return;
+      }
+      if (route.kind === 'blank') {
+        showBlankThread('none');
+        return;
+      }
+
+      streamAbortRef.current?.abort();
+      selectedThreadRef.current = null;
+      setSnapshot(null);
+      setProjectionsByRunId({});
+      setLoading(false);
+      setError('这个页面地址无效。请从历史会话进入，或开始一个新对话。');
+    };
+
+    const handlePopState = () => applyLocation();
+    window.addEventListener('popstate', handlePopState);
+    void refreshThreads()
+      .then(() => applyLocation())
+      .catch((initialError: unknown) => {
+        if (!disposed && !blockAccess(initialError)) {
+          setError(displayError(initialError));
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      disposed = true;
+      window.removeEventListener('popstate', handlePopState);
+      streamAbortRef.current?.abort();
+    };
+  }, [blockAccess, openThread, refreshThreads, showBlankThread]);
+
+  useLayoutEffect(() => {
+    if (!followOutputRef.current) return;
+    const scrollContainer = conversationScrollRef.current;
+    scrollContainer?.scrollTo({ top: scrollContainer.scrollHeight, behavior: 'auto' });
   }, [
     projectionsByRunId,
     snapshot?.active_run?.run_id,
@@ -451,24 +543,27 @@ export function App() {
     snapshot?.thread_id,
   ]);
 
-  const startNewThread = useCallback(async () => {
+  const handleConversationScroll = useCallback(() => {
+    const scrollContainer = conversationScrollRef.current;
+    if (!scrollContainer) return;
+    const distanceFromBottom =
+      scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
+    const shouldFollow = distanceFromBottom <= FOLLOW_BOTTOM_THRESHOLD;
+    followOutputRef.current = shouldFollow;
+    setShowJumpToLatest(!shouldFollow);
+  }, []);
+
+  const scrollToLatest = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    followOutputRef.current = true;
+    setShowJumpToLatest(false);
+    const scrollContainer = conversationScrollRef.current;
+    scrollContainer?.scrollTo({ top: scrollContainer.scrollHeight, behavior });
+  }, []);
+
+  const startNewThread = useCallback(() => {
     if (submittingRef.current || accessBlockedRef.current) return;
-    streamAbortRef.current?.abort();
-    setError(null);
-    setLoading(true);
-    try {
-      const created = await createThread();
-      if (accessBlockedRef.current) return;
-      selectedThreadRef.current = created.thread_id;
-      setSnapshot(created);
-      setProjectionsByRunId(projectionsFromSnapshot(created));
-      await refreshThreads();
-    } catch (newThreadError) {
-      if (!blockAccess(newThreadError)) setError(displayError(newThreadError));
-    } finally {
-      setLoading(false);
-    }
-  }, [blockAccess, refreshThreads]);
+    showBlankThread(window.location.pathname === '/' ? 'none' : 'push');
+  }, [showBlankThread]);
 
   const activeProjection = useMemo(() => {
     const activeRunId = snapshot?.active_run?.run_id;
@@ -498,25 +593,82 @@ export function App() {
     setError(null);
     const idempotencyKey = crypto.randomUUID();
     const pending = optimisticMessage(message, idempotencyKey);
-    let target = snapshot;
+    let targetThreadId = snapshot?.thread_id ?? null;
+    const isInitialRun = targetThreadId === null;
+    if (isInitialRun) setAdmittingInitialRun(true);
 
     try {
-      if (!target) {
-        target = await createThread(titleFromMessage(message));
+      let run: RunView;
+      let persistedPending: Message;
+
+      if (isInitialRun) {
+        const reusable = initialAttemptRef.current;
+        const attempt =
+          reusable?.message === message
+            ? reusable
+            : {
+                threadId: crypto.randomUUID(),
+                idempotencyKey,
+                message,
+              };
+        initialAttemptRef.current = attempt;
+        targetThreadId = attempt.threadId;
+        const now = new Date().toISOString();
+        selectedThreadRef.current = targetThreadId;
+        setSnapshot({
+          thread_id: targetThreadId,
+          title: titleFromMessage(message),
+          created_at: now,
+          updated_at: now,
+          messages: [pending],
+          runs: [],
+          active_run: null,
+        });
+        setProjectionsByRunId({});
+
+        const created = await createInitialRun(
+          attempt.threadId,
+          message,
+          attempt.idempotencyKey,
+        );
         if (accessBlockedRef.current) return;
-        selectedThreadRef.current = target.thread_id;
-        setSnapshot(target);
-        setProjectionsByRunId(projectionsFromSnapshot(target));
+        if (
+          created.thread.thread_id !== attempt.threadId ||
+          created.run.thread_id !== attempt.threadId
+        ) {
+          throw new Error('Initial run response does not match the requested thread');
+        }
+        initialAttemptRef.current = null;
+        run = created.run;
+        persistedPending = { ...pending, run_id: run.run_id };
+        if (selectedThreadRef.current !== attempt.threadId) {
+          void refreshThreads().catch((refreshError: unknown) => {
+            blockAccess(refreshError);
+          });
+          return;
+        }
+        writeThreadRoute(created.thread.thread_id, 'replace');
+        setSnapshot({
+          ...created.thread,
+          messages: [persistedPending],
+          runs: [{ ...run, events: [] }],
+          active_run: run,
+        });
+      } else {
+        const threadId = targetThreadId;
+        if (!threadId) throw new Error('Existing run requires a thread');
+        setSnapshot((current) =>
+          current?.thread_id === threadId
+            ? { ...current, messages: [...current.messages, pending] }
+            : current,
+        );
+        run = await createRun(threadId, message, idempotencyKey);
+        if (accessBlockedRef.current) return;
+        persistedPending = { ...pending, run_id: run.run_id };
       }
-      const threadId = target.thread_id;
-      setSnapshot((current) =>
-        current?.thread_id === threadId
-          ? { ...current, messages: [...current.messages, pending] }
-          : current,
-      );
-      const run = await createRun(threadId, message, idempotencyKey);
-      if (accessBlockedRef.current) return;
-      const persistedPending = { ...pending, run_id: run.run_id };
+
+      const threadId = targetThreadId;
+      if (!threadId) throw new Error('Run response is missing a thread');
       const initialProjection = createProjection(run);
       if (selectedThreadRef.current === threadId) {
         setSnapshot((current) => {
@@ -565,16 +717,32 @@ export function App() {
       });
     } catch (submitError) {
       if (blockAccess(submitError)) return;
-      if (restoreComposerOnFailure) setInput(message);
+      const stillSelected = selectedThreadRef.current === targetThreadId;
+      if (isInitialRun && submitError instanceof ApiError && submitError.status < 500) {
+        initialAttemptRef.current = null;
+      }
+      if (restoreComposerOnFailure && stillSelected) setInput(message);
       setSnapshot((current) =>
-        current
-          ? { ...current, messages: current.messages.filter((item) => item.message_id !== pending.message_id) }
+        current?.thread_id === targetThreadId
+          ? isInitialRun
+            ? null
+            : {
+                ...current,
+                messages: current.messages.filter(
+                  (item) => item.message_id !== pending.message_id,
+                ),
+              }
           : current,
       );
-      setError(displayError(submitError));
+      if (isInitialRun && stillSelected) {
+        selectedThreadRef.current = null;
+        setProjectionsByRunId({});
+      }
+      if (stillSelected) setError(displayError(submitError));
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
+      if (isInitialRun) setAdmittingInitialRun(false);
     }
   }, [activeProjection, blockAccess, connectRun, refreshThreads, snapshot]);
 
@@ -660,6 +828,51 @@ export function App() {
     }
   }, [activeProjection, blockAccess, refreshSnapshot, refreshThreads]);
 
+  const beginRename = useCallback(() => {
+    if (!snapshot || accessBlockedRef.current) return;
+    setRenameInput(snapshot.title);
+    setRenaming(true);
+    setError(null);
+  }, [snapshot]);
+
+  const saveRename = useCallback(
+    async (event: FormEvent) => {
+      event.preventDefault();
+      if (!snapshot || renameSaving || accessBlockedRef.current) return;
+      const title = renameInput.trim();
+      if (!title) {
+        setError('对话标题不能为空。');
+        return;
+      }
+      if (title.length > 200) {
+        setError('对话标题不能超过 200 个字符。');
+        return;
+      }
+
+      const threadId = snapshot.thread_id;
+      setRenameSaving(true);
+      setError(null);
+      try {
+        const updated = await updateThread(threadId, title);
+        if (selectedThreadRef.current !== threadId || accessBlockedRef.current) return;
+        setSnapshot((current) =>
+          current?.thread_id === threadId ? { ...current, ...updated } : current,
+        );
+        setThreads((current) =>
+          current.map((thread) => (thread.thread_id === threadId ? updated : thread)),
+        );
+        setRenaming(false);
+      } catch (renameError) {
+        if (!blockAccess(renameError) && selectedThreadRef.current === threadId) {
+          setError(displayError(renameError));
+        }
+      } finally {
+        setRenameSaving(false);
+      }
+    },
+    [blockAccess, renameInput, renameSaving, snapshot],
+  );
+
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault();
     void submitMessage();
@@ -689,95 +902,137 @@ export function App() {
       <Sidebar
         threads={threads}
         activeThreadId={snapshot?.thread_id ?? null}
-        disabled={accessBlocked}
+        disabled={accessBlocked || admittingInitialRun}
         onOpenThread={(threadId) => void openThread(threadId)}
-        onNewThread={() => void startNewThread()}
+        onNewThread={startNewThread}
       />
 
       <main className="chat-main">
         <header className="topbar">
-          <div>
-            <strong>{snapshot?.title || 'Work Assistant'}</strong>
-            <span>对话、工具与来源</span>
-          </div>
-          <div className="mobile-actions">
-            <label className="sr-only" htmlFor="mobile-thread-select">
-              选择历史会话
-            </label>
-            <select
-              id="mobile-thread-select"
-              value={snapshot?.thread_id ?? ''}
-              onChange={(event) => event.target.value && void openThread(event.target.value)}
-              disabled={accessBlocked}
-            >
-              <option value="">历史会话</option>
-              {threads.map((thread) => (
-                <option key={thread.thread_id} value={thread.thread_id}>
-                  {thread.title}
-                </option>
-              ))}
-            </select>
-            <button
-              className="mobile-new"
-              type="button"
-              onClick={() => void startNewThread()}
-              disabled={accessBlocked}
-            >
-              <Icon name="plus" />
-              <span className="sr-only">新建对话</span>
-            </button>
+          <button
+            ref={mobileNavButtonRef}
+            className="mobile-menu-button"
+            type="button"
+            aria-label="打开对话导航"
+            aria-expanded={mobileNavOpen}
+            aria-controls="mobile-conversation-drawer"
+            onClick={() => setMobileNavOpen(true)}
+            disabled={accessBlocked}
+          >
+            <Icon name="menu" />
+          </button>
+          <div className="topbar-title">
+            {renaming && snapshot ? (
+              <form className="rename-form" onSubmit={(event) => void saveRename(event)}>
+                <label className="sr-only" htmlFor="thread-title-input">
+                  对话标题
+                </label>
+                <input
+                  id="thread-title-input"
+                  value={renameInput}
+                  maxLength={200}
+                  autoFocus
+                  disabled={renameSaving}
+                  onChange={(event) => setRenameInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape') setRenaming(false);
+                  }}
+                />
+                <button type="submit" disabled={renameSaving || !renameInput.trim()}>
+                  保存
+                </button>
+                <button type="button" onClick={() => setRenaming(false)} disabled={renameSaving}>
+                  取消
+                </button>
+              </form>
+            ) : (
+              <div className="title-row">
+                <strong>{snapshot?.title || '新对话'}</strong>
+                {snapshot ? (
+                  <button type="button" aria-label="重命名当前对话" onClick={beginRename}>
+                    <Icon name="edit" />
+                  </button>
+                ) : null}
+              </div>
+            )}
           </div>
         </header>
 
-        <section className="conversation" aria-live="polite" aria-busy={active}>
-          {loading && !snapshot ? <LoadingState /> : null}
-          {!loading &&
-          !error &&
-          displayedMessages.length === 0 &&
-          Object.keys(projectionsByRunId).length === 0 ? (
-            <EmptyState />
+        <div className="conversation-region">
+          <div
+            className="conversation-scroll"
+            ref={conversationScrollRef}
+            onScroll={handleConversationScroll}
+          >
+            <section
+              className="conversation"
+              aria-label="对话内容"
+              aria-live="polite"
+              aria-busy={active}
+            >
+              {loading && !snapshot ? <LoadingState /> : null}
+              {!loading &&
+              !error &&
+              displayedMessages.length === 0 &&
+              Object.keys(projectionsByRunId).length === 0 ? (
+                <EmptyState />
+              ) : null}
+
+              {displayedMessages.map((message) => {
+                if (
+                  message.role === 'assistant' &&
+                  message.run_id &&
+                  projectionsByRunId[message.run_id]
+                ) {
+                  return null;
+                }
+                if (message.role === 'user' && message.run_id) {
+                  const projection = projectionsByRunId[message.run_id];
+                  return (
+                    <Fragment key={message.message_id}>
+                      <MessageTurn message={message} />
+                      {projection ? (
+                        <AssistantTurn
+                          projection={projection}
+                          retryDisabled={active || submitting || accessBlocked}
+                          onRetry={() => void retryRun(projection.run.run_id)}
+                        />
+                      ) : null}
+                    </Fragment>
+                  );
+                }
+                return <MessageTurn key={message.message_id} message={message} />;
+              })}
+
+              {Object.values(projectionsByRunId)
+                .filter((projection) => !displayedRunIds.has(projection.run.run_id))
+                .map((projection) => (
+                  <AssistantTurn
+                    key={projection.run.run_id}
+                    projection={projection}
+                    retryDisabled={active || submitting || accessBlocked}
+                    onRetry={() => void retryRun(projection.run.run_id)}
+                  />
+                ))}
+
+              {error ? (
+                <div className="page-error" role="alert">
+                  {error}
+                </div>
+              ) : null}
+            </section>
+          </div>
+          {showJumpToLatest ? (
+            <button
+              className="jump-to-latest"
+              type="button"
+              onClick={() => scrollToLatest()}
+            >
+              <Icon name="down" />
+              回到最新
+            </button>
           ) : null}
-
-          {displayedMessages.map((message) => {
-            if (message.role === 'assistant' && message.run_id && projectionsByRunId[message.run_id]) {
-              return null;
-            }
-            if (message.role === 'user' && message.run_id) {
-              const projection = projectionsByRunId[message.run_id];
-              return (
-                <Fragment key={message.message_id}>
-                  <MessageTurn message={message} />
-                  {projection ? (
-                    <AssistantTurn
-                      projection={projection}
-                      retryDisabled={active || submitting || accessBlocked}
-                      onRetry={() => void retryRun(projection.run.run_id)}
-                    />
-                  ) : null}
-                </Fragment>
-              );
-            }
-            return <MessageTurn key={message.message_id} message={message} />;
-          })}
-
-          {Object.values(projectionsByRunId)
-            .filter((projection) => !displayedRunIds.has(projection.run.run_id))
-            .map((projection) => (
-              <AssistantTurn
-                key={projection.run.run_id}
-                projection={projection}
-                retryDisabled={active || submitting || accessBlocked}
-                onRetry={() => void retryRun(projection.run.run_id)}
-              />
-            ))}
-
-          {error ? (
-            <div className="page-error" role="alert">
-              {error}
-            </div>
-          ) : null}
-          <div className="conversation-end" ref={conversationEndRef} />
-        </section>
+        </div>
 
         <Composer
           value={input}
@@ -790,11 +1045,23 @@ export function App() {
           onStop={() => void stopRun()}
         />
       </main>
+
+      {mobileNavOpen ? (
+        <MobileDrawer
+          triggerRef={mobileNavButtonRef}
+          threads={threads}
+          activeThreadId={snapshot?.thread_id ?? null}
+          disabled={accessBlocked || admittingInitialRun}
+          onClose={() => setMobileNavOpen(false)}
+          onOpenThread={(threadId) => void openThread(threadId)}
+          onNewThread={startNewThread}
+        />
+      ) : null}
     </div>
   );
 }
 
-type SidebarProps = {
+type ThreadNavigationProps = {
   threads: ThreadSummary[];
   activeThreadId: string | null;
   onOpenThread: (threadId: string) => void;
@@ -802,16 +1069,15 @@ type SidebarProps = {
   disabled: boolean;
 };
 
-function Sidebar({ threads, activeThreadId, onOpenThread, onNewThread, disabled }: SidebarProps) {
+function ThreadNavigation({
+  threads,
+  activeThreadId,
+  onOpenThread,
+  onNewThread,
+  disabled,
+}: ThreadNavigationProps) {
   return (
-    <aside className="sidebar" aria-label="对话导航">
-      <div className="brand">
-        <span className="brand-mark">W</span>
-        <div>
-          <strong>Work Assistant</strong>
-          <span>Agent 对话核心</span>
-        </div>
-      </div>
+    <>
       <button className="new-thread" type="button" onClick={onNewThread} disabled={disabled}>
         <Icon name="plus" />
         新建对话
@@ -823,20 +1089,112 @@ function Sidebar({ threads, activeThreadId, onOpenThread, onNewThread, disabled 
         ) : (
           threads.map((thread) => (
             <button
-              className={thread.thread_id === activeThreadId ? 'history-item active' : 'history-item'}
+              className={
+                thread.thread_id === activeThreadId ? 'history-item active' : 'history-item'
+              }
               type="button"
               key={thread.thread_id}
               onClick={() => onOpenThread(thread.thread_id)}
               aria-current={thread.thread_id === activeThreadId ? 'page' : undefined}
               disabled={disabled}
             >
-              <Icon name="chat" />
               <span>{thread.title || EMPTY_TITLE}</span>
             </button>
           ))
         )}
       </div>
+    </>
+  );
+}
+
+function Sidebar(props: ThreadNavigationProps) {
+  return (
+    <aside className="sidebar" aria-label="对话导航">
+      <div className="brand">
+        <span className="brand-mark">W</span>
+        <div>
+          <strong>Work Assistant</strong>
+          <span>智能工作助手</span>
+        </div>
+      </div>
+      <ThreadNavigation {...props} />
     </aside>
+  );
+}
+
+type MobileDrawerProps = ThreadNavigationProps & {
+  triggerRef: RefObject<HTMLButtonElement | null>;
+  onClose: () => void;
+};
+
+function MobileDrawer({ triggerRef, onClose, ...navigationProps }: MobileDrawerProps) {
+  const drawerRef = useRef<HTMLElement | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    const trigger = triggerRef.current;
+    document.body.style.overflow = 'hidden';
+    closeButtonRef.current?.focus();
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      trigger?.focus();
+    };
+  }, [triggerRef]);
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      onClose();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+
+    const focusable = Array.from(
+      drawerRef.current?.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), a[href], input:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      ) ?? [],
+    );
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (!first || !last) return;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+
+  return (
+    <div
+      className="mobile-drawer-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <aside
+        id="mobile-conversation-drawer"
+        ref={drawerRef}
+        className="mobile-drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-label="对话导航"
+        onKeyDown={handleKeyDown}
+      >
+        <div className="mobile-drawer-heading">
+          <div className="brand compact">
+            <span className="brand-mark">W</span>
+            <strong>Work Assistant</strong>
+          </div>
+          <button ref={closeButtonRef} type="button" aria-label="关闭对话导航" onClick={onClose}>
+            <Icon name="close" />
+          </button>
+        </div>
+        <ThreadNavigation {...navigationProps} />
+      </aside>
+    </div>
   );
 }
 
@@ -871,10 +1229,8 @@ function MessageTurn({ message }: { message: Message }) {
   }
   return (
     <article className="assistant-turn">
-      <span className="assistant-avatar">W</span>
       <div className="assistant-content">
-        <strong className="assistant-name">Work Assistant</strong>
-        <div className="answer-text">{message.content}</div>
+        <MarkdownMessage content={message.content} />
       </div>
     </article>
   );
@@ -893,10 +1249,8 @@ function AssistantTurn({
   const isWorking = !isTerminalStatus(run.status);
   return (
     <article className="assistant-turn">
-      <span className="assistant-avatar">W</span>
       <div className="assistant-content">
         <div className="assistant-heading">
-          <strong className="assistant-name">Work Assistant</strong>
           <RunStatusLabel
             status={run.status}
             connection={connection}
@@ -907,7 +1261,7 @@ function AssistantTurn({
           <ToolRun tools={tools} working={isWorking} runStatus={run.status} />
         ) : null}
         {assistantText ? (
-          <div className="answer-text">{assistantText}</div>
+          <MarkdownMessage content={assistantText} />
         ) : isWorking && connection !== 'unavailable' ? (
           <div className="thinking" role="status">
             <span />
@@ -932,12 +1286,15 @@ function AssistantTurn({
         {run.status === 'cancelled' ? <div className="run-notice">本次运行已停止。</div> : null}
         {sources.length > 0 ? (
           <div className="sources" aria-label="回答来源">
-            {sources.map((source) => (
-              <span className="source-chip" key={source.source_id} title={source.description}>
-                <Icon name="source" />
-                {source.label}
-              </span>
-            ))}
+            <strong>来源</strong>
+            <ul>
+              {sources.map((source) => (
+                <li key={source.source_id}>
+                  <span>{source.label}</span>
+                  <small>{source.description}</small>
+                </li>
+              ))}
+            </ul>
           </div>
         ) : null}
       </div>

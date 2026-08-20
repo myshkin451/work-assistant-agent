@@ -4,8 +4,8 @@ Work Assistant Agent is licensed under MIT. Third-party packages are not
 relicensed by this repository; each remains subject to its own license.
 
 This source-release review is based on `backend/uv.lock` and
-`frontend/pnpm-lock.yaml` as committed for v0.1. It covers 75 locked Python
-packages and 252 unique locked JavaScript package/version pairs. No AGPL,
+`frontend/pnpm-lock.yaml` as updated through T-008. It covers 75 locked Python
+packages and 348 unique locked JavaScript package/version pairs. No AGPL,
 GPL-only, SSPL, BUSL, Commons Clause, proprietary, or unlicensed dependency was
 identified.
 
@@ -14,11 +14,13 @@ identified.
 | Ecosystem | Locked packages | Main license families |
 | --- | ---: | --- |
 | Python | 75 | MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, LGPL-3.0-only, MPL-2.0, PSF-2.0, and compatible dual licenses |
-| JavaScript | 252 | MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, MPL-2.0, MIT-0, BlueOak-1.0.0, CC0-1.0, Python-2.0, and 0BSD |
+| JavaScript | 348 | MIT, Apache-2.0, BSD-2-Clause, BSD-3-Clause, ISC, MPL-2.0, MIT-0, BlueOak-1.0.0, CC0-1.0, Python-2.0, and 0BSD |
 
-The frontend production dependency closure is React, React DOM, and Scheduler;
-all three are MIT-licensed. The wider JavaScript inventory includes build and
-test dependencies.
+The frontend production dependency closure now contains 103 unique installed
+package/version pairs: React, React DOM, Scheduler, `react-markdown`,
+`remark-gfm`, and their unified / micromark parsing dependencies. That closure
+is MIT-licensed except for `@ungap/structured-clone`, which is ISC-licensed. The
+wider JavaScript inventory includes build and test dependencies.
 
 ## Packages requiring particular attention
 
@@ -31,6 +33,9 @@ test dependencies.
 | Python | orjson | 3.11.9 | runtime | MPL-2.0 AND (Apache-2.0 OR MIT) |
 | Python | tqdm | 4.70.0 | transitive runtime | MPL-2.0 AND MIT |
 | Python | pathspec | 1.1.1 | development | MPL-2.0 |
+| JavaScript | react-markdown | 10.1.0 | runtime | MIT |
+| JavaScript | remark-gfm | 4.0.1 | runtime | MIT |
+| JavaScript | @ungap/structured-clone | 1.3.3 | transitive runtime | ISC |
 | JavaScript | lightningcss and platform packages | 1.33.0 | build / development | MPL-2.0 |
 
 Apache-2.0 dependencies retain their required copyright, license, and NOTICE
@@ -38,6 +43,11 @@ terms. MPL-2.0 obligations apply to covered files when those files are
 distributed in a modified form. LGPL-3.0 obligations must be reviewed for any
 distribution that includes the psycopg implementation or bundled native
 libraries; recipients must retain the applicable notices and license rights.
+
+The Markdown runtime does not enable `rehype-raw` or another raw-HTML path.
+Application code keeps `react-markdown` HTML skipping and its safe default URL
+transform enabled, and renders remote image syntax as inert text. Reassess this
+security boundary before adding custom rehype plugins or changing URL handling.
 
 ## Evidence and distribution boundary
 

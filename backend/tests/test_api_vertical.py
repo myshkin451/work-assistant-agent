@@ -3,11 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 from typing import Any
+from uuid import uuid4
 
+import pytest
 from httpx import AsyncClient
 from policy_fixtures import make_execution_plan, terminal_outcome
+from sqlalchemy import event, select
 
 from work_assistant.identity import ANONYMOUS_DEVELOPMENT_SUBJECT, Principal
+from work_assistant.models import MessageRecord, RunRecord, ThreadRecord
 from work_assistant.repository import ActiveRunConflictError
 
 TEST_PRINCIPAL = Principal(subject=ANONYMOUS_DEVELOPMENT_SUBJECT)
@@ -41,6 +45,105 @@ async def read_events(
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
     return parse_sse(response.text)
+
+
+async def test_initial_run_atomically_creates_one_conversation_and_replays(
+    app_client: tuple[Any, Any],
+) -> None:
+    client, app = app_client
+    thread_id = "abcdefab-cdef-4abc-8def-abcdefabcdef"
+    body = {
+        "message": "  First   question\nnow  ",
+        "idempotency_key": "initial-request",
+    }
+
+    responses = await asyncio.gather(
+        *(client.post(f"/api/threads/{thread_id}/initial-run", json=body) for _ in range(10))
+    )
+
+    assert {response.status_code for response in responses} == {201}
+    payloads = [response.json() for response in responses]
+    assert {payload["thread"]["thread_id"] for payload in payloads} == {thread_id}
+    assert {payload["thread"]["title"] for payload in payloads} == {"First question now"}
+    run_ids = {payload["run"]["run_id"] for payload in payloads}
+    assert len(run_ids) == 1
+
+    run_id = run_ids.pop()
+    noncanonical_replay = await client.post(
+        f"/api/threads/{thread_id.upper()}/initial-run", json=body
+    )
+    assert noncanonical_replay.status_code == 201
+    assert noncanonical_replay.json()["thread"]["thread_id"] == thread_id
+    assert noncanonical_replay.json()["run"]["run_id"] == run_id
+
+    await read_events(client, run_id)
+    snapshot = (await client.get(f"/api/threads/{thread_id}")).json()
+    assert snapshot["thread_id"] == thread_id
+    assert snapshot["title"] == "First question now"
+    assert [message["role"] for message in snapshot["messages"]] == ["user", "assistant"]
+
+    async with app.state.repository._sessions() as session:  # noqa: SLF001
+        threads = (await session.scalars(select(ThreadRecord))).all()
+        runs = (await session.scalars(select(RunRecord))).all()
+        user_messages = (
+            await session.scalars(select(MessageRecord).where(MessageRecord.role == "user"))
+        ).all()
+    assert len(threads) == len(runs) == len(user_messages) == 1
+    assert runs[0].thread_id == threads[0].id == thread_id
+    assert user_messages[0].run_id == runs[0].id
+
+    invalid_thread_id = str(uuid4())
+    invalid = await client.post(
+        f"/api/threads/{invalid_thread_id}/initial-run",
+        json={"message": " ", "idempotency_key": " "},
+    )
+    assert invalid.status_code == 422
+    assert (await client.get(f"/api/threads/{invalid_thread_id}")).status_code == 404
+
+    malformed_id = await client.post(
+        "/api/threads/not-a-uuid/initial-run",
+        json={"message": "Question", "idempotency_key": "malformed-id"},
+    )
+    assert malformed_id.status_code == 422
+
+
+async def test_initial_run_transaction_rolls_back_every_product_record(
+    app_client: tuple[Any, Any],
+) -> None:
+    _, app = app_client
+    repository = app.state.repository
+    thread_id = str(uuid4())
+
+    def reject_user_message(*_: Any) -> None:
+        raise RuntimeError("injected_message_insert_failure")
+
+    event.listen(MessageRecord, "before_insert", reject_user_message)
+    try:
+        with pytest.raises(RuntimeError, match="injected_message_insert_failure"):
+            await repository.create_initial_run(
+                principal=TEST_PRINCIPAL,
+                thread_id=thread_id,
+                message="Atomic rollback question",
+                idempotency_key="atomic-rollback",
+                execution_plan=make_execution_plan(TEST_PRINCIPAL),
+            )
+    finally:
+        event.remove(MessageRecord, "before_insert", reject_user_message)
+
+    async with repository._sessions() as session:  # noqa: SLF001
+        assert await session.get(ThreadRecord, thread_id) is None
+        assert (
+            await session.scalar(
+                select(RunRecord.id).where(RunRecord.thread_id == thread_id).limit(1)
+            )
+            is None
+        )
+        assert (
+            await session.scalar(
+                select(MessageRecord.id).where(MessageRecord.thread_id == thread_id).limit(1)
+            )
+            is None
+        )
 
 
 async def test_fake_vertical_persists_contract_and_replays(app_client: tuple[Any, Any]) -> None:

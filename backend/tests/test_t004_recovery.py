@@ -358,6 +358,20 @@ class StreamResultMismatchRunner:
         yield AgentResult(text="different terminal result", source_ids=())
 
 
+class TerminalOnlyRunner:
+    async def stream(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        messages: Sequence[Message],
+        execution: RunExecution,
+        built_context: BuiltContext,
+    ) -> AsyncIterator[ProductEvent | AgentResult]:
+        del thread_id, run_id, messages, execution, built_context
+        yield AgentResult(text="terminal text must not be post-hoc chunked", source_ids=())
+
+
 async def test_three_runs_keep_messages_events_and_context_isolated(
     recovery_repository: ProductRepository,
 ) -> None:
@@ -879,6 +893,37 @@ async def test_invalid_stream_results_fail_stably_without_assistant_commit(
     assert outcome["result_validation"] == expected_result_validation
     assert outcome["result_schema_version"] == "1.0.0"
     assert outcome["result_source_ids"] == []
+
+    await service.shutdown()
+
+
+async def test_terminal_result_without_live_deltas_fails_instead_of_being_chunked(
+    recovery_repository: ProductRepository,
+) -> None:
+    repository = recovery_repository
+    service = service_for(repository, TerminalOnlyRunner())
+    thread = await repository.create_thread(
+        principal=TEST_PRINCIPAL,
+        title="Reject terminal chunk fallback",
+    )
+    run = await service.create_run(
+        principal=TEST_PRINCIPAL,
+        thread_id=thread.thread_id,
+        message="Require live Runtime deltas",
+        idempotency_key="no-terminal-chunk-fallback",
+    )
+    await service.wait_for_idle()
+
+    failed = await repository.get_run(run.run_id, principal=TEST_PRINCIPAL)
+    assert failed.status == "failed"
+    events = await repository.get_events(run.run_id, 0, principal=TEST_PRINCIPAL)
+    assert [event.type for event in events] == ["run.started", "run.failed"]
+    assert events[-1].data == {
+        "status": "failed",
+        "error_code": "result_schema_invalid",
+    }
+    snapshot = await repository.get_thread(thread.thread_id, principal=TEST_PRINCIPAL)
+    assert [message.role for message in snapshot.messages] == ["user"]
 
     await service.shutdown()
 

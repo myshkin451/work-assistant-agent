@@ -1,6 +1,6 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 import type {
   Message,
@@ -95,6 +95,10 @@ function runSnapshot(run: RunView, events: ProductEvent[]): RunSnapshot {
 }
 
 describe('employee chat vertical slice', () => {
+  beforeEach(() => {
+    window.history.replaceState(null, '', '/threads/thread-1');
+  });
+
   it('blocks all interaction when the initial request is unauthenticated', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
       jsonResponse({ detail: { code: 'authentication_required' } }, 401),
@@ -158,7 +162,7 @@ describe('employee chat vertical slice', () => {
     expect(screen.queryByRole('button', { name: '停止运行' })).not.toBeInTheDocument();
   });
 
-  it('does not let a late request restore state after access is blocked', async () => {
+  it('keeps owned history and ignores a late request after a route-level 403', async () => {
     const otherSummary: ThreadSummary = {
       ...summary,
       thread_id: 'thread-2',
@@ -200,58 +204,67 @@ describe('employee chat vertical slice', () => {
     await user.click(screen.getByRole('button', { name: otherSummary.title }));
 
     expect(
-      await screen.findByText('当前身份无权访问这项会话或运行。'),
+      await screen.findByText('无法访问这个会话。它可能不存在，或当前身份没有访问权限。'),
     ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: summary.title })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: otherSummary.title })).toBeInTheDocument();
     resolveCreateRun(jsonResponse({ detail: { code: 'service_failure' } }, 500));
     await waitFor(() => {
       expect(screen.getByRole('alert')).toHaveTextContent(
-        '当前身份无权访问这项会话或运行。',
+        '无法访问这个会话。它可能不存在，或当前身份没有访问权限。',
       );
     });
     expect(composer).toHaveValue('');
-    expect(composer).toBeDisabled();
+    expect(composer).toBeEnabled();
     expect(screen.queryByText(userMessage.content)).not.toBeInTheDocument();
     expect(screen.queryByText('A 主体尚未发送完成的草稿')).not.toBeInTheDocument();
   });
 
   it('creates a real run and renders deduplicated product events, tools and sources', async () => {
+    window.history.replaceState(null, '', '/');
+    const initialKey = '11111111-1111-4111-8111-111111111111';
+    const initialThreadId = '22222222-2222-4222-8222-222222222222';
+    vi.spyOn(crypto, 'randomUUID')
+      .mockReturnValueOnce(initialKey)
+      .mockReturnValueOnce(initialThreadId);
+    const initialSummary: ThreadSummary = { ...summary, thread_id: initialThreadId };
+    const initialRunning: RunView = { ...running, thread_id: initialThreadId };
     const emptyList = { items: [] as ThreadSummary[] };
-    const emptySnapshot: ThreadSnapshot = { ...summary, messages: [], runs: [], active_run: null };
     const withUser: ThreadSnapshot = {
-      ...summary,
+      ...initialSummary,
       messages: [userMessage],
-      runs: [runSnapshot(running, [])],
-      active_run: running,
+      runs: [runSnapshot(initialRunning, [])],
+      active_run: initialRunning,
     };
     const completedSnapshot: ThreadSnapshot = {
-      ...summary,
+      ...initialSummary,
       messages: [userMessage, assistantMessage],
       runs: [
         runSnapshot(
-          { ...running, status: 'completed', last_seq: 9, completed_at: timestamp },
+          { ...initialRunning, status: 'completed', last_seq: 9, completed_at: timestamp },
           [
-            event(1, 'run.started', { status: 'running' }),
+            event(1, 'run.started', { status: 'running' }, 'run-1', initialThreadId),
             event(2, 'tool.started', {
               tool_call_id: 'tool-1',
               name: 'get_current_time',
               label: '查询指定时区的当前时间',
               input_summary: 'Asia/Shanghai',
-            }),
+            }, 'run-1', initialThreadId),
             event(3, 'tool.finished', {
               tool_call_id: 'tool-1',
               name: 'get_current_time',
               label: '查询指定时区的当前时间',
               output_summary: '已取得 Asia/Shanghai 当前时间',
-            }),
-            event(5, 'message.delta', { delta: '上海当前时间' }),
-            event(6, 'message.delta', { delta: '为 2026 年 8 月 12 日 20:00。' }),
+            }, 'run-1', initialThreadId),
+            event(5, 'message.delta', { delta: '上海当前时间' }, 'run-1', initialThreadId),
+            event(6, 'message.delta', { delta: '为 2026 年 8 月 12 日 20:00。' }, 'run-1', initialThreadId),
             event(7, 'source.added', {
               source_id: 'source-1',
               label: '系统时钟 · Asia/Shanghai',
               description: '由只读时间工具返回',
-            }),
-            event(8, 'message.completed', { message: assistantMessage }),
-            event(9, 'run.completed', { status: 'completed' }),
+            }, 'run-1', initialThreadId),
+            event(8, 'message.completed', { message: assistantMessage }, 'run-1', initialThreadId),
+            event(9, 'run.completed', { status: 'completed' }, 'run-1', initialThreadId),
           ],
         ),
       ],
@@ -262,40 +275,41 @@ describe('employee chat vertical slice', () => {
       const url = String(input);
       const method = init?.method ?? 'GET';
       if (url === '/api/threads' && method === 'GET') {
-        return jsonResponse(snapshotReads === 0 ? emptyList : { items: [summary] });
+        return jsonResponse(snapshotReads === 0 ? emptyList : { items: [initialSummary] });
       }
-      if (url === '/api/threads' && method === 'POST') return jsonResponse(emptySnapshot);
-      if (url === '/api/threads/thread-1/runs' && method === 'POST') return jsonResponse(running);
-      if (url === '/api/threads/thread-1' && method === 'GET') {
+      if (url === `/api/threads/${initialThreadId}/initial-run` && method === 'POST') {
+        return jsonResponse({ thread: initialSummary, run: initialRunning }, 201);
+      }
+      if (url === `/api/threads/${initialThreadId}` && method === 'GET') {
         snapshotReads += 1;
         return jsonResponse(snapshotReads === 1 ? withUser : completedSnapshot);
       }
       if (url === '/api/runs/run-1/events?after_seq=0') {
         return sseResponse([
-          event(1, 'run.started', { status: 'running' }),
+          event(1, 'run.started', { status: 'running' }, 'run-1', initialThreadId),
           event(2, 'tool.started', {
             tool_call_id: 'tool-1',
             name: 'get_current_time',
             label: '查询指定时区的当前时间',
             input_summary: 'Asia/Shanghai',
-          }),
+          }, 'run-1', initialThreadId),
           event(3, 'tool.finished', {
             tool_call_id: 'tool-1',
             name: 'get_current_time',
             label: '查询指定时区的当前时间',
             output_summary: '已取得 Asia/Shanghai 当前时间',
-          }),
-          privateEvent(4),
-          event(5, 'message.delta', { delta: '上海当前时间' }),
-          event(5, 'message.delta', { delta: '重复内容不应显示' }),
-          event(6, 'message.delta', { delta: '为 2026 年 8 月 12 日 20:00。' }),
+          }, 'run-1', initialThreadId),
+          { ...privateEvent(4), thread_id: initialThreadId },
+          event(5, 'message.delta', { delta: '上海当前时间' }, 'run-1', initialThreadId),
+          event(5, 'message.delta', { delta: '重复内容不应显示' }, 'run-1', initialThreadId),
+          event(6, 'message.delta', { delta: '为 2026 年 8 月 12 日 20:00。' }, 'run-1', initialThreadId),
           event(7, 'source.added', {
             source_id: 'source-1',
             label: '系统时钟 · Asia/Shanghai',
             description: '由只读时间工具返回',
-          }),
-          event(8, 'message.completed', { message: assistantMessage }),
-          event(9, 'run.completed', { status: 'completed' }),
+          }, 'run-1', initialThreadId),
+          event(8, 'message.completed', { message: assistantMessage }, 'run-1', initialThreadId),
+          event(9, 'run.completed', { status: 'completed' }, 'run-1', initialThreadId),
         ]);
       }
       throw new Error(`Unexpected request: ${method} ${url}`);
@@ -316,6 +330,19 @@ describe('employee chat vertical slice', () => {
     expect(screen.getByText('系统时钟 · Asia/Shanghai')).toBeInTheDocument();
     expect(screen.queryByText('重复内容不应显示')).not.toBeInTheDocument();
     expect(screen.queryByText('不应显示的内部思考')).not.toBeInTheDocument();
+    expect(window.location.pathname).toBe(`/threads/${initialThreadId}`);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/threads/${initialThreadId}/initial-run`,
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ message: userMessage.content, idempotency_key: initialKey }),
+      }),
+    );
+    expect(
+      fetchMock.mock.calls.some(
+        ([input, init]) => String(input) === '/api/threads' && init?.method === 'POST',
+      ),
+    ).toBe(false);
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/runs/run-1/events?after_seq=0',
       expect.objectContaining({ credentials: 'include' }),

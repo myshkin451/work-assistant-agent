@@ -17,7 +17,13 @@ from langchain.agents.middleware import (
     wrap_model_call,
     wrap_tool_call,
 )
-from langchain_core.messages import AIMessage, BaseMessage, SystemMessage, ToolMessage
+from langchain_core.messages import (
+    AIMessage,
+    AIMessageChunk,
+    BaseMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_deepseek import ChatDeepSeek
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
@@ -303,12 +309,146 @@ def _split_text(text: str) -> tuple[str, str]:
     return text[:split_at], text[split_at:]
 
 
-def _message_delta_events(text: str) -> list[tuple[str, dict[str, str]]]:
-    chunk_size = 8_000
-    return [
-        ("message.delta", {"delta": text[offset : offset + chunk_size]})
-        for offset in range(0, len(text), chunk_size)
-    ]
+_FINALIZER_FORBIDDEN_MODEL_SETTINGS = frozenset(
+    {
+        "function_call",
+        "functions",
+        "parallel_tool_calls",
+        "tool_choice",
+        "tools",
+    }
+)
+_FINALIZER_TOOL_SIGNAL_KEYS = frozenset({"function_call", "tool_calls"})
+_FINALIZER_TOOL_BLOCK_TYPES = frozenset(
+    {
+        "function_call",
+        "input_json_delta",
+        "tool_call",
+        "tool_call_chunk",
+        "tool_use",
+    }
+)
+_PUBLIC_TEXT_BLOCK_TYPES = frozenset({"output_text", "text"})
+_PUBLIC_DELTA_MAX_CHARS = 8_000
+_STREAM_DELTA_TARGET_CHARS = 64
+
+
+def _has_tool_signal(message: AIMessage | AIMessageChunk) -> bool:
+    if message.tool_calls or message.invalid_tool_calls:
+        return True
+    if isinstance(message, AIMessageChunk) and message.tool_call_chunks:
+        return True
+    if _FINALIZER_TOOL_SIGNAL_KEYS.intersection(message.additional_kwargs):
+        return True
+    if message.response_metadata.get("finish_reason") in {"function_call", "tool_calls"}:
+        return True
+    if isinstance(message.content, list):
+        return any(
+            isinstance(block, dict) and block.get("type") in _FINALIZER_TOOL_BLOCK_TYPES
+            for block in message.content
+        )
+    return False
+
+
+def _public_stream_chunk_text(chunk: AIMessageChunk) -> str:
+    """Extract only public answer text from one provider stream chunk.
+
+    DeepSeek reasoning lives outside ``content`` in ``additional_kwargs``. Tool
+    arguments and all unknown provider blocks are intentionally never serialized
+    into a product event.
+    """
+
+    if _has_tool_signal(chunk):
+        raise AgentExecutionFailed("finalizer_tool_call_forbidden")
+    if isinstance(chunk.content, str):
+        return chunk.content
+    if not isinstance(chunk.content, list):
+        raise AgentExecutionFailed("finalizer_chunk_invalid")
+    parts: list[str] = []
+    for block in chunk.content:
+        if not isinstance(block, dict) or block.get("type") not in _PUBLIC_TEXT_BLOCK_TYPES:
+            continue
+        text = block.get("text")
+        if not isinstance(text, str):
+            raise AgentExecutionFailed("finalizer_chunk_invalid")
+        parts.append(text)
+    return "".join(parts)
+
+
+async def _emit_stream_chunk(context: DeepSeekRuntimeContext, text: str) -> None:
+    """Frame one live buffered block to the public payload limit without post-hoc splitting."""
+
+    for offset in range(0, len(text), _PUBLIC_DELTA_MAX_CHARS):
+        await context.emit(
+            ProductEvent(
+                "message.delta",
+                {"delta": text[offset : offset + _PUBLIC_DELTA_MAX_CHARS]},
+            )
+        )
+
+
+async def _stream_final_response(
+    request: ModelRequest[DeepSeekRuntimeContext],
+    context: DeepSeekRuntimeContext,
+) -> str:
+    forbidden_settings = _FINALIZER_FORBIDDEN_MODEL_SETTINGS.intersection(request.model_settings)
+    if forbidden_settings:
+        raise AgentExecutionFailed("finalizer_tool_configuration_forbidden")
+
+    messages: list[BaseMessage] = []
+    if request.system_message is not None:
+        messages.append(request.system_message)
+    messages.extend(request.messages)
+
+    text_parts: list[str] = []
+    public_buffer = ""
+    has_non_whitespace = False
+    emitted_public_delta = False
+    text_chars = 0
+    max_answer_chars = context.execution.agent.result_contract.max_answer_chars
+
+    # This call is structurally Tool-free: it uses the unbound BaseChatModel
+    # directly and passes neither request.tools nor a Tool choice. That provider
+    # protocol invariant removes the single-call ambiguity where text can precede
+    # a later Tool call. Any contrary provider signal fails the Run closed; text
+    # already emitted before such a violation can only remain on that failed Run.
+    async with asyncio.timeout(context.execution.remaining_seconds):
+        async for chunk in request.model.astream(messages, **request.model_settings):
+            if not isinstance(chunk, AIMessageChunk):
+                raise AgentExecutionFailed("finalizer_chunk_invalid")
+            delta = _public_stream_chunk_text(chunk)
+            if not delta:
+                continue
+            text_chars += len(delta)
+            if text_chars > max_answer_chars:
+                raise ResultSchemaInvalid
+            text_parts.append(delta)
+            public_buffer += delta
+            if not has_non_whitespace and delta.strip():
+                has_non_whitespace = True
+            if has_non_whitespace:
+                if not emitted_public_delta:
+                    # Make even a short answer observable before the provider
+                    # generator closes. Later tokens are coalesced to keep
+                    # persistence write amplification bounded.
+                    await _emit_stream_chunk(context, public_buffer)
+                    public_buffer = ""
+                    emitted_public_delta = True
+                    continue
+                # Persist bounded live blocks instead of one transaction per
+                # provider token. Full blocks flush before the provider stream
+                # advances; only the final short tail waits for stream closure.
+                while len(public_buffer) >= _STREAM_DELTA_TARGET_CHARS:
+                    public_delta = public_buffer[:_STREAM_DELTA_TARGET_CHARS]
+                    public_buffer = public_buffer[_STREAM_DELTA_TARGET_CHARS:]
+                    await _emit_stream_chunk(context, public_delta)
+
+    final_text = "".join(text_parts)
+    if not final_text.strip():
+        raise ResultSchemaInvalid
+    if public_buffer:
+        await _emit_stream_chunk(context, public_buffer)
+    return final_text
 
 
 class _RuntimeLifecycle:
@@ -434,26 +574,36 @@ async def apply_model_policy(
     context.execution.before_model_call()
     visible = set(context.execution.visible_tool_ids)
     tools = [tool for tool in request.tools if getattr(tool, "name", None) in visible]
-    response = await handler(
-        request.override(
-            tools=tools,
-            tool_choice="auto" if tools else "none",
-            system_message=SystemMessage(content=context.built_context.system_prompt),
-        )
+    controlled_request = request.override(
+        tools=tools,
+        tool_choice="auto" if tools else "none",
+        system_message=SystemMessage(content=context.built_context.system_prompt),
     )
+    response = await handler(controlled_request)
     context.execution.after_model_response(response.result)
     terminal_message = response.result[-1] if response.result else None
     if isinstance(terminal_message, AIMessage) and not terminal_message.tool_calls:
-        final_text = _content_text(terminal_message.content)
-        if not final_text.strip():
+        if _has_tool_signal(terminal_message):
+            raise AgentExecutionFailed("terminal_tool_signal_invalid")
+        terminal_draft = _content_text(terminal_message.content)
+        if not terminal_draft.strip():
             raise ResultSchemaInvalid
-        if len(final_text) > context.execution.agent.result_contract.max_answer_chars:
-            raise ResultSchemaInvalid
+        if (
+            controlled_request.response_format is not None
+            or response.structured_response is not None
+        ):
+            raise AgentExecutionFailed("finalizer_structured_response_unsupported")
         if context.final_response_text is not None:
             raise AgentExecutionFailed("multiple_terminal_model_responses")
+        context.execution.before_model_call()
+        final_text = await _stream_final_response(controlled_request, context)
+        final_message = AIMessage(content=final_text, name=terminal_message.name)
+        context.execution.after_model_response([final_message])
         context.final_response_text = final_text
-        for event_type, data in _message_delta_events(final_text):
-            await context.emit(ProductEvent(event_type, data))
+        return ModelResponse(
+            result=[*response.result[:-1], final_message],
+            structured_response=None,
+        )
     return response
 
 
@@ -546,11 +696,12 @@ class DeepSeekAgentRunner:
         self._lifecycle.require_healthy()
         if not messages:
             raise RuntimeError("conversation_context_missing")
-        # Every model response and Tool call is already business-bounded. This
-        # capacity holds the maximum 3 events per reserved Tool, four answer
-        # chunks, one exception, and the sentinel without unbounded buffering.
+        # Keep a small bounded lead between the provider and durable persistence.
+        # Completion signaling separately observes consumer exit, so a full queue
+        # cannot strand a cancelled producer in its finally block.
         queue_capacity = execution.agent.budget.max_tool_calls * 3 + 6
         queue: asyncio.Queue[RuntimeItem | Exception | None] = asyncio.Queue(maxsize=queue_capacity)
+        consumer_stopped = asyncio.Event()
 
         async def emit(event: ProductEvent) -> None:
             await queue.put(event)
@@ -596,7 +747,20 @@ class DeepSeekAgentRunner:
             except Exception as exc:
                 await queue.put(exc)
             finally:
-                await queue.put(None)
+                if not consumer_stopped.is_set():
+                    put_sentinel = asyncio.create_task(queue.put(None))
+                    wait_for_consumer = asyncio.create_task(consumer_stopped.wait())
+                    completion_tasks = {put_sentinel, wait_for_consumer}
+                    try:
+                        await asyncio.wait(
+                            completion_tasks,
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                    finally:
+                        for task in completion_tasks:
+                            if not task.done():
+                                task.cancel()
+                        await asyncio.gather(*completion_tasks, return_exceptions=True)
 
         producer = asyncio.create_task(produce(), name=f"deepseek-agent-{run_id}")
         producer_reached_sentinel = False
@@ -610,6 +774,7 @@ class DeepSeekAgentRunner:
                     raise item
                 yield item
         finally:
+            consumer_stopped.set()
             # A normal sentinel means producer work reached its own final
             # boundary; observe it without injecting an unnecessary cancel.
             # Early consumer exit or Run cancellation still cancels exactly once.

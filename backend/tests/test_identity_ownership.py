@@ -5,6 +5,7 @@ import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -220,6 +221,11 @@ async def test_health_is_public_but_every_product_entry_requires_identity(
             headers={"Content-Type": "application/json"},
         ),
         client.get("/api/threads/unknown"),
+        client.patch("/api/threads/unknown", json={"title": "Rename"}),
+        client.post(
+            f"/api/threads/{uuid4()}/initial-run",
+            json={"message": "question", "idempotency_key": "initial-key"},
+        ),
         client.post(
             "/api/threads/unknown/runs",
             json={"message": "question", "idempotency_key": "key"},
@@ -280,6 +286,132 @@ async def test_thread_listing_detail_and_creation_are_owner_scoped(
     assert stored_b is not None and stored_b.owner_subject == PRINCIPAL_B.subject
 
 
+async def test_initial_run_conflicts_and_foreign_replays_fail_closed(
+    identity_clients: tuple[AsyncClient, AsyncClient, AsyncClient, Any],
+) -> None:
+    client_a, client_b, _, app = identity_clients
+    thread_id = str(uuid4())
+    body = {"message": "Owner A first question", "idempotency_key": "initial-owner-a"}
+
+    created = await client_a.post(f"/api/threads/{thread_id}/initial-run", json=body)
+    replayed = await client_a.post(f"/api/threads/{thread_id}/initial-run", json=body)
+    assert created.status_code == replayed.status_code == 201
+    assert created.json()["run"]["run_id"] == replayed.json()["run"]["run_id"]
+
+    mismatch = await client_a.post(
+        f"/api/threads/{thread_id}/initial-run",
+        json={**body, "message": "A different first question"},
+    )
+    assert mismatch.status_code == 409
+    assert mismatch.json() == {"detail": {"code": "idempotency_mismatch"}}
+
+    different_key = await client_a.post(
+        f"/api/threads/{thread_id}/initial-run",
+        json={**body, "idempotency_key": "another-initial-key"},
+    )
+    assert different_key.status_code == 409
+    assert different_key.json() == {"detail": {"code": "thread_already_exists"}}
+
+    rejected_origin_thread_id = str(uuid4())
+    rejected_origin = await client_a.post(
+        f"/api/threads/{rejected_origin_thread_id}/initial-run",
+        json={"message": "Must not persist", "idempotency_key": "bad-origin"},
+        headers={"Origin": "https://untrusted.example"},
+    )
+    assert rejected_origin.status_code == 403
+    assert rejected_origin.json() == {"detail": {"code": "origin_forbidden"}}
+    assert (await client_a.get(f"/api/threads/{rejected_origin_thread_id}")).status_code == 404
+
+    forbidden = await client_b.post(f"/api/threads/{thread_id}/initial-run", json=body)
+    forbidden_malformed = await client_b.post(
+        f"/api/threads/{thread_id}/initial-run",
+        json={"message": " ", "idempotency_key": " "},
+    )
+    assert forbidden.status_code == forbidden_malformed.status_code == 403
+    assert (
+        forbidden.json() == forbidden_malformed.json() == {"detail": {"code": "thread_forbidden"}}
+    )
+    forbidden_text = forbidden.text + forbidden_malformed.text
+    assert created.json()["run"]["run_id"] not in forbidden_text
+    assert "Owner A" not in forbidden_text
+
+    async with app.state.repository._sessions() as session:  # noqa: SLF001
+        threads = (await session.scalars(select(ThreadRecord))).all()
+        runs = (await session.scalars(select(RunRecord))).all()
+        messages = (
+            await session.scalars(select(MessageRecord).where(MessageRecord.role == "user"))
+        ).all()
+    assert len(threads) == len(runs) == len(messages) == 1
+    assert threads[0].owner_subject == runs[0].actor_subject == PRINCIPAL_A.subject
+
+
+async def test_thread_rename_is_strict_owner_scoped_and_cors_allowed(
+    identity_clients: tuple[AsyncClient, AsyncClient, AsyncClient, Any],
+) -> None:
+    client_a, client_b, unauthenticated, _ = identity_clients
+    thread_id = await create_thread(client_a, "Original title")
+
+    renamed = await client_a.patch(
+        f"/api/threads/{thread_id}",
+        json={"title": "  Renamed   conversation  "},
+    )
+    assert renamed.status_code == 200
+    assert renamed.json()["title"] == "Renamed conversation"
+    normalized_long_input = await client_a.patch(
+        f"/api/threads/{thread_id}",
+        json={"title": f"Concise{' ' * 220}title"},
+    )
+    assert normalized_long_input.status_code == 200
+    assert normalized_long_input.json()["title"] == "Concise title"
+    assert (await client_a.get(f"/api/threads/{thread_id}")).json()["title"] == ("Concise title")
+    assert (await client_a.get("/api/threads")).json()["items"][0]["title"] == ("Concise title")
+
+    blank = await client_a.patch(f"/api/threads/{thread_id}", json={"title": " "})
+    control = await client_a.patch(
+        f"/api/threads/{thread_id}", json={"title": "line one\nline two"}
+    )
+    extra = await client_a.patch(
+        f"/api/threads/{thread_id}", json={"title": "Valid", "owner": "injected"}
+    )
+    assert blank.status_code == control.status_code == extra.status_code == 422
+
+    forbidden = await client_b.patch(f"/api/threads/{thread_id}", json={"title": "Foreign rename"})
+    forbidden_malformed = await client_b.patch(f"/api/threads/{thread_id}", json={"title": " "})
+    assert forbidden.status_code == forbidden_malformed.status_code == 403
+    assert (
+        forbidden.json() == forbidden_malformed.json() == {"detail": {"code": "thread_forbidden"}}
+    )
+    assert "Renamed conversation" not in forbidden.text + forbidden_malformed.text
+
+    missing = await client_a.patch(
+        f"/api/threads/{uuid4()}", json={"title": "Missing conversation"}
+    )
+    assert missing.status_code == 404
+    unauthenticated_rename = await unauthenticated.patch(
+        f"/api/threads/{thread_id}", json={"title": " "}
+    )
+    assert unauthenticated_rename.status_code == 401
+
+    bad_origin = await client_a.patch(
+        f"/api/threads/{thread_id}",
+        json={"title": "Origin must not mutate"},
+        headers={"Origin": "https://untrusted.example"},
+    )
+    assert bad_origin.status_code == 403
+    assert bad_origin.json() == {"detail": {"code": "origin_forbidden"}}
+    assert (await client_a.get(f"/api/threads/{thread_id}")).json()["title"] == ("Concise title")
+
+    preflight = await client_a.options(
+        f"/api/threads/{thread_id}",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "PATCH",
+        },
+    )
+    assert preflight.status_code == 200
+    assert "PATCH" in preflight.headers["access-control-allow-methods"]
+
+
 async def test_run_idempotency_actor_and_cross_owner_rejection(
     identity_clients: tuple[AsyncClient, AsyncClient, AsyncClient, Any],
 ) -> None:
@@ -312,9 +444,7 @@ async def test_run_idempotency_actor_and_cross_owner_rejection(
         roles=("admin", "allow-all-tools"),
     )
     allowed_plan_for_b = make_execution_plan(privileged_b)
-    assert tuple(tool.tool_id for tool in allowed_plan_for_b.visible_tools) == (
-        "get_current_time",
-    )
+    assert tuple(tool.tool_id for tool in allowed_plan_for_b.visible_tools) == ("get_current_time",)
     with pytest.raises(ResourceForbiddenError, match="thread"):
         await app.state.repository.create_run(
             principal=privileged_b,
@@ -450,13 +580,9 @@ async def test_sse_replay_and_reconnect_reauthorize_before_streaming(
     assert unauthenticated_response.status_code == 401
     missing = await client_a.get("/api/runs/not-a-run/events")
     assert missing.status_code == 404
-    missing_bad_cursor = await client_a.get(
-        "/api/runs/not-a-run/events", params={"after_seq": -1}
-    )
+    missing_bad_cursor = await client_a.get("/api/runs/not-a-run/events", params={"after_seq": -1})
     assert missing_bad_cursor.status_code == 404
-    owned_bad_cursor = await client_a.get(
-        f"/api/runs/{run_id}/events", params={"after_seq": -1}
-    )
+    owned_bad_cursor = await client_a.get(f"/api/runs/{run_id}/events", params={"after_seq": -1})
     assert owned_bad_cursor.status_code == 422
     assert owned_bad_cursor.json() == {"detail": {"code": "invalid_after_seq"}}
     assert full.headers["cache-control"] == "private, no-store, no-transform"
@@ -577,6 +703,7 @@ async def test_development_identity_header_cors_is_explicit_and_credentialed(
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == "http://localhost:5173"
     assert response.headers["access-control-allow-credentials"] == "true"
-    assert DEVELOPMENT_PRINCIPAL_HEADER.casefold() in response.headers[
-        "access-control-allow-headers"
-    ].casefold()
+    assert (
+        DEVELOPMENT_PRINCIPAL_HEADER.casefold()
+        in response.headers["access-control-allow-headers"].casefold()
+    )

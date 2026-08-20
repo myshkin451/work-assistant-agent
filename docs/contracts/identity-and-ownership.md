@@ -99,11 +99,11 @@ SSE request and reconnect authenticates again; an authorization failure is a
 normal JSON response emitted before the stream starts.
 
 For browser mutations, an absent `Origin` is accepted for non-browser clients;
-when `Origin` is present, every `POST /api/**` requires exactly one value from
-the configured allowlist before any mutation executes. This is the neutral
-Host's ambient-cookie CSRF baseline. Credentialed CORS controls response access;
-it is not itself a CSRF defense. A downstream cookie provider must additionally
-set an appropriate Secure/SameSite cookie policy and may add stronger request
+when `Origin` is present, every `POST` or `PATCH /api/**` mutation requires
+exactly one value from the configured allowlist before any mutation executes.
+This is the neutral Host's ambient-cookie CSRF baseline. Credentialed CORS
+controls response access; it is not itself a CSRF defense. A downstream cookie
+provider must additionally set an appropriate Secure/SameSite cookie policy and may add stronger request
 binding without weakening the Host's exact-origin check.
 
 ## v0.2 migration

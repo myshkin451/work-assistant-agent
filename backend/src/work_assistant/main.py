@@ -134,7 +134,7 @@ def create_app(
 
     app = FastAPI(
         title="Work Assistant Agent API",
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
 
@@ -155,7 +155,7 @@ def create_app(
         CORSMiddleware,
         allow_origins=resolved.cors_origins,
         allow_credentials=True,
-        allow_methods=["GET", "POST"],
+        allow_methods=["GET", "POST", "PATCH"],
         allow_headers=[
             "Authorization",
             "Content-Type",

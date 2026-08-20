@@ -3,20 +3,30 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from typing import Annotated
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 
 from .authorization import ResourceForbiddenError
 from .identity import Principal
-from .repository import ActiveRunConflictError, ProductRepository, ResourceNotFoundError
+from .repository import (
+    ActiveRunConflictError,
+    IdempotencyMismatchError,
+    InitialThreadExistsError,
+    ProductRepository,
+    ResourceNotFoundError,
+)
 from .schemas import (
     EventEnvelope,
+    InitialRunResponse,
     RunCreate,
     RunView,
     ThreadCreate,
     ThreadList,
     ThreadSnapshot,
+    ThreadSummary,
+    ThreadUpdate,
 )
 from .service import (
     RepositoryCleanupTimeout,
@@ -87,6 +97,26 @@ async def _current_owned_thread(
 CurrentOwnedThread = Annotated[None, Depends(_current_owned_thread)]
 
 
+async def _current_owned_or_absent_initial_thread(
+    client_thread_id: UUID,
+    request: Request,
+    principal: CurrentPrincipal,
+) -> None:
+    try:
+        await _repository(request).require_thread_access(str(client_thread_id), principal=principal)
+    except ResourceNotFoundError:
+        # Absence is the expected first-write state. The repository remains the
+        # final arbiter if another creator wins after this dependency returns.
+        return
+    except ResourceForbiddenError as exc:
+        raise _forbidden("thread") from exc
+
+
+CurrentOwnedOrAbsentInitialThread = Annotated[
+    None, Depends(_current_owned_or_absent_initial_thread)
+]
+
+
 @router.get("/health")
 async def health(request: Request) -> dict[str, str]:
     if not _service(request).is_healthy:
@@ -108,6 +138,52 @@ async def create_thread(
     return await _repository(request).create_thread(principal=principal, title=body.title)
 
 
+@router.post(
+    "/api/threads/{client_thread_id}/initial-run",
+    response_model=InitialRunResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_initial_run(
+    client_thread_id: UUID,
+    body: RunCreate,
+    request: Request,
+    principal: CurrentPrincipal,
+    _trusted_origin: TrustedMutationOrigin,
+    _owned_or_absent: CurrentOwnedOrAbsentInitialThread,
+) -> InitialRunResponse:
+    try:
+        return await _service(request).create_initial_run(
+            principal=principal,
+            thread_id=str(client_thread_id),
+            message=body.message,
+            idempotency_key=body.idempotency_key,
+        )
+    except ResourceNotFoundError as exc:
+        raise _not_found("thread") from exc
+    except ResourceForbiddenError as exc:
+        raise _forbidden("thread") from exc
+    except IdempotencyMismatchError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "idempotency_mismatch"},
+        ) from exc
+    except InitialThreadExistsError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "thread_already_exists"},
+        ) from exc
+    except RunAdmissionTimeout as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "run_admission_timeout"},
+        ) from exc
+    except (RepositoryCleanupTimeout, RunServiceUnavailable) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "service_unavailable"},
+        ) from exc
+
+
 @router.get("/api/threads", response_model=ThreadList)
 async def list_threads(request: Request, principal: CurrentPrincipal) -> ThreadList:
     return ThreadList(items=await _repository(request).list_threads(principal=principal))
@@ -119,6 +195,27 @@ async def get_thread(
 ) -> ThreadSnapshot:
     try:
         return await _repository(request).get_thread(thread_id, principal=principal)
+    except ResourceNotFoundError as exc:
+        raise _not_found("thread") from exc
+    except ResourceForbiddenError as exc:
+        raise _forbidden("thread") from exc
+
+
+@router.patch("/api/threads/{thread_id}", response_model=ThreadSummary)
+async def rename_thread(
+    thread_id: str,
+    body: ThreadUpdate,
+    request: Request,
+    principal: CurrentPrincipal,
+    _trusted_origin: TrustedMutationOrigin,
+    _owned_thread: CurrentOwnedThread,
+) -> ThreadSummary:
+    try:
+        return await _repository(request).rename_thread(
+            thread_id,
+            principal=principal,
+            title=body.title,
+        )
     except ResourceNotFoundError as exc:
         raise _not_found("thread") from exc
     except ResourceForbiddenError as exc:

@@ -2,6 +2,7 @@ import {
   productEventTypes,
   type ProductEvent,
   type ProductEventType,
+  type InitialRunResponse,
   type RunView,
   type ThreadSnapshot,
   type ThreadSummary,
@@ -64,6 +65,25 @@ export const createThread = (title?: string) =>
 
 export const getThread = (threadId: string) =>
   requestJson<ThreadSnapshot>(`/api/threads/${encodeURIComponent(threadId)}`);
+
+export const createInitialRun = (
+  threadId: string,
+  message: string,
+  idempotencyKey: string,
+) =>
+  requestJson<InitialRunResponse>(
+    `/api/threads/${encodeURIComponent(threadId)}/initial-run`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ message, idempotency_key: idempotencyKey }),
+    },
+  );
+
+export const updateThread = (threadId: string, title: string) =>
+  requestJson<ThreadSummary>(`/api/threads/${encodeURIComponent(threadId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ title }),
+  });
 
 export const createRun = (threadId: string, message: string, idempotencyKey: string) =>
   requestJson<RunView>(`/api/threads/${encodeURIComponent(threadId)}/runs`, {

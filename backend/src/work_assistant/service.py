@@ -17,6 +17,7 @@ from .identity import Principal
 from .repository import ProductRepository
 from .schemas import (
     EventEnvelope,
+    InitialRunResponse,
     ProductEventValidationError,
     RuntimeEventType,
     RunView,
@@ -86,16 +87,6 @@ async def _finish_repository_call[T](
             await asyncio.wait({operation}, timeout=remaining)
         except asyncio.CancelledError:
             parent_cancelled = True
-
-
-def _result_delta_events(text: str) -> list[tuple[RuntimeEventType, dict[str, Any]]]:
-    """Encode one validated answer as public payload-sized delta events."""
-
-    chunk_size = 8_000
-    return [
-        ("message.delta", {"delta": text[offset : offset + chunk_size]})
-        for offset in range(0, len(text), chunk_size)
-    ]
 
 
 class DisconnectAware(Protocol):
@@ -198,6 +189,39 @@ class RunService:
             if created:
                 self._launch(view.run_id, execution)
             return view
+
+        try:
+            return await self._repository_call(
+                admit_and_launch,
+                deadline_at=execution.deadline_at,
+            )
+        except TimeoutError as exc:
+            raise RunAdmissionTimeout("run_admission_timeout") from exc
+
+    async def create_initial_run(
+        self,
+        *,
+        principal: Principal,
+        thread_id: str,
+        message: str,
+        idempotency_key: str,
+    ) -> InitialRunResponse:
+        self._require_healthy()
+        execution = self._policy_kernel.prepare_run(principal=principal)
+
+        async def admit_and_launch() -> InitialRunResponse:
+            thread, view, created = await self.repository.create_initial_run(
+                principal=principal,
+                thread_id=thread_id,
+                message=message,
+                idempotency_key=idempotency_key,
+                execution_plan=execution.plan_evidence,
+            )
+            # Match ordinary Run admission: a committed new Run cannot yield
+            # ownership before its in-process worker has been registered.
+            if created:
+                self._launch(view.run_id, execution)
+            return InitialRunResponse(thread=thread, run=view)
 
         try:
             return await self._repository_call(
@@ -396,18 +420,11 @@ class RunService:
                         result = item
                 if result is None:
                     raise AgentExecutionFailed("agent_result_missing")
-                runtime_text = "".join(runtime_text_parts) if runtime_text_parts else None
+                runtime_text = "".join(runtime_text_parts)
                 validated_result = execution.validate_result(
                     result,
                     runtime_text=runtime_text,
                 )
-                if not runtime_text_parts:
-                    for event_type, data in _result_delta_events(validated_result.text):
-                        event = ProductEvent(event_type, data)
-                        execution.validate_runtime_event(event)
-                        persisted = await persist_controlled_event(event, event_type, data)
-                        if persisted is None:
-                            return
             outcome = execution.outcome(
                 status="completed",
                 stop_reason="completed",
