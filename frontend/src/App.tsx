@@ -2,21 +2,32 @@ import {
   Fragment,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
   type FormEvent,
   type KeyboardEvent,
+  type RefObject,
 } from 'react';
 import {
   ApiError,
   cancelRun,
+  createInitialRun,
   createRun,
-  createThread,
   getThread,
   listThreads,
   streamRunEvents,
+  updateThread,
 } from './api';
+import { MarkdownMessage } from './MarkdownMessage';
+import {
+  parseThreadRoute,
+  threadPath,
+  type HistoryMode,
+  writeBlankRoute,
+  writeThreadRoute,
+} from './threadRoute';
 import {
   isRunFailureCode,
   isTerminalStatus,
@@ -34,6 +45,12 @@ import {
 
 const EMPTY_TITLE = '新对话';
 
+const publicSourceCopy: Record<string, string> = {
+  'System clock with IANA time data': 'IANA 时区系统时钟',
+  'Current server clock converted with the requested IANA timezone.':
+    '由系统时钟按指定 IANA 时区换算。',
+};
+
 const iconPaths = {
   plus: 'M12 5v14M5 12h14',
   send: 'M12 19V5M6 11l6-6 6 6',
@@ -41,6 +58,10 @@ const iconPaths = {
   time: 'M12 7v5l3 2 M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18',
   source: 'M5 4h14v16H5z M8 8h8M8 12h8M8 16h5',
   chat: 'M4 5h16v12H8l-4 3z',
+  close: 'M6 6l12 12M18 6L6 18',
+  down: 'M6 9l6 6 6-6',
+  edit: 'M4 20h4L19 9l-4-4L4 16v4z M13.5 6.5l4 4',
+  menu: 'M4 7h16M4 12h16M4 17h16',
 } as const;
 
 function Icon({ name }: { name: keyof typeof iconPaths }) {
@@ -164,6 +185,7 @@ function applyEvent(projection: RunProjection, event: ProductEvent): RunProjecti
     const errorCode = event.data.error_code;
     return {
       ...next,
+      ...(terminalStatus === 'failed' ? { assistantText: '' } : {}),
       connection: 'closed',
       cancelling: false,
       ...(isRunFailureCode(errorCode) ? { failureCode: errorCode } : {}),
@@ -203,6 +225,109 @@ function projectionsFromSnapshot(snapshot: ThreadSnapshot): ProjectionMap {
   return projections;
 }
 
+function mergeProjectionMapsMonotonic(
+  current: ProjectionMap,
+  incoming: ProjectionMap,
+): ProjectionMap {
+  const next = { ...current };
+  for (const [runId, candidate] of Object.entries(incoming)) {
+    const existing = current[runId];
+    if (!existing) {
+      next[runId] = candidate;
+      continue;
+    }
+    if (candidate.lastSeq < existing.lastSeq) continue;
+    if (candidate.lastSeq === existing.lastSeq) {
+      next[runId] = {
+        ...existing,
+        assistantText: existing.assistantText || candidate.assistantText,
+        tools: existing.tools.length >= candidate.tools.length ? existing.tools : candidate.tools,
+        sources:
+          existing.sources.length >= candidate.sources.length
+            ? existing.sources
+            : candidate.sources,
+        ...(isTerminalStatus(candidate.run.status)
+          ? { run: candidate.run, connection: 'closed' as const, cancelling: false }
+          : {}),
+      };
+      continue;
+    }
+    next[runId] = {
+      ...candidate,
+      connection: isTerminalStatus(candidate.run.status) ? 'closed' : existing.connection,
+      cancelling: existing.cancelling,
+    };
+  }
+  return next;
+}
+
+function messagesMatch(left: Message, right: Message) {
+  if (left.message_id === right.message_id) return true;
+  if (left.role !== right.role) return false;
+  if (left.run_id && right.run_id) return left.run_id === right.run_id;
+  return left.role === 'user' && left.content === right.content;
+}
+
+function mergeThreadSnapshotMonotonic(
+  current: ThreadSnapshot | null,
+  incoming: ThreadSnapshot,
+  pending?: Message,
+) {
+  const base = pending ? mergeOptimisticMessage(incoming, pending) : incoming;
+  if (!current || current.thread_id !== incoming.thread_id) return base;
+
+  const messages = [...base.messages];
+  for (const message of current.messages) {
+    if (!messages.some((candidate) => messagesMatch(candidate, message))) messages.push(message);
+  }
+
+  const runs = [...base.runs];
+  for (const run of current.runs) {
+    const index = runs.findIndex((candidate) => candidate.run_id === run.run_id);
+    if (index < 0) runs.push(run);
+    else if ((runs[index]?.last_seq ?? 0) < run.last_seq) runs[index] = run;
+  }
+
+  let activeRun = base.active_run;
+  if (activeRun) {
+    const currentRun = current.runs.find((candidate) => candidate.run_id === activeRun?.run_id);
+    if (
+      currentRun &&
+      isTerminalStatus(currentRun.status) &&
+      currentRun.last_seq >= activeRun.last_seq
+    ) {
+      activeRun = null;
+    }
+  }
+  if (current.active_run && current.active_run.run_id !== activeRun?.run_id) {
+    const mergedCurrentRun = runs.find(
+      (candidate) => candidate.run_id === current.active_run?.run_id,
+    );
+    const currentCreatedAt = Date.parse(current.active_run.created_at);
+    const incomingCreatedAt = activeRun ? Date.parse(activeRun.created_at) : Number.NaN;
+    const currentIsNoOlder =
+      !activeRun ||
+      !Number.isFinite(currentCreatedAt) ||
+      !Number.isFinite(incomingCreatedAt) ||
+      currentCreatedAt >= incomingCreatedAt;
+    if (
+      mergedCurrentRun &&
+      !isTerminalStatus(mergedCurrentRun.status) &&
+      currentIsNoOlder
+    ) {
+      activeRun = current.active_run;
+    }
+  }
+  if (!activeRun && current.active_run) {
+    const incomingRun = base.runs.find(
+      (candidate) => candidate.run_id === current.active_run?.run_id,
+    );
+    if (!incomingRun || !isTerminalStatus(incomingRun.status)) activeRun = current.active_run;
+  }
+
+  return { ...base, messages, runs, active_run: activeRun };
+}
+
 function titleFromMessage(message: string) {
   const collapsed = message.replace(/\s+/g, ' ').trim();
   return collapsed.length > 28 ? `${collapsed.slice(0, 28)}…` : collapsed || EMPTY_TITLE;
@@ -229,12 +354,21 @@ function mergeOptimisticMessage(snapshot: ThreadSnapshot, pending: Message) {
 
 function displayError(error: unknown) {
   if (error instanceof ApiError) return error.message;
-  return '无法连接服务，请确认后端已经启动。';
+  return '暂时无法连接，请稍后重试。';
 }
 
 function isAccessError(error: unknown): error is ApiError {
   return error instanceof ApiError && (error.status === 401 || error.status === 403);
 }
+
+type InitialAttempt = {
+  threadId: string;
+  idempotencyKey: string;
+  message: string;
+};
+
+const FOLLOW_BOTTOM_THRESHOLD = 80;
+const STREAM_RENDER_BATCH_MS = 60;
 
 export function App() {
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
@@ -243,13 +377,22 @@ export function App() {
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [admittingInitialRun, setAdmittingInitialRun] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [accessBlocked, setAccessBlocked] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [renaming, setRenaming] = useState(false);
+  const [renameInput, setRenameInput] = useState('');
+  const [renameSaving, setRenameSaving] = useState(false);
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const selectedThreadRef = useRef<string | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
   const submittingRef = useRef(false);
   const accessBlockedRef = useRef(false);
-  const conversationEndRef = useRef<HTMLDivElement | null>(null);
+  const initialAttemptRef = useRef<InitialAttempt | null>(null);
+  const conversationScrollRef = useRef<HTMLDivElement | null>(null);
+  const followOutputRef = useRef(true);
+  const mobileNavButtonRef = useRef<HTMLButtonElement | null>(null);
 
   const blockAccess = useCallback((accessError: unknown) => {
     if (accessBlockedRef.current) return true;
@@ -263,8 +406,12 @@ export function App() {
     setProjectionsByRunId({});
     setInput('');
     setSubmitting(false);
+    setAdmittingInitialRun(false);
     setLoading(false);
     setAccessBlocked(true);
+    setMobileNavOpen(false);
+    setRenaming(false);
+    setRenameSaving(false);
     setError(displayError(accessError));
     return true;
   }, []);
@@ -281,8 +428,10 @@ export function App() {
     if (accessBlockedRef.current) return null;
     const fresh = await getThread(threadId);
     if (!accessBlockedRef.current && selectedThreadRef.current === threadId) {
-      setSnapshot(fresh);
-      setProjectionsByRunId(projectionsFromSnapshot(fresh));
+      setSnapshot((current) => mergeThreadSnapshotMonotonic(current, fresh));
+      setProjectionsByRunId((current) =>
+        mergeProjectionMapsMonotonic(current, projectionsFromSnapshot(fresh)),
+      );
     }
     return fresh;
   }, []);
@@ -303,10 +452,77 @@ export function App() {
         [run.run_id]: startingProjection,
       }));
 
+      let pendingEvents: ProductEvent[] = [];
+      let renderTimer: number | null = null;
+
       const isCurrentStream = () =>
         !controller.signal.aborted &&
         streamAbortRef.current === controller &&
         selectedThreadRef.current === run.thread_id;
+
+      const flushPendingEvents = () => {
+        if (renderTimer !== null) {
+          window.clearTimeout(renderTimer);
+          renderTimer = null;
+        }
+        if (!isCurrentStream() || pendingEvents.length === 0) {
+          pendingEvents = [];
+          return;
+        }
+        const batch = pendingEvents;
+        pendingEvents = [];
+        setProjectionsByRunId((current) => {
+          const projection = current[run.run_id];
+          return projection
+            ? {
+                ...current,
+                [run.run_id]: batch.reduce(applyEvent, projection),
+              }
+            : current;
+        });
+
+        const completedMessages = batch.flatMap((event) => {
+          if (
+            event.run_id !== run.run_id ||
+            event.thread_id !== run.thread_id ||
+            event.type !== 'message.completed'
+          ) {
+            return [];
+          }
+          const message = event.data.message;
+          if (typeof message !== 'object' || message === null) return [];
+          const completedMessage = message as Message;
+          return typeof completedMessage.message_id === 'string' &&
+            typeof completedMessage.content === 'string' &&
+            completedMessage.role === 'assistant'
+            ? [completedMessage]
+            : [];
+        });
+        if (completedMessages.length > 0) {
+          setSnapshot((current) => {
+            if (!current || current.thread_id !== run.thread_id) return current;
+            const messages = [...current.messages];
+            for (const completedMessage of completedMessages) {
+              const index = messages.findIndex(
+                (item) => item.message_id === completedMessage.message_id,
+              );
+              if (index >= 0) messages[index] = completedMessage;
+              else messages.push(completedMessage);
+            }
+            return { ...current, messages };
+          });
+        }
+      };
+
+      controller.signal.addEventListener(
+        'abort',
+        () => {
+          if (renderTimer !== null) window.clearTimeout(renderTimer);
+          renderTimer = null;
+          pendingEvents = [];
+        },
+        { once: true },
+      );
 
       void (async () => {
         try {
@@ -325,36 +541,16 @@ export function App() {
               },
               onEvent: (event) => {
                 if (!isCurrentStream()) return;
-                setProjectionsByRunId((current) => {
-                  const projection = current[run.run_id];
-                  return projection
-                    ? { ...current, [run.run_id]: applyEvent(projection, event) }
-                    : current;
-                });
-                if (event.type === 'message.completed') {
-                  const message = event.data.message;
-                  if (typeof message === 'object' && message !== null) {
-                    const completedMessage = message as Message;
-                    if (
-                      typeof completedMessage.message_id === 'string' &&
-                      typeof completedMessage.content === 'string' &&
-                      completedMessage.role === 'assistant'
-                    ) {
-                      setSnapshot((current) => {
-                        if (!current || current.thread_id !== event.thread_id) return current;
-                        const messages = current.messages.some(
-                          (item) => item.message_id === completedMessage.message_id,
-                        )
-                          ? current.messages.map((item) =>
-                              item.message_id === completedMessage.message_id
-                                ? completedMessage
-                                : item,
-                            )
-                          : [...current.messages, completedMessage];
-                        return { ...current, messages };
-                      });
-                    }
-                  }
+                if (event.run_id !== run.run_id || event.thread_id !== run.thread_id) return;
+                pendingEvents.push(event);
+                if (
+                  event.type === 'run.completed' ||
+                  event.type === 'run.failed' ||
+                  event.type === 'run.cancelled'
+                ) {
+                  flushPendingEvents();
+                } else if (renderTimer === null) {
+                  renderTimer = window.setTimeout(flushPendingEvents, STREAM_RENDER_BATCH_MS);
                 }
               },
             },
@@ -362,6 +558,7 @@ export function App() {
           );
         } catch (streamError) {
           if (!isCurrentStream()) return;
+          flushPendingEvents();
           if (blockAccess(streamError)) return;
           setProjectionsByRunId((current) => {
             const projection = current[run.run_id];
@@ -373,6 +570,7 @@ export function App() {
         }
 
         if (!isCurrentStream()) return;
+        flushPendingEvents();
         try {
           await Promise.all([refreshSnapshot(run.thread_id), refreshThreads()]);
           if (isCurrentStream()) setError(null);
@@ -388,10 +586,17 @@ export function App() {
   );
 
   const openThread = useCallback(
-    async (threadId: string) => {
+    async (threadId: string, historyMode: HistoryMode = 'push') => {
       if (accessBlockedRef.current) return;
+      if (historyMode !== 'none' && window.location.pathname !== threadPath(threadId)) {
+        writeThreadRoute(threadId, historyMode);
+      }
       streamAbortRef.current?.abort();
       selectedThreadRef.current = threadId;
+      followOutputRef.current = true;
+      setShowJumpToLatest(false);
+      setMobileNavOpen(false);
+      setRenaming(false);
       setLoading(true);
       setError(null);
       setSnapshot(null);
@@ -410,7 +615,13 @@ export function App() {
           );
         }
       } catch (openError) {
-        if (!blockAccess(openError) && selectedThreadRef.current === threadId) {
+        if (selectedThreadRef.current !== threadId) return;
+        if (openError instanceof ApiError && (openError.status === 403 || openError.status === 404)) {
+          // One inaccessible URL is a route-level failure. Keep the caller's
+          // own thread list available; active-run authorization failures still
+          // use the global fail-closed path in connectRun.
+          setError('无法打开这个对话。你可以选择最近对话，或新建一个对话。');
+        } else if (!blockAccess(openError)) {
           setError(displayError(openError));
         }
       } finally {
@@ -420,30 +631,73 @@ export function App() {
     [blockAccess, connectRun],
   );
 
-  useEffect(() => {
-    let disposed = false;
-    void refreshThreads()
-      .then((items) => {
-        if (disposed) return;
-        if (items[0]) return openThread(items[0].thread_id);
-        setLoading(false);
-      })
-      .catch((initialError: unknown) => {
-        if (!disposed) {
-          if (!blockAccess(initialError)) {
-            setError(displayError(initialError));
-            setLoading(false);
-          }
-        }
-      });
-    return () => {
-      disposed = true;
-      streamAbortRef.current?.abort();
-    };
-  }, [blockAccess, openThread, refreshThreads]);
+  const showBlankThread = useCallback((historyMode: HistoryMode = 'push') => {
+    if (accessBlockedRef.current) return;
+    streamAbortRef.current?.abort();
+    selectedThreadRef.current = null;
+    initialAttemptRef.current = null;
+    followOutputRef.current = true;
+    if (
+      historyMode !== 'none' &&
+      (window.location.pathname !== '/' || historyMode === 'replace')
+    ) {
+      writeBlankRoute(historyMode);
+    }
+    setSnapshot(null);
+    setProjectionsByRunId({});
+    setInput('');
+    setLoading(false);
+    setError(null);
+    setMobileNavOpen(false);
+    setRenaming(false);
+    setShowJumpToLatest(false);
+  }, []);
 
   useEffect(() => {
-    conversationEndRef.current?.scrollIntoView({ block: 'end', behavior: 'smooth' });
+    let disposed = false;
+
+    const applyLocation = () => {
+      if (disposed || accessBlockedRef.current) return;
+      const route = parseThreadRoute();
+      if (route.kind === 'thread') {
+        void openThread(route.threadId, 'none');
+        return;
+      }
+      if (route.kind === 'blank') {
+        showBlankThread('none');
+        return;
+      }
+
+      streamAbortRef.current?.abort();
+      selectedThreadRef.current = null;
+      setSnapshot(null);
+      setProjectionsByRunId({});
+      setLoading(false);
+      setError('这个对话链接无效。请从最近对话进入，或新建一个对话。');
+    };
+
+    const handlePopState = () => applyLocation();
+    window.addEventListener('popstate', handlePopState);
+    void refreshThreads()
+      .then(() => applyLocation())
+      .catch((initialError: unknown) => {
+        if (!disposed && !blockAccess(initialError)) {
+          setError(displayError(initialError));
+          setLoading(false);
+        }
+      });
+
+    return () => {
+      disposed = true;
+      window.removeEventListener('popstate', handlePopState);
+      streamAbortRef.current?.abort();
+    };
+  }, [blockAccess, openThread, refreshThreads, showBlankThread]);
+
+  useLayoutEffect(() => {
+    if (!followOutputRef.current) return;
+    const scrollContainer = conversationScrollRef.current;
+    scrollContainer?.scrollTo({ top: scrollContainer.scrollHeight, behavior: 'auto' });
   }, [
     projectionsByRunId,
     snapshot?.active_run?.run_id,
@@ -451,24 +705,27 @@ export function App() {
     snapshot?.thread_id,
   ]);
 
-  const startNewThread = useCallback(async () => {
+  const handleConversationScroll = useCallback(() => {
+    const scrollContainer = conversationScrollRef.current;
+    if (!scrollContainer) return;
+    const distanceFromBottom =
+      scrollContainer.scrollHeight - scrollContainer.scrollTop - scrollContainer.clientHeight;
+    const shouldFollow = distanceFromBottom <= FOLLOW_BOTTOM_THRESHOLD;
+    followOutputRef.current = shouldFollow;
+    setShowJumpToLatest(!shouldFollow);
+  }, []);
+
+  const scrollToLatest = useCallback((behavior: ScrollBehavior = 'smooth') => {
+    followOutputRef.current = true;
+    setShowJumpToLatest(false);
+    const scrollContainer = conversationScrollRef.current;
+    scrollContainer?.scrollTo({ top: scrollContainer.scrollHeight, behavior });
+  }, []);
+
+  const startNewThread = useCallback(() => {
     if (submittingRef.current || accessBlockedRef.current) return;
-    streamAbortRef.current?.abort();
-    setError(null);
-    setLoading(true);
-    try {
-      const created = await createThread();
-      if (accessBlockedRef.current) return;
-      selectedThreadRef.current = created.thread_id;
-      setSnapshot(created);
-      setProjectionsByRunId(projectionsFromSnapshot(created));
-      await refreshThreads();
-    } catch (newThreadError) {
-      if (!blockAccess(newThreadError)) setError(displayError(newThreadError));
-    } finally {
-      setLoading(false);
-    }
-  }, [blockAccess, refreshThreads]);
+    showBlankThread(window.location.pathname === '/' ? 'none' : 'push');
+  }, [showBlankThread]);
 
   const activeProjection = useMemo(() => {
     const activeRunId = snapshot?.active_run?.run_id;
@@ -498,25 +755,82 @@ export function App() {
     setError(null);
     const idempotencyKey = crypto.randomUUID();
     const pending = optimisticMessage(message, idempotencyKey);
-    let target = snapshot;
+    let targetThreadId = snapshot?.thread_id ?? null;
+    const isInitialRun = targetThreadId === null;
+    if (isInitialRun) setAdmittingInitialRun(true);
 
     try {
-      if (!target) {
-        target = await createThread(titleFromMessage(message));
+      let run: RunView;
+      let persistedPending: Message;
+
+      if (isInitialRun) {
+        const reusable = initialAttemptRef.current;
+        const attempt =
+          reusable?.message === message
+            ? reusable
+            : {
+                threadId: crypto.randomUUID(),
+                idempotencyKey,
+                message,
+              };
+        initialAttemptRef.current = attempt;
+        targetThreadId = attempt.threadId;
+        const now = new Date().toISOString();
+        selectedThreadRef.current = targetThreadId;
+        setSnapshot({
+          thread_id: targetThreadId,
+          title: titleFromMessage(message),
+          created_at: now,
+          updated_at: now,
+          messages: [pending],
+          runs: [],
+          active_run: null,
+        });
+        setProjectionsByRunId({});
+
+        const created = await createInitialRun(
+          attempt.threadId,
+          message,
+          attempt.idempotencyKey,
+        );
         if (accessBlockedRef.current) return;
-        selectedThreadRef.current = target.thread_id;
-        setSnapshot(target);
-        setProjectionsByRunId(projectionsFromSnapshot(target));
+        if (
+          created.thread.thread_id !== attempt.threadId ||
+          created.run.thread_id !== attempt.threadId
+        ) {
+          throw new Error('Initial run response does not match the requested thread');
+        }
+        initialAttemptRef.current = null;
+        run = created.run;
+        persistedPending = { ...pending, run_id: run.run_id };
+        if (selectedThreadRef.current !== attempt.threadId) {
+          void refreshThreads().catch((refreshError: unknown) => {
+            blockAccess(refreshError);
+          });
+          return;
+        }
+        writeThreadRoute(created.thread.thread_id, 'replace');
+        setSnapshot({
+          ...created.thread,
+          messages: [persistedPending],
+          runs: [{ ...run, events: [] }],
+          active_run: run,
+        });
+      } else {
+        const threadId = targetThreadId;
+        if (!threadId) throw new Error('Existing run requires a thread');
+        setSnapshot((current) =>
+          current?.thread_id === threadId
+            ? { ...current, messages: [...current.messages, pending] }
+            : current,
+        );
+        run = await createRun(threadId, message, idempotencyKey);
+        if (accessBlockedRef.current) return;
+        persistedPending = { ...pending, run_id: run.run_id };
       }
-      const threadId = target.thread_id;
-      setSnapshot((current) =>
-        current?.thread_id === threadId
-          ? { ...current, messages: [...current.messages, pending] }
-          : current,
-      );
-      const run = await createRun(threadId, message, idempotencyKey);
-      if (accessBlockedRef.current) return;
-      const persistedPending = { ...pending, run_id: run.run_id };
+
+      const threadId = targetThreadId;
+      if (!threadId) throw new Error('Run response is missing a thread');
       const initialProjection = createProjection(run);
       if (selectedThreadRef.current === threadId) {
         setSnapshot((current) => {
@@ -538,43 +852,57 @@ export function App() {
         }));
       }
 
-      let projectionToConnect = initialProjection;
-      let shouldConnect = !isTerminalStatus(run.status);
-      try {
-        const fresh = await getThread(threadId);
-        if (selectedThreadRef.current === threadId) {
-          const merged = mergeOptimisticMessage(fresh, persistedPending);
-          const projections = projectionsFromSnapshot(merged);
-          setSnapshot(merged);
-          setProjectionsByRunId(projections);
-          projectionToConnect = projections[run.run_id] ?? initialProjection;
-          shouldConnect =
-            fresh.active_run?.run_id === run.run_id &&
-            !isTerminalStatus(projectionToConnect.run.status);
-        }
-      } catch (snapshotError) {
-        if (blockAccess(snapshotError)) return;
-        // The optimistic user message remains visible while the event stream proceeds.
+      if (selectedThreadRef.current === threadId && !isTerminalStatus(run.status)) {
+        connectRun(run, initialProjection);
       }
-      if (selectedThreadRef.current === threadId && shouldConnect) {
-        connectRun(run, projectionToConnect);
-      }
+      void getThread(threadId)
+        .then((fresh) => {
+          if (accessBlockedRef.current || selectedThreadRef.current !== threadId) return;
+          const projections = projectionsFromSnapshot(fresh);
+          setSnapshot((current) =>
+            mergeThreadSnapshotMonotonic(current, fresh, persistedPending),
+          );
+          setProjectionsByRunId((current) =>
+            mergeProjectionMapsMonotonic(current, projections),
+          );
+        })
+        .catch((snapshotError: unknown) => {
+          blockAccess(snapshotError);
+          // The optimistic message and live event stream remain authoritative
+          // while a background snapshot is temporarily unavailable.
+        });
       void refreshThreads().catch((refreshError: unknown) => {
         if (blockAccess(refreshError)) return;
         if (selectedThreadRef.current === threadId) setError(displayError(refreshError));
       });
     } catch (submitError) {
       if (blockAccess(submitError)) return;
-      if (restoreComposerOnFailure) setInput(message);
+      const stillSelected = selectedThreadRef.current === targetThreadId;
+      if (isInitialRun && submitError instanceof ApiError && submitError.status < 500) {
+        initialAttemptRef.current = null;
+      }
+      if (restoreComposerOnFailure && stillSelected) setInput(message);
       setSnapshot((current) =>
-        current
-          ? { ...current, messages: current.messages.filter((item) => item.message_id !== pending.message_id) }
+        current?.thread_id === targetThreadId
+          ? isInitialRun
+            ? null
+            : {
+                ...current,
+                messages: current.messages.filter(
+                  (item) => item.message_id !== pending.message_id,
+                ),
+              }
           : current,
       );
-      setError(displayError(submitError));
+      if (isInitialRun && stillSelected) {
+        selectedThreadRef.current = null;
+        setProjectionsByRunId({});
+      }
+      if (stillSelected) setError(displayError(submitError));
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
+      if (isInitialRun) setAdmittingInitialRun(false);
     }
   }, [activeProjection, blockAccess, connectRun, refreshThreads, snapshot]);
 
@@ -591,7 +919,7 @@ export function App() {
         (message) => message.role === 'user' && message.run_id === runId,
       );
       if (!original) {
-        setError('无法找到这次运行的原始问题。');
+        setError('无法重试这条消息，请重新发送问题。');
         return;
       }
       await startMessage(original.content, false);
@@ -660,6 +988,51 @@ export function App() {
     }
   }, [activeProjection, blockAccess, refreshSnapshot, refreshThreads]);
 
+  const beginRename = useCallback(() => {
+    if (!snapshot || accessBlockedRef.current) return;
+    setRenameInput(snapshot.title);
+    setRenaming(true);
+    setError(null);
+  }, [snapshot]);
+
+  const saveRename = useCallback(
+    async (event: FormEvent) => {
+      event.preventDefault();
+      if (!snapshot || renameSaving || accessBlockedRef.current) return;
+      const title = renameInput.trim();
+      if (!title) {
+        setError('对话标题不能为空。');
+        return;
+      }
+      if (title.length > 200) {
+        setError('对话标题不能超过 200 个字符。');
+        return;
+      }
+
+      const threadId = snapshot.thread_id;
+      setRenameSaving(true);
+      setError(null);
+      try {
+        const updated = await updateThread(threadId, title);
+        if (selectedThreadRef.current !== threadId || accessBlockedRef.current) return;
+        setSnapshot((current) =>
+          current?.thread_id === threadId ? { ...current, ...updated } : current,
+        );
+        setThreads((current) =>
+          current.map((thread) => (thread.thread_id === threadId ? updated : thread)),
+        );
+        setRenaming(false);
+      } catch (renameError) {
+        if (!blockAccess(renameError) && selectedThreadRef.current === threadId) {
+          setError(displayError(renameError));
+        }
+      } finally {
+        setRenameSaving(false);
+      }
+    },
+    [blockAccess, renameInput, renameSaving, snapshot],
+  );
+
   const handleSubmit = (event: FormEvent) => {
     event.preventDefault();
     void submitMessage();
@@ -689,95 +1062,137 @@ export function App() {
       <Sidebar
         threads={threads}
         activeThreadId={snapshot?.thread_id ?? null}
-        disabled={accessBlocked}
+        disabled={accessBlocked || admittingInitialRun}
         onOpenThread={(threadId) => void openThread(threadId)}
-        onNewThread={() => void startNewThread()}
+        onNewThread={startNewThread}
       />
 
       <main className="chat-main">
         <header className="topbar">
-          <div>
-            <strong>{snapshot?.title || 'Work Assistant'}</strong>
-            <span>对话、工具与来源</span>
-          </div>
-          <div className="mobile-actions">
-            <label className="sr-only" htmlFor="mobile-thread-select">
-              选择历史会话
-            </label>
-            <select
-              id="mobile-thread-select"
-              value={snapshot?.thread_id ?? ''}
-              onChange={(event) => event.target.value && void openThread(event.target.value)}
-              disabled={accessBlocked}
-            >
-              <option value="">历史会话</option>
-              {threads.map((thread) => (
-                <option key={thread.thread_id} value={thread.thread_id}>
-                  {thread.title}
-                </option>
-              ))}
-            </select>
-            <button
-              className="mobile-new"
-              type="button"
-              onClick={() => void startNewThread()}
-              disabled={accessBlocked}
-            >
-              <Icon name="plus" />
-              <span className="sr-only">新建对话</span>
-            </button>
+          <button
+            ref={mobileNavButtonRef}
+            className="mobile-menu-button"
+            type="button"
+            aria-label="打开对话导航"
+            aria-expanded={mobileNavOpen}
+            aria-controls="mobile-conversation-drawer"
+            onClick={() => setMobileNavOpen(true)}
+            disabled={accessBlocked}
+          >
+            <Icon name="menu" />
+          </button>
+          <div className="topbar-title">
+            {renaming && snapshot ? (
+              <form className="rename-form" onSubmit={(event) => void saveRename(event)}>
+                <label className="sr-only" htmlFor="thread-title-input">
+                  对话标题
+                </label>
+                <input
+                  id="thread-title-input"
+                  value={renameInput}
+                  maxLength={200}
+                  autoFocus
+                  disabled={renameSaving}
+                  onChange={(event) => setRenameInput(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === 'Escape') setRenaming(false);
+                  }}
+                />
+                <button type="submit" disabled={renameSaving || !renameInput.trim()}>
+                  保存
+                </button>
+                <button type="button" onClick={() => setRenaming(false)} disabled={renameSaving}>
+                  取消
+                </button>
+              </form>
+            ) : (
+              <div className="title-row">
+                <strong>{snapshot?.title || '新对话'}</strong>
+                {snapshot ? (
+                  <button type="button" aria-label="重命名当前对话" onClick={beginRename}>
+                    <Icon name="edit" />
+                  </button>
+                ) : null}
+              </div>
+            )}
           </div>
         </header>
 
-        <section className="conversation" aria-live="polite" aria-busy={active}>
-          {loading && !snapshot ? <LoadingState /> : null}
-          {!loading &&
-          !error &&
-          displayedMessages.length === 0 &&
-          Object.keys(projectionsByRunId).length === 0 ? (
-            <EmptyState />
+        <div className="conversation-region">
+          <div
+            className="conversation-scroll"
+            ref={conversationScrollRef}
+            onScroll={handleConversationScroll}
+          >
+            <section
+              className="conversation"
+              aria-label="对话内容"
+              aria-live="polite"
+              aria-busy={active}
+            >
+              {loading && !snapshot ? <LoadingState /> : null}
+              {!loading &&
+              !error &&
+              displayedMessages.length === 0 &&
+              Object.keys(projectionsByRunId).length === 0 ? (
+                <EmptyState />
+              ) : null}
+
+              {displayedMessages.map((message) => {
+                if (
+                  message.role === 'assistant' &&
+                  message.run_id &&
+                  projectionsByRunId[message.run_id]
+                ) {
+                  return null;
+                }
+                if (message.role === 'user' && message.run_id) {
+                  const projection = projectionsByRunId[message.run_id];
+                  return (
+                    <Fragment key={message.message_id}>
+                      <MessageTurn message={message} />
+                      {projection ? (
+                        <AssistantTurn
+                          projection={projection}
+                          retryDisabled={active || submitting || accessBlocked}
+                          onRetry={() => void retryRun(projection.run.run_id)}
+                        />
+                      ) : null}
+                    </Fragment>
+                  );
+                }
+                return <MessageTurn key={message.message_id} message={message} />;
+              })}
+
+              {Object.values(projectionsByRunId)
+                .filter((projection) => !displayedRunIds.has(projection.run.run_id))
+                .map((projection) => (
+                  <AssistantTurn
+                    key={projection.run.run_id}
+                    projection={projection}
+                    retryDisabled={active || submitting || accessBlocked}
+                    onRetry={() => void retryRun(projection.run.run_id)}
+                  />
+                ))}
+
+              {error ? (
+                <div className="page-error" role="alert">
+                  {error}
+                </div>
+              ) : null}
+            </section>
+          </div>
+          {showJumpToLatest ? (
+            <button
+              className="jump-to-latest"
+              type="button"
+              onClick={() => scrollToLatest()}
+            >
+              <Icon name="down" />
+              回到最新
+            </button>
           ) : null}
-
-          {displayedMessages.map((message) => {
-            if (message.role === 'assistant' && message.run_id && projectionsByRunId[message.run_id]) {
-              return null;
-            }
-            if (message.role === 'user' && message.run_id) {
-              const projection = projectionsByRunId[message.run_id];
-              return (
-                <Fragment key={message.message_id}>
-                  <MessageTurn message={message} />
-                  {projection ? (
-                    <AssistantTurn
-                      projection={projection}
-                      retryDisabled={active || submitting || accessBlocked}
-                      onRetry={() => void retryRun(projection.run.run_id)}
-                    />
-                  ) : null}
-                </Fragment>
-              );
-            }
-            return <MessageTurn key={message.message_id} message={message} />;
-          })}
-
-          {Object.values(projectionsByRunId)
-            .filter((projection) => !displayedRunIds.has(projection.run.run_id))
-            .map((projection) => (
-              <AssistantTurn
-                key={projection.run.run_id}
-                projection={projection}
-                retryDisabled={active || submitting || accessBlocked}
-                onRetry={() => void retryRun(projection.run.run_id)}
-              />
-            ))}
-
-          {error ? (
-            <div className="page-error" role="alert">
-              {error}
-            </div>
-          ) : null}
-          <div className="conversation-end" ref={conversationEndRef} />
-        </section>
+        </div>
 
         <Composer
           value={input}
@@ -790,11 +1205,23 @@ export function App() {
           onStop={() => void stopRun()}
         />
       </main>
+
+      {mobileNavOpen ? (
+        <MobileDrawer
+          triggerRef={mobileNavButtonRef}
+          threads={threads}
+          activeThreadId={snapshot?.thread_id ?? null}
+          disabled={accessBlocked || admittingInitialRun}
+          onClose={() => setMobileNavOpen(false)}
+          onOpenThread={(threadId) => void openThread(threadId)}
+          onNewThread={startNewThread}
+        />
+      ) : null}
     </div>
   );
 }
 
-type SidebarProps = {
+type ThreadNavigationProps = {
   threads: ThreadSummary[];
   activeThreadId: string | null;
   onOpenThread: (threadId: string) => void;
@@ -802,16 +1229,15 @@ type SidebarProps = {
   disabled: boolean;
 };
 
-function Sidebar({ threads, activeThreadId, onOpenThread, onNewThread, disabled }: SidebarProps) {
+function ThreadNavigation({
+  threads,
+  activeThreadId,
+  onOpenThread,
+  onNewThread,
+  disabled,
+}: ThreadNavigationProps) {
   return (
-    <aside className="sidebar" aria-label="对话导航">
-      <div className="brand">
-        <span className="brand-mark">W</span>
-        <div>
-          <strong>Work Assistant</strong>
-          <span>Agent 对话核心</span>
-        </div>
-      </div>
+    <>
       <button className="new-thread" type="button" onClick={onNewThread} disabled={disabled}>
         <Icon name="plus" />
         新建对话
@@ -823,20 +1249,107 @@ function Sidebar({ threads, activeThreadId, onOpenThread, onNewThread, disabled 
         ) : (
           threads.map((thread) => (
             <button
-              className={thread.thread_id === activeThreadId ? 'history-item active' : 'history-item'}
+              className={
+                thread.thread_id === activeThreadId ? 'history-item active' : 'history-item'
+              }
               type="button"
               key={thread.thread_id}
               onClick={() => onOpenThread(thread.thread_id)}
               aria-current={thread.thread_id === activeThreadId ? 'page' : undefined}
               disabled={disabled}
             >
-              <Icon name="chat" />
               <span>{thread.title || EMPTY_TITLE}</span>
             </button>
           ))
         )}
       </div>
+    </>
+  );
+}
+
+function Sidebar(props: ThreadNavigationProps) {
+  return (
+    <aside className="sidebar" aria-label="对话导航">
+      <div className="brand">
+        <strong>工作助手</strong>
+      </div>
+      <ThreadNavigation {...props} />
     </aside>
+  );
+}
+
+type MobileDrawerProps = ThreadNavigationProps & {
+  triggerRef: RefObject<HTMLButtonElement | null>;
+  onClose: () => void;
+};
+
+function MobileDrawer({ triggerRef, onClose, ...navigationProps }: MobileDrawerProps) {
+  const drawerRef = useRef<HTMLElement | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    const trigger = triggerRef.current;
+    document.body.style.overflow = 'hidden';
+    closeButtonRef.current?.focus();
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      trigger?.focus();
+    };
+  }, [triggerRef]);
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      onClose();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+
+    const focusable = Array.from(
+      drawerRef.current?.querySelectorAll<HTMLElement>(
+        'button:not(:disabled), a[href], input:not(:disabled), [tabindex]:not([tabindex="-1"])',
+      ) ?? [],
+    );
+    const first = focusable[0];
+    const last = focusable.at(-1);
+    if (!first || !last) return;
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  };
+
+  return (
+    <div
+      className="mobile-drawer-backdrop"
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <aside
+        id="mobile-conversation-drawer"
+        ref={drawerRef}
+        className="mobile-drawer"
+        role="dialog"
+        aria-modal="true"
+        aria-label="对话导航"
+        onKeyDown={handleKeyDown}
+      >
+        <div className="mobile-drawer-heading">
+          <div className="brand compact">
+            <strong>工作助手</strong>
+          </div>
+          <button ref={closeButtonRef} type="button" aria-label="关闭对话导航" onClick={onClose}>
+            <Icon name="close" />
+          </button>
+        </div>
+        <ThreadNavigation {...navigationProps} />
+      </aside>
+    </div>
   );
 }
 
@@ -852,11 +1365,8 @@ function LoadingState() {
 function EmptyState() {
   return (
     <div className="empty-state">
-      <span className="empty-icon">
-        <Icon name="time" />
-      </span>
-      <h1>从一个真实工具开始</h1>
-      <p>例如：请查询当前上海时间，并说明结果来自哪里。</p>
+      <h1>今天想处理什么？</h1>
+      <p>可以直接提问，也可以继续最近的对话。</p>
     </div>
   );
 }
@@ -871,10 +1381,8 @@ function MessageTurn({ message }: { message: Message }) {
   }
   return (
     <article className="assistant-turn">
-      <span className="assistant-avatar">W</span>
       <div className="assistant-content">
-        <strong className="assistant-name">Work Assistant</strong>
-        <div className="answer-text">{message.content}</div>
+        <MarkdownMessage content={message.content} />
       </div>
     </article>
   );
@@ -893,10 +1401,8 @@ function AssistantTurn({
   const isWorking = !isTerminalStatus(run.status);
   return (
     <article className="assistant-turn">
-      <span className="assistant-avatar">W</span>
       <div className="assistant-content">
         <div className="assistant-heading">
-          <strong className="assistant-name">Work Assistant</strong>
           <RunStatusLabel
             status={run.status}
             connection={connection}
@@ -907,37 +1413,43 @@ function AssistantTurn({
           <ToolRun tools={tools} working={isWorking} runStatus={run.status} />
         ) : null}
         {assistantText ? (
-          <div className="answer-text">{assistantText}</div>
+          <MarkdownMessage content={assistantText} />
         ) : isWorking && connection !== 'unavailable' ? (
           <div className="thinking" role="status">
             <span />
             <span />
             <span />
-            正在处理
+            正在回答…
           </div>
         ) : null}
         {run.status === 'failed' ? (
           <div className="run-notice error run-notice-row" role="alert">
             <span>{friendlyRunError(failureCode)}</span>
             <button className="retry-button" type="button" onClick={onRetry} disabled={retryDisabled}>
-              重新运行
+              重试
             </button>
           </div>
         ) : null}
         {isWorking && connection === 'unavailable' ? (
           <div className="run-notice connection" role="status">
-            实时连接暂不可用。运行状态未被改为失败；请刷新页面重新连接。
+            连接中断，刷新页面后可继续查看。
           </div>
         ) : null}
-        {run.status === 'cancelled' ? <div className="run-notice">本次运行已停止。</div> : null}
+        {run.status === 'cancelled' ? <div className="run-notice">已停止回答。</div> : null}
         {sources.length > 0 ? (
           <div className="sources" aria-label="回答来源">
-            {sources.map((source) => (
-              <span className="source-chip" key={source.source_id} title={source.description}>
-                <Icon name="source" />
-                {source.label}
-              </span>
-            ))}
+            <strong>参考来源</strong>
+            <ol>
+              {sources.map((source, index) => (
+                <li key={source.source_id}>
+                  <span className="source-index">{index + 1}.</span>
+                  <div>
+                    <span>{publicSourceCopy[source.label] ?? source.label}</span>
+                    <small>{publicSourceCopy[source.description] ?? source.description}</small>
+                  </div>
+                </li>
+              ))}
+            </ol>
           </div>
         ) : null}
       </div>
@@ -946,17 +1458,13 @@ function AssistantTurn({
 }
 
 function friendlyRunError(failureCode: RunProjection['failureCode']) {
-  if (failureCode === 'run_timeout') return '本次运行超时，未能完成。';
-  if (failureCode === 'agent_execution_failed') return 'Agent 执行失败，未能完成本次运行。';
-  if (failureCode === 'service_restarted') return '服务已重启，原运行已安全结束。';
-  if (failureCode === 'model_step_limit') return 'Agent 已达到本次推理步数上限，运行已安全停止。';
-  if (failureCode === 'tool_call_limit') return 'Agent 已达到本次工具调用上限，运行已安全停止。';
-  if (failureCode === 'repeated_tool_call') return '检测到重复工具调用，运行已安全停止。';
-  if (failureCode === 'no_progress') return 'Agent 连续未取得新进展，运行已安全停止。';
-  if (failureCode === 'tool_not_allowed') return 'Agent 请求了未获授权的工具，运行已安全停止。';
-  if (failureCode === 'result_schema_invalid') return 'Agent 返回结果不符合约定，未保存为回答。';
-  if (failureCode === 'source_validation_failed') return '回答来源校验失败，未保存为回答。';
-  return '本次运行没有完成，请重试。';
+  if (failureCode === 'run_timeout') return '等待时间过长，这次回答没有完成。';
+  if (failureCode === 'service_restarted') return '服务刚刚恢复，请重试这条消息。';
+  if (failureCode === 'tool_not_allowed') return '当前请求暂时无法处理。';
+  if (failureCode === 'result_schema_invalid' || failureCode === 'source_validation_failed') {
+    return '这次回答没有完成，请重试。';
+  }
+  return '这次没有生成完整回答，请重试。';
 }
 
 function RunStatusLabel({
@@ -968,14 +1476,12 @@ function RunStatusLabel({
   connection: RunProjection['connection'];
   cancelling: boolean;
 }) {
-  let label = '准备中';
-  if (status === 'completed') label = '已完成';
-  else if (status === 'failed') label = '失败';
-  else if (status === 'cancelled') label = '已停止';
-  else if (cancelling) label = '正在停止';
-  else if (connection === 'reconnecting') label = '正在重新连接';
+  if (isTerminalStatus(status)) return null;
+  let label = '正在准备回答…';
+  if (cancelling) label = '正在停止…';
+  else if (connection === 'reconnecting') label = '正在恢复连接…';
   else if (connection === 'unavailable') label = '连接中断';
-  else if (status === 'running') label = '运行中';
+  else if (status === 'running') label = '正在回答…';
   return <span className={`run-status ${status}`}>{label}</span>;
 }
 
@@ -990,6 +1496,7 @@ function ToolRun({
 }) {
   const completed = tools.filter((tool) => tool.status === 'completed').length;
   const stopped = isTerminalStatus(runStatus) ? tools.length - completed : 0;
+  const activeTool = [...tools].reverse().find((tool) => tool.status !== 'completed');
   return (
     <details className="tool-run" open={working}>
       <summary>
@@ -1000,12 +1507,12 @@ function ToolRun({
         />
         <strong>
           {working
-            ? '正在调用工具'
+            ? `正在查询${activeTool ? `：${activeTool.label}` : '…'}`
             : stopped > 0
-              ? `${completed} 个完成，${stopped} 个已停止`
-              : `已完成 ${completed} 个工具步骤`}
+              ? '查询已停止'
+              : '查询记录'}
         </strong>
-        <span>查看详情</span>
+        <span>详情</span>
       </summary>
       <div className="tool-list">
         {tools.map((tool) => (
@@ -1029,10 +1536,10 @@ function ToolRun({
             </div>
             <span>
               {tool.status === 'completed'
-                ? '完成'
+                ? '已查询'
                 : isTerminalStatus(runStatus)
                   ? '已停止'
-                  : '运行中'}
+                  : '查询中'}
             </span>
           </div>
         ))}
@@ -1066,19 +1573,18 @@ function Composer({
     <div className="composer-dock">
       <form className="composer" onSubmit={onSubmit}>
         <label className="sr-only" htmlFor="message-input">
-          向 Work Assistant 提问
+          输入消息
         </label>
         <textarea
           id="message-input"
           value={value}
-          placeholder="向 Work Assistant 提问…"
-          rows={2}
+          placeholder="输入消息"
+          rows={1}
           disabled={disabled || active}
           onChange={(event) => onChange(event.target.value)}
           onKeyDown={onKeyDown}
         />
-        <div className="composer-footer">
-          <span>Enter 发送，Shift + Enter 换行</span>
+        <div className="composer-actions">
           {active ? (
             <button
               className="stop-button"
@@ -1101,7 +1607,6 @@ function Composer({
           )}
         </div>
       </form>
-      <p>工具结果和重要信息应通过来源继续核对。</p>
     </div>
   );
 }

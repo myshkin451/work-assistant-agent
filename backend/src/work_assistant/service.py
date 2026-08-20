@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Protocol
+
+from openai import APIConnectionError
 
 from .agent_runtime import AgentResult, AgentRunner, ProductEvent, RuntimeFatalError
 from .execution_policy import (
@@ -17,12 +20,23 @@ from .identity import Principal
 from .repository import ProductRepository
 from .schemas import (
     EventEnvelope,
+    InitialRunResponse,
     ProductEventValidationError,
     RuntimeEventType,
     RunView,
     validate_runtime_event,
 )
 from .settings import Settings
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_exception_log_fields(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, APIConnectionError):
+        return "provider_connection", "APIConnectionError"
+    if isinstance(exc, RuntimeError):
+        return "runtime_error", "RuntimeError"
+    return "unexpected", "UnclassifiedError"
 
 
 class RepositoryCleanupTimeout(RuntimeError):
@@ -86,16 +100,6 @@ async def _finish_repository_call[T](
             await asyncio.wait({operation}, timeout=remaining)
         except asyncio.CancelledError:
             parent_cancelled = True
-
-
-def _result_delta_events(text: str) -> list[tuple[RuntimeEventType, dict[str, Any]]]:
-    """Encode one validated answer as public payload-sized delta events."""
-
-    chunk_size = 8_000
-    return [
-        ("message.delta", {"delta": text[offset : offset + chunk_size]})
-        for offset in range(0, len(text), chunk_size)
-    ]
 
 
 class DisconnectAware(Protocol):
@@ -198,6 +202,39 @@ class RunService:
             if created:
                 self._launch(view.run_id, execution)
             return view
+
+        try:
+            return await self._repository_call(
+                admit_and_launch,
+                deadline_at=execution.deadline_at,
+            )
+        except TimeoutError as exc:
+            raise RunAdmissionTimeout("run_admission_timeout") from exc
+
+    async def create_initial_run(
+        self,
+        *,
+        principal: Principal,
+        thread_id: str,
+        message: str,
+        idempotency_key: str,
+    ) -> InitialRunResponse:
+        self._require_healthy()
+        execution = self._policy_kernel.prepare_run(principal=principal)
+
+        async def admit_and_launch() -> InitialRunResponse:
+            thread, view, created = await self.repository.create_initial_run(
+                principal=principal,
+                thread_id=thread_id,
+                message=message,
+                idempotency_key=idempotency_key,
+                execution_plan=execution.plan_evidence,
+            )
+            # Match ordinary Run admission: a committed new Run cannot yield
+            # ownership before its in-process worker has been registered.
+            if created:
+                self._launch(view.run_id, execution)
+            return InitialRunResponse(thread=thread, run=view)
 
         try:
             return await self._repository_call(
@@ -396,18 +433,11 @@ class RunService:
                         result = item
                 if result is None:
                     raise AgentExecutionFailed("agent_result_missing")
-                runtime_text = "".join(runtime_text_parts) if runtime_text_parts else None
+                runtime_text = "".join(runtime_text_parts)
                 validated_result = execution.validate_result(
                     result,
                     runtime_text=runtime_text,
                 )
-                if not runtime_text_parts:
-                    for event_type, data in _result_delta_events(validated_result.text):
-                        event = ProductEvent(event_type, data)
-                        execution.validate_runtime_event(event)
-                        persisted = await persist_controlled_event(event, event_type, data)
-                        if persisted is None:
-                            return
             outcome = execution.outcome(
                 status="completed",
                 stop_reason="completed",
@@ -464,8 +494,17 @@ class RunService:
                     execution_outcome=outcome,
                 ),
             )
-        except Exception:
+        except Exception as exc:
             # Provider responses and exception text are intentionally not persisted.
+            error_category, exception_type = _safe_exception_log_fields(exc)
+            logger.warning(
+                "run_execution_failed",
+                extra={
+                    "run_id": run_id,
+                    "error_category": error_category,
+                    "exception_type": exception_type,
+                },
+            )
             outcome = execution.outcome(
                 status="failed",
                 stop_reason="agent_execution_failed",

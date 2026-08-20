@@ -1,5 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
-import { parseProductEvent, readSseEvents, streamRunEvents } from './api';
+import {
+  createInitialRun,
+  parseProductEvent,
+  readSseEvents,
+  streamRunEvents,
+  updateThread,
+} from './api';
 import type { ProductEvent } from './types';
 
 function event(seq: number, type: ProductEvent['type'], data: Record<string, unknown> = {}) {
@@ -114,6 +120,70 @@ describe('product event boundary', () => {
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/runs/run-1/events?after_seq=3',
       expect.objectContaining({ credentials: 'include' }),
+    );
+  });
+});
+
+describe('thread workspace API boundary', () => {
+  it('sends only the frozen initial-run fields and receives summary plus run', async () => {
+    const thread = {
+      thread_id: '11111111-1111-4111-8111-111111111111',
+      title: '首问',
+      created_at: '2026-08-20T12:00:00Z',
+      updated_at: '2026-08-20T12:00:00Z',
+    };
+    const run = {
+      run_id: 'run-1',
+      thread_id: thread.thread_id,
+      status: 'running',
+      last_seq: 0,
+      created_at: thread.created_at,
+      completed_at: null,
+    };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify({ thread, run }), {
+        status: 201,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(createInitialRun(thread.thread_id, '第一问', 'stable-key')).resolves.toEqual({
+      thread,
+      run,
+    });
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/threads/${thread.thread_id}/initial-run`,
+      expect.objectContaining({
+        method: 'POST',
+        credentials: 'include',
+        body: JSON.stringify({ message: '第一问', idempotency_key: 'stable-key' }),
+      }),
+    );
+  });
+
+  it('patches only the normalized title field', async () => {
+    const updated = {
+      thread_id: 'thread/with space',
+      title: '新标题',
+      created_at: '2026-08-20T12:00:00Z',
+      updated_at: '2026-08-20T12:01:00Z',
+    };
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(JSON.stringify(updated), {
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    );
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(updateThread(updated.thread_id, updated.title)).resolves.toEqual(updated);
+    expect(fetchMock).toHaveBeenCalledWith(
+      '/api/threads/thread%2Fwith%20space',
+      expect.objectContaining({
+        method: 'PATCH',
+        credentials: 'include',
+        body: JSON.stringify({ title: updated.title }),
+      }),
     );
   });
 });

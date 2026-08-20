@@ -1,4 +1,4 @@
-# Product API and event contract v0.4
+# Product API and event contract v0.5
 
 The frontend uses the product contract below. It does not consume raw model,
 LangChain, LangGraph, or provider events.
@@ -10,8 +10,10 @@ ownership rules in
 ## Endpoints
 
 - `POST /api/threads`
+- `POST /api/threads/{client_thread_id}/initial-run`
 - `GET /api/threads`
 - `GET /api/threads/{thread_id}`
+- `PATCH /api/threads/{thread_id}`
 - `POST /api/threads/{thread_id}/runs`
 - `GET /api/runs/{run_id}/events?after_seq={last_seen_seq}`
 - `POST /api/runs/{run_id}/cancel`
@@ -47,6 +49,11 @@ type RunView = {
   last_seq: number;
   created_at: string;
   completed_at: string | null;
+};
+
+type InitialRunResponse = {
+  thread: ThreadSummary;
+  run: RunView;
 };
 
 type ProductEventType =
@@ -91,16 +98,27 @@ rebuilt from its snapshot events and then streamed from its last accepted
 Request and response bodies:
 
 - `POST /api/threads` accepts `{ "title"?: string }` and returns `ThreadSnapshot`.
+  It remains a compatibility endpoint; the conversation workspace does not call
+  it for an empty local draft.
+- `POST /api/threads/{client_thread_id}/initial-run` accepts
+  `{ "message": string, "idempotency_key": string }` and returns
+  `InitialRunResponse`. `client_thread_id` must parse as a UUID and the Host
+  canonicalizes it before persistence. The Host atomically creates the Thread,
+  first Run, and user Message, derives a bounded title from the normalized first
+  question, and then launches that Run.
 - `GET /api/threads` returns `{ "items": ThreadSummary[] }`, newest first.
 - `GET /api/threads/{thread_id}` returns `ThreadSnapshot`.
+- `PATCH /api/threads/{thread_id}` accepts `{ "title": string }` and returns
+  `ThreadSummary`. The title is a non-empty, single-line value of at most 200
+  characters after deterministic whitespace normalization.
 - `POST /api/threads/{thread_id}/runs` accepts
   `{ "message": string, "idempotency_key": string }` and returns `RunView`.
 - `POST /api/runs/{run_id}/cancel` returns the current `RunView` after recording
   the cancellation request or terminal cancellation.
 
-Thread and Run creation bodies are strict. Unknown fields, including a
-client-supplied Agent ID, budget, Principal role, or Tool policy, return `422`
-and cannot alter the server-evaluated execution plan.
+Thread creation, initial Run, rename, and ordinary Run bodies are strict. Unknown
+fields, including a client-supplied Agent ID, budget, Principal role, or Tool
+policy, return `422` and cannot alter the server-evaluated execution plan.
 
 Authentication and resource errors are stable:
 
@@ -111,6 +129,12 @@ Authentication and resource errors are stable:
   an Origin outside the exact configured allowlist;
 - `404` with `thread_not_found` or `run_not_found` for an unknown identifier.
 
+Initial creation additionally uses two bounded conflicts after exact ownership
+authorization: `409 idempotency_mismatch` when one key is replayed with different
+message text, and `409 thread_already_exists` when an existing owned Thread ID is
+present without that key. An exact same-ID, same-key, same-message replay returns
+the original Run and never relaunches Runtime work.
+
 Authentication occurs before product body or cursor validation. For an
 authenticated caller, ownership is checked before idempotency replay, active-Run
 conflict, cancellation, replay, or retry behavior. Therefore a forbidden caller
@@ -120,8 +144,9 @@ Validation errors for an owned resource use `422`. Error bodies never include
 resource content, owner/actor subjects, provider responses, prompts, stack
 traces, or credentials.
 
-Every browser `POST` with an `Origin` header also passes the exact-origin guard
-before mutation; service-to-service clients that omit `Origin` remain supported.
+Every browser `POST` or `PATCH` with an `Origin` header also passes the
+exact-origin guard before mutation; service-to-service clients that omit
+`Origin` remain supported.
 
 ## SSE envelope
 
@@ -205,6 +230,54 @@ events are Host-owned and committed with product state. Tool and source events
 are also checked against the current Run's reserved-call and successful-Tool
 ledger before persistence; a structurally valid event cannot invent a Tool call
 or source.
+
+Agent and Tool-decision model rounds never produce public text deltas. With
+visible external Tools, the preferred direct-answer path uses a Host-private,
+argument-free finalization signal. If a provider instead ignores required Tool
+choice and returns one complete non-empty draft without any Tool signal, that
+draft remains private and is discarded; graph exit then starts the same raw,
+Tool-free live finalizer rather than publishing or slicing the draft. A
+successful model turn reaches the finalizer immediately after Tool completion only when it
+contains one or more registered terminal-eligible Tools plus exactly one
+no-argument, no-text control declaring that same batch complete, and all Tool
+handlers succeed. A terminal-eligible Tool batch without the control reaches
+`after_agent` and jumps back to the model; it is not guessed complete. A mixed
+terminal/non-terminal batch without the control returns to the model, while a
+control mixed with any non-terminal Tool fails closed. With no visible external
+Tool, the first model call is already the finalizer. The control signal is not a
+public Tool, source, event, or Tool-budget attempt, and it cannot carry answer
+text.
+
+The finalizer is separately model-budgeted and deadline-bounded where a decision
+round preceded it. It calls the same raw model without binding any Tool or
+function schema and receives the trusted system Context plus conversation and
+successful Tool messages. Tool parsing, source registration, lifecycle events,
+ownership, and final result validation still run before terminal persistence;
+Tool output is never promoted directly into answer text. Only allowlisted answer
+text chunks from the provider stream may become `message.delta`; reasoning,
+Tool arguments, unknown blocks, and raw provider metadata are never serialized.
+
+Provider-received text is coalesced into short phrases while the stream is open.
+Once at least three characters have accumulated, a punctuation boundary or
+24-character target flushes immediately; a 160-millisecond soft cap also flushes
+an accumulated phrase of at least three characters. One or two isolated slow
+characters remain buffered until more real
+provider text arrives or the provider closes; the final tail then flushes
+verbatim. A terminal-only adapter is rejected: the Host does not split a
+completed answer after generation or use a client-side typing animation to
+simulate streaming. The ordered delta concatenation must equal the final Runtime
+message and committed `message.completed` content byte-for-byte. The Host never
+bypasses declared model-step or total-deadline budgets to obtain a terminal
+answer. Before any Tool attempt or public event, the visible-Tool initial
+decision may retry one provider connection failure after a bounded
+150-millisecond delay; it consumes a model step and remains inside the original
+Run deadline. Direct no-Tool streams and terminal finalizers do not retry.
+
+The client accepts and deduplicates every validated sequence immediately, but
+coalesces rapid adjacent Runtime events into one React render batch of at most
+60 milliseconds. A terminal event flushes its batch immediately. This changes
+only paint frequency: event order, resume cursor, persisted text, and terminal
+equality remain unchanged, and the client never invents pacing after completion.
 
 The public payload contains user-facing Tool purpose, bounded result summaries,
 source references, text deltas, and errors. It never contains model reasoning,

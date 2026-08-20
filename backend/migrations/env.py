@@ -10,7 +10,9 @@ from work_assistant.models import Base
 
 config = context.config
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    # Alembic can run in the same process as application checks and tooling.
+    # Do not silently disable loggers that were created before migration setup.
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 database_url = os.environ.get("DATABASE_URL")
 if database_url:

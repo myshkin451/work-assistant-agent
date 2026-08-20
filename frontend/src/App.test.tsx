@@ -1,6 +1,6 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 import type {
   Message,
@@ -95,6 +95,10 @@ function runSnapshot(run: RunView, events: ProductEvent[]): RunSnapshot {
 }
 
 describe('employee chat vertical slice', () => {
+  beforeEach(() => {
+    window.history.replaceState(null, '', '/threads/thread-1');
+  });
+
   it('blocks all interaction when the initial request is unauthenticated', async () => {
     const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
       jsonResponse({ detail: { code: 'authentication_required' } }, 401),
@@ -103,10 +107,10 @@ describe('employee chat vertical slice', () => {
     render(<App />);
 
     expect(
-      await screen.findByText('当前请求未通过身份认证，请完成认证后刷新页面。'),
+      await screen.findByText('登录已失效，请重新登录。'),
     ).toBeInTheDocument();
-    expect(screen.getByLabelText('向 Work Assistant 提问')).toBeDisabled();
-    expect(screen.queryByText('从一个真实工具开始')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('输入消息')).toBeDisabled();
+    expect(screen.queryByText('今天想处理什么？')).not.toBeInTheDocument();
     for (const button of screen.getAllByRole('button', { name: '新建对话' })) {
       expect(button).toBeDisabled();
     }
@@ -150,15 +154,15 @@ describe('employee chat vertical slice', () => {
     expect(screen.getByText(privateSnapshot.title)).toBeInTheDocument();
     resolveSse(jsonResponse({ detail: { code: 'run_forbidden' } }, 403));
     expect(
-      await screen.findByText('当前身份无权访问这项会话或运行。'),
+      await screen.findByText('你没有权限查看这个对话。'),
     ).toBeInTheDocument();
     expect(screen.queryByText(privateMessage.content)).not.toBeInTheDocument();
     expect(screen.queryByText(privateSnapshot.title)).not.toBeInTheDocument();
-    expect(screen.getByLabelText('向 Work Assistant 提问')).toBeDisabled();
+    expect(screen.getByLabelText('输入消息')).toBeDisabled();
     expect(screen.queryByRole('button', { name: '停止运行' })).not.toBeInTheDocument();
   });
 
-  it('does not let a late request restore state after access is blocked', async () => {
+  it('keeps owned history and ignores a late request after a route-level 403', async () => {
     const otherSummary: ThreadSummary = {
       ...summary,
       thread_id: 'thread-2',
@@ -194,108 +198,123 @@ describe('employee chat vertical slice', () => {
     render(<App />);
 
     expect(await screen.findByText(userMessage.content)).toBeInTheDocument();
-    const composer = screen.getByLabelText('向 Work Assistant 提问');
+    const composer = screen.getByLabelText('输入消息');
     await user.type(composer, 'A 主体尚未发送完成的草稿');
     await user.click(screen.getByRole('button', { name: '发送消息' }));
     await user.click(screen.getByRole('button', { name: otherSummary.title }));
 
     expect(
-      await screen.findByText('当前身份无权访问这项会话或运行。'),
+      await screen.findByText('无法打开这个对话。你可以选择最近对话，或新建一个对话。'),
     ).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: summary.title })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: otherSummary.title })).toBeInTheDocument();
     resolveCreateRun(jsonResponse({ detail: { code: 'service_failure' } }, 500));
     await waitFor(() => {
       expect(screen.getByRole('alert')).toHaveTextContent(
-        '当前身份无权访问这项会话或运行。',
+        '无法打开这个对话。你可以选择最近对话，或新建一个对话。',
       );
     });
     expect(composer).toHaveValue('');
-    expect(composer).toBeDisabled();
+    expect(composer).toBeEnabled();
     expect(screen.queryByText(userMessage.content)).not.toBeInTheDocument();
     expect(screen.queryByText('A 主体尚未发送完成的草稿')).not.toBeInTheDocument();
   });
 
-  it('creates a real run and renders deduplicated product events, tools and sources', async () => {
+  it('connects SSE before the first snapshot resolves and renders deduplicated product events', async () => {
+    window.history.replaceState(null, '', '/');
+    const initialKey = '11111111-1111-4111-8111-111111111111';
+    const initialThreadId = '22222222-2222-4222-8222-222222222222';
+    vi.spyOn(crypto, 'randomUUID')
+      .mockReturnValueOnce(initialKey)
+      .mockReturnValueOnce(initialThreadId);
+    const initialSummary: ThreadSummary = { ...summary, thread_id: initialThreadId };
+    const initialRunning: RunView = { ...running, thread_id: initialThreadId };
     const emptyList = { items: [] as ThreadSummary[] };
-    const emptySnapshot: ThreadSnapshot = { ...summary, messages: [], runs: [], active_run: null };
     const withUser: ThreadSnapshot = {
-      ...summary,
+      ...initialSummary,
       messages: [userMessage],
-      runs: [runSnapshot(running, [])],
-      active_run: running,
+      runs: [runSnapshot(initialRunning, [])],
+      active_run: initialRunning,
     };
     const completedSnapshot: ThreadSnapshot = {
-      ...summary,
+      ...initialSummary,
       messages: [userMessage, assistantMessage],
       runs: [
         runSnapshot(
-          { ...running, status: 'completed', last_seq: 9, completed_at: timestamp },
+          { ...initialRunning, status: 'completed', last_seq: 9, completed_at: timestamp },
           [
-            event(1, 'run.started', { status: 'running' }),
+            event(1, 'run.started', { status: 'running' }, 'run-1', initialThreadId),
             event(2, 'tool.started', {
               tool_call_id: 'tool-1',
               name: 'get_current_time',
               label: '查询指定时区的当前时间',
               input_summary: 'Asia/Shanghai',
-            }),
+            }, 'run-1', initialThreadId),
             event(3, 'tool.finished', {
               tool_call_id: 'tool-1',
               name: 'get_current_time',
               label: '查询指定时区的当前时间',
               output_summary: '已取得 Asia/Shanghai 当前时间',
-            }),
-            event(5, 'message.delta', { delta: '上海当前时间' }),
-            event(6, 'message.delta', { delta: '为 2026 年 8 月 12 日 20:00。' }),
+            }, 'run-1', initialThreadId),
+            event(5, 'message.delta', { delta: '上海当前时间' }, 'run-1', initialThreadId),
+            event(6, 'message.delta', { delta: '为 2026 年 8 月 12 日 20:00。' }, 'run-1', initialThreadId),
             event(7, 'source.added', {
               source_id: 'source-1',
               label: '系统时钟 · Asia/Shanghai',
               description: '由只读时间工具返回',
-            }),
-            event(8, 'message.completed', { message: assistantMessage }),
-            event(9, 'run.completed', { status: 'completed' }),
+            }, 'run-1', initialThreadId),
+            event(8, 'message.completed', { message: assistantMessage }, 'run-1', initialThreadId),
+            event(9, 'run.completed', { status: 'completed' }, 'run-1', initialThreadId),
           ],
         ),
       ],
       active_run: null,
     };
     let snapshotReads = 0;
+    let staleSnapshotResolved = false;
+    let resolveStaleSnapshot!: (response: Response) => void;
+    const staleSnapshot = new Promise<Response>((resolve) => {
+      resolveStaleSnapshot = resolve;
+    });
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       const url = String(input);
       const method = init?.method ?? 'GET';
       if (url === '/api/threads' && method === 'GET') {
-        return jsonResponse(snapshotReads === 0 ? emptyList : { items: [summary] });
+        return jsonResponse(snapshotReads === 0 ? emptyList : { items: [initialSummary] });
       }
-      if (url === '/api/threads' && method === 'POST') return jsonResponse(emptySnapshot);
-      if (url === '/api/threads/thread-1/runs' && method === 'POST') return jsonResponse(running);
-      if (url === '/api/threads/thread-1' && method === 'GET') {
+      if (url === `/api/threads/${initialThreadId}/initial-run` && method === 'POST') {
+        return jsonResponse({ thread: initialSummary, run: initialRunning }, 201);
+      }
+      if (url === `/api/threads/${initialThreadId}` && method === 'GET') {
         snapshotReads += 1;
-        return jsonResponse(snapshotReads === 1 ? withUser : completedSnapshot);
+        return snapshotReads === 1 ? staleSnapshot : jsonResponse(completedSnapshot);
       }
       if (url === '/api/runs/run-1/events?after_seq=0') {
         return sseResponse([
-          event(1, 'run.started', { status: 'running' }),
+          event(1, 'run.started', { status: 'running' }, 'run-1', initialThreadId),
           event(2, 'tool.started', {
             tool_call_id: 'tool-1',
             name: 'get_current_time',
             label: '查询指定时区的当前时间',
             input_summary: 'Asia/Shanghai',
-          }),
+          }, 'run-1', initialThreadId),
           event(3, 'tool.finished', {
             tool_call_id: 'tool-1',
             name: 'get_current_time',
             label: '查询指定时区的当前时间',
             output_summary: '已取得 Asia/Shanghai 当前时间',
-          }),
-          privateEvent(4),
-          event(5, 'message.delta', { delta: '上海当前时间' }),
-          event(5, 'message.delta', { delta: '重复内容不应显示' }),
-          event(6, 'message.delta', { delta: '为 2026 年 8 月 12 日 20:00。' }),
+          }, 'run-1', initialThreadId),
+          { ...privateEvent(4), thread_id: initialThreadId },
+          event(5, 'message.delta', { delta: '上海当前时间' }, 'run-1', initialThreadId),
+          event(5, 'message.delta', { delta: '重复内容不应显示' }, 'run-1', initialThreadId),
+          event(6, 'message.delta', { delta: '为 2026 年 8 月 12 日 20:00。' }, 'run-1', initialThreadId),
           event(7, 'source.added', {
             source_id: 'source-1',
             label: '系统时钟 · Asia/Shanghai',
             description: '由只读时间工具返回',
-          }),
-          event(8, 'message.completed', { message: assistantMessage }),
-          event(9, 'run.completed', { status: 'completed' }),
+          }, 'run-1', initialThreadId),
+          event(8, 'message.completed', { message: assistantMessage }, 'run-1', initialThreadId),
+          event(9, 'run.completed', { status: 'completed' }, 'run-1', initialThreadId),
         ]);
       }
       throw new Error(`Unexpected request: ${method} ${url}`);
@@ -304,22 +323,199 @@ describe('employee chat vertical slice', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    expect(await screen.findByText('从一个真实工具开始')).toBeInTheDocument();
+    expect(await screen.findByText('今天想处理什么？')).toBeInTheDocument();
     await user.type(
-      screen.getByLabelText('向 Work Assistant 提问'),
+      screen.getByLabelText('输入消息'),
       '请查询当前上海时间，并说明结果来自哪里。',
     );
     await user.click(screen.getByRole('button', { name: '发送消息' }));
 
     expect(await screen.findByText(assistantMessage.content)).toBeInTheDocument();
+    expect(staleSnapshotResolved).toBe(false);
     expect(screen.getByText('查询指定时区的当前时间')).toBeInTheDocument();
     expect(screen.getByText('系统时钟 · Asia/Shanghai')).toBeInTheDocument();
     expect(screen.queryByText('重复内容不应显示')).not.toBeInTheDocument();
     expect(screen.queryByText('不应显示的内部思考')).not.toBeInTheDocument();
+    expect(window.location.pathname).toBe(`/threads/${initialThreadId}`);
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/threads/${initialThreadId}/initial-run`,
+      expect.objectContaining({
+        method: 'POST',
+        body: JSON.stringify({ message: userMessage.content, idempotency_key: initialKey }),
+      }),
+    );
+    expect(
+      fetchMock.mock.calls.some(
+        ([input, init]) => String(input) === '/api/threads' && init?.method === 'POST',
+      ),
+    ).toBe(false);
     expect(fetchMock).toHaveBeenCalledWith(
       '/api/runs/run-1/events?after_seq=0',
       expect.objectContaining({ credentials: 'include' }),
     );
+    staleSnapshotResolved = true;
+    resolveStaleSnapshot(jsonResponse(withUser));
+    await waitFor(() => expect(screen.queryByRole('button', { name: '停止运行' })).not.toBeInTheDocument());
+    expect(screen.getByText(assistantMessage.content)).toBeInTheDocument();
+  });
+
+  it('coalesces rapid persisted deltas into one visible render batch', async () => {
+    const firstDelta = '第一段真实增量';
+    const secondDelta = '和第二段真实增量';
+    const finalDelta = '，以及结尾。';
+    const partialContent = `${firstDelta}${secondDelta}`;
+    const completedMessage: Message = {
+      ...assistantMessage,
+      content: `${partialContent}${finalDelta}`,
+    };
+    const wrongThreadMessage: Message = {
+      ...assistantMessage,
+      message_id: 'wrong-thread-message',
+      content: '不应写入当前会话的回答',
+    };
+    const activeSnapshot: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage],
+      runs: [runSnapshot(running, [])],
+      active_run: running,
+    };
+    const completedRun: RunView = {
+      ...running,
+      status: 'completed',
+      last_seq: 7,
+      completed_at: timestamp,
+    };
+    const completedSnapshot: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage, completedMessage],
+      runs: [
+        runSnapshot(completedRun, [
+          event(1, 'run.started', { status: 'running' }),
+          event(2, 'message.delta', { delta: firstDelta }),
+          event(3, 'message.delta', { delta: secondDelta }),
+          event(5, 'message.delta', { delta: finalDelta }),
+          event(6, 'message.completed', { message: completedMessage }),
+          event(7, 'run.completed', { status: 'completed' }),
+        ]),
+      ],
+      active_run: null,
+    };
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+    });
+    const encoder = new TextEncoder();
+    const push = (productEvent: ReturnType<typeof event>) => {
+      streamController.enqueue(
+        encoder.encode(`id: ${productEvent.seq}\ndata: ${JSON.stringify(productEvent)}\n\n`),
+      );
+    };
+    let terminal = false;
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/api/threads' && method === 'GET') {
+        return jsonResponse({ items: [summary] });
+      }
+      if (url === '/api/threads/thread-1' && method === 'GET') {
+        return jsonResponse(terminal ? completedSnapshot : activeSnapshot);
+      }
+      if (url === '/api/runs/run-1/events?after_seq=0') {
+        return new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+
+    expect(await screen.findByRole('button', { name: '停止运行' })).toBeInTheDocument();
+    await act(async () => {
+      push(event(1, 'run.started', { status: 'running' }));
+      push(event(2, 'message.delta', { delta: firstDelta }));
+      push(event(3, 'message.delta', { delta: secondDelta }));
+      await Promise.resolve();
+    });
+    expect(screen.queryByText(partialContent)).not.toBeInTheDocument();
+
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
+    });
+    expect(screen.getByText(partialContent)).toBeInTheDocument();
+
+    await act(async () => {
+      push(event(4, 'message.completed', { message: wrongThreadMessage }, 'run-1', 'thread-2'));
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
+    });
+    expect(screen.queryByText(wrongThreadMessage.content)).not.toBeInTheDocument();
+
+    terminal = true;
+    await act(async () => {
+      push(event(5, 'message.delta', { delta: finalDelta }));
+      push(event(6, 'message.completed', { message: completedMessage }));
+      push(event(7, 'run.completed', { status: 'completed' }));
+      streamController.close();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    expect(screen.getByText(completedMessage.content)).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: '停止运行' })).not.toBeInTheDocument();
+    });
+  });
+
+  it('keeps a newer same-thread run active when an older refresh returns late', async () => {
+    const firstRun = { ...running, last_seq: 1 };
+    const firstSnapshot: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage],
+      runs: [runSnapshot(firstRun, [event(1, 'run.started', { status: 'running' })])],
+      active_run: firstRun,
+    };
+    const secondRun: RunView = {
+      ...running,
+      run_id: 'run-2',
+      created_at: '2026-08-12T12:01:00Z',
+    };
+    let threadReads = 0;
+    let resolveOldRefresh!: (response: Response) => void;
+    const oldRefresh = new Promise<Response>((resolve) => {
+      resolveOldRefresh = resolve;
+    });
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/api/threads' && method === 'GET') return jsonResponse({ items: [summary] });
+      if (url === '/api/threads/thread-1' && method === 'GET') {
+        threadReads += 1;
+        if (threadReads === 1) return jsonResponse(firstSnapshot);
+        return oldRefresh;
+      }
+      if (url === '/api/runs/run-1/events?after_seq=1') {
+        return sseResponse([event(2, 'run.completed', { status: 'completed' })]);
+      }
+      if (url === '/api/threads/thread-1/runs' && method === 'POST') {
+        return jsonResponse(secondRun);
+      }
+      if (url === '/api/runs/run-2/events?after_seq=0') {
+        return new Promise<Response>(() => undefined);
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+    render(<App />);
+
+    const composer = await screen.findByLabelText('输入消息');
+    await waitFor(() => expect(composer).toBeEnabled());
+    await user.type(composer, '继续查询下一项');
+    await user.click(screen.getByRole('button', { name: '发送消息' }));
+    expect(await screen.findByRole('button', { name: '停止运行' })).toBeInTheDocument();
+
+    resolveOldRefresh(jsonResponse(firstSnapshot));
+    await waitFor(() => expect(screen.getByRole('button', { name: '停止运行' })).toBeInTheDocument());
+    expect(composer).toBeDisabled();
+    expect(screen.getByText('继续查询下一项')).toBeInTheDocument();
   });
 
   it('restores an active run and continues SSE from the snapshot last seq', async () => {
@@ -436,7 +632,7 @@ describe('employee chat vertical slice', () => {
     render(<App />);
 
     expect(await screen.findByText(assistantMessage.content)).toBeInTheDocument();
-    expect(await screen.findByText('已完成')).toBeInTheDocument();
+    expect(screen.queryByText('已完成')).not.toBeInTheDocument();
     await waitFor(() => expect(listReads).toBeGreaterThan(1));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
@@ -551,10 +747,10 @@ describe('employee chat vertical slice', () => {
       expect(screen.getByText(`系统时钟 · ${timezone}`)).toBeInTheDocument();
       expect(screen.getByText(answer)).toBeInTheDocument();
     }
-    expect(screen.getAllByText('已完成')).toHaveLength(3);
+    expect(screen.queryByText('已完成')).not.toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: '其他对话' }));
-    expect(await screen.findByText('从一个真实工具开始')).toBeInTheDocument();
+    expect(await screen.findByText('今天想处理什么？')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '查询上海当前时间' }));
     expect(await screen.findByText('伦敦现在是 13:00。')).toBeInTheDocument();
 
@@ -584,24 +780,24 @@ describe('employee chat vertical slice', () => {
 
     expect(await screen.findByText('连接中断')).toBeInTheDocument();
     expect(
-      screen.getByText('实时连接暂不可用。运行状态未被改为失败；请刷新页面重新连接。'),
+      screen.getByText('连接中断，刷新页面后可继续查看。'),
     ).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '重新运行' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '停止运行' })).toBeInTheDocument();
   });
 
   it('renders every frozen run failure code with a deterministic message', async () => {
     const cases: Array<[RunFailureCode, string]> = [
-      ['run_timeout', '本次运行超时，未能完成。'],
-      ['agent_execution_failed', 'Agent 执行失败，未能完成本次运行。'],
-      ['service_restarted', '服务已重启，原运行已安全结束。'],
-      ['model_step_limit', 'Agent 已达到本次推理步数上限，运行已安全停止。'],
-      ['tool_call_limit', 'Agent 已达到本次工具调用上限，运行已安全停止。'],
-      ['repeated_tool_call', '检测到重复工具调用，运行已安全停止。'],
-      ['no_progress', 'Agent 连续未取得新进展，运行已安全停止。'],
-      ['tool_not_allowed', 'Agent 请求了未获授权的工具，运行已安全停止。'],
-      ['result_schema_invalid', 'Agent 返回结果不符合约定，未保存为回答。'],
-      ['source_validation_failed', '回答来源校验失败，未保存为回答。'],
+      ['run_timeout', '等待时间过长，这次回答没有完成。'],
+      ['agent_execution_failed', '这次没有生成完整回答，请重试。'],
+      ['service_restarted', '服务刚刚恢复，请重试这条消息。'],
+      ['model_step_limit', '这次没有生成完整回答，请重试。'],
+      ['tool_call_limit', '这次没有生成完整回答，请重试。'],
+      ['repeated_tool_call', '这次没有生成完整回答，请重试。'],
+      ['no_progress', '这次没有生成完整回答，请重试。'],
+      ['tool_not_allowed', '当前请求暂时无法处理。'],
+      ['result_schema_invalid', '这次回答没有完成，请重试。'],
+      ['source_validation_failed', '这次回答没有完成，请重试。'],
     ];
     const messages: Message[] = [];
     const runs: RunSnapshot[] = [];
@@ -620,12 +816,13 @@ describe('employee chat vertical slice', () => {
             ...running,
             run_id: runId,
             status: 'failed',
-            last_seq: 2,
+            last_seq: 3,
             completed_at: timestamp,
           },
           [
             event(1, 'run.started', { status: 'running' }, runId),
-            event(2, 'run.failed', { status: 'failed', error_code: failureCode }, runId),
+            event(2, 'message.delta', { delta: `partial answer ${index}` }, runId),
+            event(3, 'run.failed', { status: 'failed', error_code: failureCode }, runId),
           ],
         ),
       );
@@ -646,10 +843,17 @@ describe('employee chat vertical slice', () => {
     vi.stubGlobal('fetch', fetchMock);
     render(<App />);
 
+    const expectedCounts = new Map<string, number>();
     for (const [, message] of cases) {
-      expect(await screen.findByText(message)).toBeInTheDocument();
+      expectedCounts.set(message, (expectedCounts.get(message) ?? 0) + 1);
     }
-    expect(screen.getAllByRole('button', { name: '重新运行' })).toHaveLength(cases.length);
+    for (const [message, count] of expectedCounts) {
+      expect(await screen.findAllByText(message)).toHaveLength(count);
+    }
+    cases.forEach((_, index) => {
+      expect(screen.queryByText(`partial answer ${index}`)).not.toBeInTheDocument();
+    });
+    expect(screen.getAllByRole('button', { name: '重试' })).toHaveLength(cases.length);
   });
 
   it('retries service_restarted as a new run and preserves the failed turn', async () => {
@@ -757,12 +961,12 @@ describe('employee chat vertical slice', () => {
     const user = userEvent.setup();
     render(<App />);
 
-    expect(await screen.findByText('服务已重启，原运行已安全结束。')).toBeInTheDocument();
+    expect(await screen.findByText('服务刚刚恢复，请重试这条消息。')).toBeInTheDocument();
     expect(screen.getByText('已停止')).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: '重新运行' }));
+    await user.click(screen.getByRole('button', { name: '重试' }));
 
     expect(await screen.findByText(retryAssistant.content)).toBeInTheDocument();
-    expect(screen.getByText('服务已重启，原运行已安全结束。')).toBeInTheDocument();
+    expect(screen.getByText('服务刚刚恢复，请重试这条消息。')).toBeInTheDocument();
     const runPosts = fetchMock.mock.calls.filter(
       ([input, init]) =>
         String(input) === '/api/threads/thread-1/runs' && (init?.method ?? 'GET') === 'POST',
@@ -821,7 +1025,7 @@ describe('employee chat vertical slice', () => {
 
     const stop = await screen.findByRole('button', { name: '停止运行' });
     await user.click(stop);
-    expect(await screen.findByText('本次运行已停止。')).toBeInTheDocument();
+    expect(await screen.findByText('已停止回答。')).toBeInTheDocument();
     await waitFor(() =>
       expect(fetchMock).toHaveBeenCalledWith(
         '/api/runs/run-1/cancel',

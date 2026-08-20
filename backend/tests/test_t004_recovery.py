@@ -6,8 +6,10 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any, cast, get_args
 
+import httpx
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
+from openai import APIConnectionError
 from policy_fixtures import (
     make_execution,
     make_execution_plan,
@@ -324,7 +326,10 @@ class RaisingRunner:
     ) -> AsyncIterator[ProductEvent | AgentResult]:
         del thread_id, run_id, messages, execution, built_context
         yield ProductEvent("message.delta", {"delta": "safe prefix"})
-        raise RuntimeError("provider-secret-sentinel")
+        raise APIConnectionError(
+            message="provider-secret-sentinel",
+            request=httpx.Request("POST", "https://provider.invalid"),
+        )
 
 
 class CumulativeDeltaOverflowRunner:
@@ -356,6 +361,20 @@ class StreamResultMismatchRunner:
         del thread_id, run_id, messages, execution, built_context
         yield ProductEvent("message.delta", {"delta": "safe prefix"})
         yield AgentResult(text="different terminal result", source_ids=())
+
+
+class TerminalOnlyRunner:
+    async def stream(
+        self,
+        *,
+        thread_id: str,
+        run_id: str,
+        messages: Sequence[Message],
+        execution: RunExecution,
+        built_context: BuiltContext,
+    ) -> AsyncIterator[ProductEvent | AgentResult]:
+        del thread_id, run_id, messages, execution, built_context
+        yield AgentResult(text="terminal text must not be post-hoc chunked", source_ids=())
 
 
 async def test_three_runs_keep_messages_events_and_context_isolated(
@@ -430,7 +449,12 @@ async def test_three_runs_keep_messages_events_and_context_isolated(
         )
         assert plan is not None
         assert plan["agent_id"] == "default-work-assistant"
-        assert plan["visible_tools"] == [{"tool_id": "get_current_time", "version": "1.0.0"}]
+        assert plan["visible_tools"] == [
+            {
+                "tool_id": "get_current_time",
+                "version": "1.1.0",
+            }
+        ]
         assert outcome is not None
         assert outcome["status"] == "completed"
         assert outcome["result_validation"] == "passed"
@@ -743,7 +767,9 @@ async def test_service_failures_are_bounded_contiguous_and_do_not_persist_except
     timeout_seconds: float,
     expected_code: str,
     expected_types: list[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level("WARNING", logger="work_assistant.service")
     repository = recovery_repository
     service = service_for(
         repository,
@@ -785,6 +811,15 @@ async def test_service_failures_are_bounded_contiguous_and_do_not_persist_except
         }
     )
     assert "provider-secret-sentinel" not in serialized
+    assert "provider-secret-sentinel" not in caplog.text
+    if expected_code == "agent_execution_failed":
+        record = next(
+            record for record in caplog.records if record.message == "run_execution_failed"
+        )
+        assert record.run_id == run.run_id
+        assert record.error_category == "provider_connection"
+        assert record.exception_type == "APIConnectionError"
+        assert record.exc_info is None
 
     await service.shutdown()
 
@@ -879,6 +914,37 @@ async def test_invalid_stream_results_fail_stably_without_assistant_commit(
     assert outcome["result_validation"] == expected_result_validation
     assert outcome["result_schema_version"] == "1.0.0"
     assert outcome["result_source_ids"] == []
+
+    await service.shutdown()
+
+
+async def test_terminal_result_without_live_deltas_fails_instead_of_being_chunked(
+    recovery_repository: ProductRepository,
+) -> None:
+    repository = recovery_repository
+    service = service_for(repository, TerminalOnlyRunner())
+    thread = await repository.create_thread(
+        principal=TEST_PRINCIPAL,
+        title="Reject terminal chunk fallback",
+    )
+    run = await service.create_run(
+        principal=TEST_PRINCIPAL,
+        thread_id=thread.thread_id,
+        message="Require live Runtime deltas",
+        idempotency_key="no-terminal-chunk-fallback",
+    )
+    await service.wait_for_idle()
+
+    failed = await repository.get_run(run.run_id, principal=TEST_PRINCIPAL)
+    assert failed.status == "failed"
+    events = await repository.get_events(run.run_id, 0, principal=TEST_PRINCIPAL)
+    assert [event.type for event in events] == ["run.started", "run.failed"]
+    assert events[-1].data == {
+        "status": "failed",
+        "error_code": "result_schema_invalid",
+    }
+    snapshot = await repository.get_thread(thread.thread_id, principal=TEST_PRINCIPAL)
+    assert [message.role for message in snapshot.messages] == ["user"]
 
     await service.shutdown()
 

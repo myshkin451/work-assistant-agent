@@ -1,24 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any, cast
 
+import httpx
 import pytest
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain.tools import tool
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langgraph.runtime import Runtime
+from openai import APIConnectionError
 from policy_fixtures import make_execution, make_settings
 
 from work_assistant.agent_runtime import (
     AgentResult,
+    DeepSeekAgentRunner,
     DeepSeekRuntimeContext,
     FakeAgentRunner,
     ProductEvent,
     RuntimeCleanupTimeout,
     RuntimeConfigurationError,
     RuntimeUnavailable,
+    _request_final_answer,
     _RuntimeLifecycle,
     apply_model_policy,
     get_current_time,
@@ -32,6 +37,38 @@ from work_assistant.identity import Principal
 from work_assistant.schemas import Message
 
 TEST_PRINCIPAL = Principal(subject="neutral-runtime-principal")
+
+
+class ToolFreeStreamingModel:
+    def __init__(self) -> None:
+        self.received_messages: list[tuple[BaseMessage, ...]] = []
+        self.model_kwargs: list[dict[str, Any]] = []
+
+    async def astream(
+        self,
+        messages: list[BaseMessage],
+        **kwargs: Any,
+    ) -> AsyncIterator[AIMessageChunk]:
+        self.received_messages.append(tuple(messages))
+        self.model_kwargs.append(dict(kwargs))
+        yield AIMessageChunk(content="safe ")
+        yield AIMessageChunk(content="direct answer")
+
+
+class BurstAgentGraph:
+    async def astream(
+        self,
+        inputs: dict[str, Any],
+        *,
+        config: dict[str, Any],
+        context: DeepSeekRuntimeContext,
+        stream_mode: str,
+    ) -> AsyncIterator[dict[str, Any]]:
+        del inputs, config, stream_mode
+        for _ in range(64):
+            await context.emit(ProductEvent("message.delta", {"delta": "x"}))
+        context.final_response_text = "x" * 64
+        yield {"messages": [AIMessage(content=context.final_response_text)]}
 
 
 def message(content: str, run_id: str = "run") -> Message:
@@ -117,6 +154,106 @@ async def test_model_hook_filters_tools_and_replaces_the_full_system_message() -
 
     execution = make_execution(TEST_PRINCIPAL)
     built = execution.build_context([message("Answer directly")])
+    emitted: list[ProductEvent] = []
+
+    async def emit(event: ProductEvent) -> None:
+        emitted.append(event)
+
+    context = DeepSeekRuntimeContext(
+        execution=execution,
+        built_context=built,
+        emit=emit,
+    )
+    observed: dict[str, Any] = {}
+    model = ToolFreeStreamingModel()
+
+    async def handler(request: ModelRequest[Any]) -> ModelResponse[Any]:
+        observed["tools"] = [getattr(item, "name", None) for item in request.tools]
+        observed["system"] = request.system_message.text if request.system_message else None
+        observed["tool_choice"] = request.tool_choice
+        return ModelResponse(
+            result=[
+                AIMessage(
+                    content="safe hidden preamble",
+                    tool_calls=[
+                        {
+                            "id": "visible-time",
+                            "name": "get_current_time",
+                            "args": {"timezone": "UTC"},
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        )
+
+    request = ModelRequest(
+        model=cast(Any, model),
+        messages=[],
+        tools=[get_current_time, forbidden_probe, _request_final_answer],
+        runtime=Runtime(context=context),
+    )
+    await apply_model_policy.awrap_model_call(request, handler)
+    assert observed["tools"] == ["get_current_time", "host__finalize_answer"]
+    assert observed["tool_choice"] == "required"
+    assert cast(str, observed["system"]).startswith(built.system_prompt)
+    assert "that exact batch contains" in cast(str, observed["system"])
+    assert model.model_kwargs == []
+    assert model.received_messages == []
+    assert emitted == []
+    assert execution.usage().model_steps == 1
+
+
+async def test_first_visible_tool_decision_retries_one_connection_error() -> None:
+    execution = make_execution(TEST_PRINCIPAL)
+    built = execution.build_context([message("Answer directly")])
+    emitted: list[ProductEvent] = []
+
+    async def emit(event: ProductEvent) -> None:
+        emitted.append(event)
+
+    context = DeepSeekRuntimeContext(execution=execution, built_context=built, emit=emit)
+    attempts = 0
+
+    async def handler(request: ModelRequest[Any]) -> ModelResponse[Any]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise APIConnectionError(request=httpx.Request("POST", "https://provider.invalid"))
+        return ModelResponse(
+            result=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "visible-time",
+                            "name": "get_current_time",
+                            "args": {"timezone": "UTC"},
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        )
+
+    request = ModelRequest(
+        model=cast(Any, ToolFreeStreamingModel()),
+        messages=[],
+        tools=[get_current_time, _request_final_answer],
+        runtime=Runtime(context=context),
+    )
+    await apply_model_policy.awrap_model_call(request, handler)
+
+    assert attempts == 2
+    assert context.first_decision_retry_used is True
+    assert execution.usage().model_steps == 2
+    assert execution.usage().tool_calls_attempted == 1
+    assert emitted == []
+
+
+async def test_connection_error_is_not_retried_after_a_public_event() -> None:
+    execution = make_execution(TEST_PRINCIPAL)
+    built = execution.build_context([message("Answer directly")])
 
     async def emit(event: ProductEvent) -> None:
         del event
@@ -125,27 +262,26 @@ async def test_model_hook_filters_tools_and_replaces_the_full_system_message() -
         execution=execution,
         built_context=built,
         emit=emit,
+        public_events_emitted=1,
     )
-    observed: dict[str, Any] = {}
+    attempts = 0
 
     async def handler(request: ModelRequest[Any]) -> ModelResponse[Any]:
-        observed["tools"] = [getattr(item, "name", None) for item in request.tools]
-        observed["system"] = request.system_message.text if request.system_message else None
-        observed["tool_choice"] = request.tool_choice
-        return ModelResponse(result=[AIMessage(content="safe direct answer")])
+        nonlocal attempts
+        attempts += 1
+        raise APIConnectionError(request=httpx.Request("POST", "https://provider.invalid"))
 
     request = ModelRequest(
-        model=cast(Any, object()),
+        model=cast(Any, ToolFreeStreamingModel()),
         messages=[],
-        tools=[get_current_time, forbidden_probe],
+        tools=[get_current_time, _request_final_answer],
         runtime=Runtime(context=context),
     )
-    await apply_model_policy.awrap_model_call(request, handler)
-    assert observed == {
-        "tools": ["get_current_time"],
-        "system": built.system_prompt,
-        "tool_choice": "auto",
-    }
+    with pytest.raises(APIConnectionError):
+        await apply_model_policy.awrap_model_call(request, handler)
+
+    assert attempts == 1
+    assert context.first_decision_retry_used is False
     assert execution.usage().model_steps == 1
 
 
@@ -225,6 +361,31 @@ async def test_runtime_normal_completion_is_observed_without_cancellation() -> N
     assert producer.done()
     assert producer.cancelling() == 0
     assert lifecycle.is_healthy is True
+
+
+async def test_stream_consumer_exit_does_not_deadlock_a_full_runtime_queue() -> None:
+    execution = make_execution(TEST_PRINCIPAL)
+    messages = [message("Answer directly")]
+    runner = object.__new__(DeepSeekAgentRunner)
+    mutable_runner = cast(Any, runner)
+    mutable_runner._agent = BurstAgentGraph()
+    mutable_runner._semaphore = asyncio.Semaphore(1)
+    mutable_runner._recursion_limit = 8
+    mutable_runner._lifecycle = _RuntimeLifecycle(cleanup_grace_seconds=0.05)
+
+    stream = runner.stream(
+        thread_id="thread",
+        run_id="queue-cancel-run",
+        messages=messages,
+        execution=execution,
+        built_context=execution.build_context(messages),
+    )
+    first = await anext(stream)
+    assert first == ProductEvent("message.delta", {"delta": "x"})
+    await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(stream.aclose(), timeout=0.2)
+    assert runner.is_healthy is True
 
 
 async def test_runtime_cleanup_bounds_langgraph_nested_cleanup_without_cancelling_it() -> None:
