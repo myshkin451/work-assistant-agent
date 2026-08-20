@@ -271,6 +271,12 @@ answer. Before any Tool attempt or public event, one initial provider connection
 failure may receive one 150-millisecond bounded retry; it consumes a model step
 and remains inside the original Run deadline.
 
+The client accepts and deduplicates every validated sequence immediately, but
+coalesces rapid adjacent Runtime events into one React render batch of at most
+60 milliseconds. A terminal event flushes its batch immediately. This changes
+only paint frequency: event order, resume cursor, persisted text, and terminal
+equality remain unchanged, and the client never invents pacing after completion.
+
 The public payload contains user-facing Tool purpose, bounded result summaries,
 source references, text deltas, and errors. It never contains model reasoning,
 credentials, raw provider events, hidden prompts, or internal checkpoint state.

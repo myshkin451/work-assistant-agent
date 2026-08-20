@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
@@ -357,6 +357,95 @@ describe('employee chat vertical slice', () => {
     resolveStaleSnapshot(jsonResponse(withUser));
     await waitFor(() => expect(screen.queryByRole('button', { name: '停止运行' })).not.toBeInTheDocument());
     expect(screen.getByText(assistantMessage.content)).toBeInTheDocument();
+  });
+
+  it('coalesces rapid persisted deltas into one visible render batch', async () => {
+    const firstDelta = '第一段真实增量';
+    const secondDelta = '和第二段真实增量';
+    const completedMessage: Message = {
+      ...assistantMessage,
+      content: `${firstDelta}${secondDelta}`,
+    };
+    const activeSnapshot: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage],
+      runs: [runSnapshot(running, [])],
+      active_run: running,
+    };
+    const completedRun: RunView = {
+      ...running,
+      status: 'completed',
+      last_seq: 5,
+      completed_at: timestamp,
+    };
+    const completedSnapshot: ThreadSnapshot = {
+      ...summary,
+      messages: [userMessage, completedMessage],
+      runs: [
+        runSnapshot(completedRun, [
+          event(1, 'run.started', { status: 'running' }),
+          event(2, 'message.delta', { delta: firstDelta }),
+          event(3, 'message.delta', { delta: secondDelta }),
+          event(4, 'message.completed', { message: completedMessage }),
+          event(5, 'run.completed', { status: 'completed' }),
+        ]),
+      ],
+      active_run: null,
+    };
+    let streamController!: ReadableStreamDefaultController<Uint8Array>;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        streamController = controller;
+      },
+    });
+    const encoder = new TextEncoder();
+    const push = (productEvent: ReturnType<typeof event>) => {
+      streamController.enqueue(
+        encoder.encode(`id: ${productEvent.seq}\ndata: ${JSON.stringify(productEvent)}\n\n`),
+      );
+    };
+    let terminal = false;
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/api/threads' && method === 'GET') {
+        return jsonResponse({ items: [summary] });
+      }
+      if (url === '/api/threads/thread-1' && method === 'GET') {
+        return jsonResponse(terminal ? completedSnapshot : activeSnapshot);
+      }
+      if (url === '/api/runs/run-1/events?after_seq=0') {
+        return new Response(stream, { headers: { 'Content-Type': 'text/event-stream' } });
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    render(<App />);
+
+    expect(await screen.findByRole('button', { name: '停止运行' })).toBeInTheDocument();
+    await act(async () => {
+      push(event(1, 'run.started', { status: 'running' }));
+      push(event(2, 'message.delta', { delta: firstDelta }));
+      push(event(3, 'message.delta', { delta: secondDelta }));
+      await Promise.resolve();
+    });
+    expect(screen.queryByText(completedMessage.content)).not.toBeInTheDocument();
+
+    await act(async () => {
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
+    });
+    expect(screen.getByText(completedMessage.content)).toBeInTheDocument();
+
+    terminal = true;
+    await act(async () => {
+      push(event(4, 'message.completed', { message: completedMessage }));
+      push(event(5, 'run.completed', { status: 'completed' }));
+      streamController.close();
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: '停止运行' })).not.toBeInTheDocument();
+    });
   });
 
   it('keeps a newer same-thread run active when an older refresh returns late', async () => {

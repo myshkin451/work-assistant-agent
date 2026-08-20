@@ -368,6 +368,7 @@ type InitialAttempt = {
 };
 
 const FOLLOW_BOTTOM_THRESHOLD = 80;
+const STREAM_RENDER_BATCH_MS = 60;
 
 export function App() {
   const [threads, setThreads] = useState<ThreadSummary[]>([]);
@@ -451,10 +452,71 @@ export function App() {
         [run.run_id]: startingProjection,
       }));
 
+      let pendingEvents: ProductEvent[] = [];
+      let renderTimer: number | null = null;
+
       const isCurrentStream = () =>
         !controller.signal.aborted &&
         streamAbortRef.current === controller &&
         selectedThreadRef.current === run.thread_id;
+
+      const flushPendingEvents = () => {
+        if (renderTimer !== null) {
+          window.clearTimeout(renderTimer);
+          renderTimer = null;
+        }
+        if (!isCurrentStream() || pendingEvents.length === 0) {
+          pendingEvents = [];
+          return;
+        }
+        const batch = pendingEvents;
+        pendingEvents = [];
+        setProjectionsByRunId((current) => {
+          const projection = current[run.run_id];
+          return projection
+            ? {
+                ...current,
+                [run.run_id]: batch.reduce(applyEvent, projection),
+              }
+            : current;
+        });
+
+        const completedMessages = batch.flatMap((event) => {
+          if (event.type !== 'message.completed') return [];
+          const message = event.data.message;
+          if (typeof message !== 'object' || message === null) return [];
+          const completedMessage = message as Message;
+          return typeof completedMessage.message_id === 'string' &&
+            typeof completedMessage.content === 'string' &&
+            completedMessage.role === 'assistant'
+            ? [completedMessage]
+            : [];
+        });
+        if (completedMessages.length > 0) {
+          setSnapshot((current) => {
+            if (!current || current.thread_id !== run.thread_id) return current;
+            const messages = [...current.messages];
+            for (const completedMessage of completedMessages) {
+              const index = messages.findIndex(
+                (item) => item.message_id === completedMessage.message_id,
+              );
+              if (index >= 0) messages[index] = completedMessage;
+              else messages.push(completedMessage);
+            }
+            return { ...current, messages };
+          });
+        }
+      };
+
+      controller.signal.addEventListener(
+        'abort',
+        () => {
+          if (renderTimer !== null) window.clearTimeout(renderTimer);
+          renderTimer = null;
+          pendingEvents = [];
+        },
+        { once: true },
+      );
 
       void (async () => {
         try {
@@ -473,36 +535,15 @@ export function App() {
               },
               onEvent: (event) => {
                 if (!isCurrentStream()) return;
-                setProjectionsByRunId((current) => {
-                  const projection = current[run.run_id];
-                  return projection
-                    ? { ...current, [run.run_id]: applyEvent(projection, event) }
-                    : current;
-                });
-                if (event.type === 'message.completed') {
-                  const message = event.data.message;
-                  if (typeof message === 'object' && message !== null) {
-                    const completedMessage = message as Message;
-                    if (
-                      typeof completedMessage.message_id === 'string' &&
-                      typeof completedMessage.content === 'string' &&
-                      completedMessage.role === 'assistant'
-                    ) {
-                      setSnapshot((current) => {
-                        if (!current || current.thread_id !== event.thread_id) return current;
-                        const messages = current.messages.some(
-                          (item) => item.message_id === completedMessage.message_id,
-                        )
-                          ? current.messages.map((item) =>
-                              item.message_id === completedMessage.message_id
-                                ? completedMessage
-                                : item,
-                            )
-                          : [...current.messages, completedMessage];
-                        return { ...current, messages };
-                      });
-                    }
-                  }
+                pendingEvents.push(event);
+                if (
+                  event.type === 'run.completed' ||
+                  event.type === 'run.failed' ||
+                  event.type === 'run.cancelled'
+                ) {
+                  flushPendingEvents();
+                } else if (renderTimer === null) {
+                  renderTimer = window.setTimeout(flushPendingEvents, STREAM_RENDER_BATCH_MS);
                 }
               },
             },
@@ -510,6 +551,7 @@ export function App() {
           );
         } catch (streamError) {
           if (!isCurrentStream()) return;
+          flushPendingEvents();
           if (blockAccess(streamError)) return;
           setProjectionsByRunId((current) => {
             const projection = current[run.run_id];
@@ -521,6 +563,7 @@ export function App() {
         }
 
         if (!isCurrentStream()) return;
+        flushPendingEvents();
         try {
           await Promise.all([refreshSnapshot(run.thread_id), refreshThreads()]);
           if (isCurrentStream()) setError(null);

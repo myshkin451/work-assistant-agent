@@ -18,9 +18,11 @@ browser back/forward navigation. The model uses a read-only time Tool, emits
 validated answer deltas while the final response is being generated, and renders
 safe CommonMark/GFM. Live text is coalesced into short provider-received phrases
 instead of repainting isolated Chinese characters; it is never reconstructed
-from a completed answer or a client-side typing animation. PostgreSQL preserves
-every turn and monotonic SSE sequence for reconnect, replay, cancellation,
-source validation, and failure recovery.
+from a completed answer or a client-side typing animation. The browser preserves
+every received sequence while grouping rapid adjacent SSE frames into at most
+one visible render per 60 milliseconds. PostgreSQL preserves every turn and
+monotonic SSE sequence for reconnect, replay, cancellation, source validation,
+and failure recovery.
 
 ![T-008 live DeepSeek conversation workspace](output/playwright/t008/t008-deepseek-desktop.png)
 
