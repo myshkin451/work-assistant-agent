@@ -20,7 +20,8 @@ safe CommonMark/GFM. Live text is coalesced into short provider-received phrases
 instead of repainting isolated Chinese characters; it is never reconstructed
 from a completed answer or a client-side typing animation. The browser preserves
 every received sequence while grouping rapid adjacent SSE frames into at most
-one visible render per 60 milliseconds. PostgreSQL preserves every turn and
+one visible render per 60 milliseconds; terminal events flush immediately.
+PostgreSQL preserves every turn and
 monotonic SSE sequence for reconnect, replay, cancellation, source validation,
 and failure recovery.
 

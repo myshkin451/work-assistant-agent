@@ -362,9 +362,16 @@ describe('employee chat vertical slice', () => {
   it('coalesces rapid persisted deltas into one visible render batch', async () => {
     const firstDelta = '第一段真实增量';
     const secondDelta = '和第二段真实增量';
+    const finalDelta = '，以及结尾。';
+    const partialContent = `${firstDelta}${secondDelta}`;
     const completedMessage: Message = {
       ...assistantMessage,
-      content: `${firstDelta}${secondDelta}`,
+      content: `${partialContent}${finalDelta}`,
+    };
+    const wrongThreadMessage: Message = {
+      ...assistantMessage,
+      message_id: 'wrong-thread-message',
+      content: '不应写入当前会话的回答',
     };
     const activeSnapshot: ThreadSnapshot = {
       ...summary,
@@ -375,7 +382,7 @@ describe('employee chat vertical slice', () => {
     const completedRun: RunView = {
       ...running,
       status: 'completed',
-      last_seq: 5,
+      last_seq: 7,
       completed_at: timestamp,
     };
     const completedSnapshot: ThreadSnapshot = {
@@ -386,8 +393,9 @@ describe('employee chat vertical slice', () => {
           event(1, 'run.started', { status: 'running' }),
           event(2, 'message.delta', { delta: firstDelta }),
           event(3, 'message.delta', { delta: secondDelta }),
-          event(4, 'message.completed', { message: completedMessage }),
-          event(5, 'run.completed', { status: 'completed' }),
+          event(5, 'message.delta', { delta: finalDelta }),
+          event(6, 'message.completed', { message: completedMessage }),
+          event(7, 'run.completed', { status: 'completed' }),
         ]),
       ],
       active_run: null,
@@ -429,20 +437,28 @@ describe('employee chat vertical slice', () => {
       push(event(3, 'message.delta', { delta: secondDelta }));
       await Promise.resolve();
     });
-    expect(screen.queryByText(completedMessage.content)).not.toBeInTheDocument();
+    expect(screen.queryByText(partialContent)).not.toBeInTheDocument();
 
     await act(async () => {
       await new Promise((resolve) => window.setTimeout(resolve, 80));
     });
-    expect(screen.getByText(completedMessage.content)).toBeInTheDocument();
+    expect(screen.getByText(partialContent)).toBeInTheDocument();
+
+    await act(async () => {
+      push(event(4, 'message.completed', { message: wrongThreadMessage }, 'run-1', 'thread-2'));
+      await new Promise((resolve) => window.setTimeout(resolve, 80));
+    });
+    expect(screen.queryByText(wrongThreadMessage.content)).not.toBeInTheDocument();
 
     terminal = true;
     await act(async () => {
-      push(event(4, 'message.completed', { message: completedMessage }));
-      push(event(5, 'run.completed', { status: 'completed' }));
+      push(event(5, 'message.delta', { delta: finalDelta }));
+      push(event(6, 'message.completed', { message: completedMessage }));
+      push(event(7, 'run.completed', { status: 'completed' }));
       streamController.close();
-      await Promise.resolve();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
     });
+    expect(screen.getByText(completedMessage.content)).toBeInTheDocument();
     await waitFor(() => {
       expect(screen.queryByRole('button', { name: '停止运行' })).not.toBeInTheDocument();
     });

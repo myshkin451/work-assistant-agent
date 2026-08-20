@@ -257,19 +257,21 @@ Tool output is never promoted directly into answer text. Only allowlisted answer
 text chunks from the provider stream may become `message.delta`; reasoning,
 Tool arguments, unknown blocks, and raw provider metadata are never serialized.
 
-Provider-received text is coalesced into short phrases while the stream is open:
-a punctuation boundary or 24-character target flushes immediately, while a
-160-millisecond soft cap flushes an accumulated phrase of at least three
-characters. One or two isolated slow characters remain buffered until more real
+Provider-received text is coalesced into short phrases while the stream is open.
+Once at least three characters have accumulated, a punctuation boundary or
+24-character target flushes immediately; a 160-millisecond soft cap also flushes
+an accumulated phrase of at least three characters. One or two isolated slow
+characters remain buffered until more real
 provider text arrives or the provider closes; the final tail then flushes
 verbatim. A terminal-only adapter is rejected: the Host does not split a
 completed answer after generation or use a client-side typing animation to
 simulate streaming. The ordered delta concatenation must equal the final Runtime
 message and committed `message.completed` content byte-for-byte. The Host never
 bypasses declared model-step or total-deadline budgets to obtain a terminal
-answer. Before any Tool attempt or public event, one initial provider connection
-failure may receive one 150-millisecond bounded retry; it consumes a model step
-and remains inside the original Run deadline.
+answer. Before any Tool attempt or public event, the visible-Tool initial
+decision may retry one provider connection failure after a bounded
+150-millisecond delay; it consumes a model step and remains inside the original
+Run deadline. Direct no-Tool streams and terminal finalizers do not retry.
 
 The client accepts and deduplicates every validated sequence immediately, but
 coalesces rapid adjacent Runtime events into one React render batch of at most

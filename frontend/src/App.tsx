@@ -482,7 +482,13 @@ export function App() {
         });
 
         const completedMessages = batch.flatMap((event) => {
-          if (event.type !== 'message.completed') return [];
+          if (
+            event.run_id !== run.run_id ||
+            event.thread_id !== run.thread_id ||
+            event.type !== 'message.completed'
+          ) {
+            return [];
+          }
           const message = event.data.message;
           if (typeof message !== 'object' || message === null) return [];
           const completedMessage = message as Message;
@@ -535,6 +541,7 @@ export function App() {
               },
               onEvent: (event) => {
                 if (!isCurrentStream()) return;
+                if (event.run_id !== run.run_id || event.thread_id !== run.thread_id) return;
                 pendingEvents.push(event);
                 if (
                   event.type === 'run.completed' ||
