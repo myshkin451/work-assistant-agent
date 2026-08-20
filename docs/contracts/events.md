@@ -231,10 +231,13 @@ are also checked against the current Run's reserved-call and successful-Tool
 ledger before persistence; a structurally valid event cannot invent a Tool call
 or source.
 
-Agent and Tool-decision model rounds never produce public text deltas or a
-complete hidden draft for later rewriting. With visible external Tools, a direct
-answer requires a Host-private, argument-free finalization signal. A successful
-model turn reaches the finalizer immediately after Tool completion only when it
+Agent and Tool-decision model rounds never produce public text deltas. With
+visible external Tools, the preferred direct-answer path uses a Host-private,
+argument-free finalization signal. If a provider instead ignores required Tool
+choice and returns one complete non-empty draft without any Tool signal, that
+draft remains private and is discarded; graph exit then starts the same raw,
+Tool-free live finalizer rather than publishing or slicing the draft. A
+successful model turn reaches the finalizer immediately after Tool completion only when it
 contains one or more registered terminal-eligible Tools plus exactly one
 no-argument, no-text control declaring that same batch complete, and all Tool
 handlers succeed. A terminal-eligible Tool batch without the control reaches
@@ -254,14 +257,19 @@ Tool output is never promoted directly into answer text. Only allowlisted answer
 text chunks from the provider stream may become `message.delta`; reasoning,
 Tool arguments, unknown blocks, and raw provider metadata are never serialized.
 
-The first safe non-empty provider text block is emitted while the stream is open,
-including for a short answer. Later text flushes when either 64 characters are
-buffered or 80 milliseconds elapse while generation is still active; the tail
-flushes on provider completion. A terminal-only adapter is rejected: the Host
-does not split a completed answer after generation to simulate streaming. The
-ordered delta concatenation must equal the final Runtime message and committed
-`message.completed` content byte-for-byte. The Host never bypasses declared
-model-step or total-deadline budgets to obtain a terminal answer.
+Provider-received text is coalesced into short phrases while the stream is open:
+a punctuation boundary or 24-character target flushes immediately, while a
+160-millisecond soft cap flushes an accumulated phrase of at least three
+characters. One or two isolated slow characters remain buffered until more real
+provider text arrives or the provider closes; the final tail then flushes
+verbatim. A terminal-only adapter is rejected: the Host does not split a
+completed answer after generation or use a client-side typing animation to
+simulate streaming. The ordered delta concatenation must equal the final Runtime
+message and committed `message.completed` content byte-for-byte. The Host never
+bypasses declared model-step or total-deadline budgets to obtain a terminal
+answer. Before any Tool attempt or public event, one initial provider connection
+failure may receive one 150-millisecond bounded retry; it consumes a model step
+and remains inside the original Run deadline.
 
 The public payload contains user-facing Tool purpose, bounded result summaries,
 source references, text deltas, and errors. It never contains model reasoning,

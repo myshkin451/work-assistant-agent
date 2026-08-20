@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -10,7 +10,7 @@ from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from .agent_definition import AgentDefinition
-from .agent_runtime import runtime_for_settings
+from .agent_runtime import AgentRunner, runtime_for_settings
 from .api import router
 from .bootstrap import build_policy_kernel
 from .capabilities import (
@@ -92,6 +92,7 @@ def create_app(
     agent_definitions: Sequence[AgentDefinition] | None = None,
     tool_registry: ToolRegistry | None = None,
     capability_policy: PrincipalCapabilityPolicy | None = None,
+    runner_decorator: Callable[[AgentRunner], AgentRunner] | None = None,
 ) -> FastAPI:
     resolved = settings or get_settings()
     policy_kernel = build_policy_kernel(
@@ -110,13 +111,14 @@ def create_app(
         )
         repository = ProductRepository(database.session_factory)
         async with runtime_for_settings(resolved, policy_kernel=policy_kernel) as runner:
+            active_runner = runner_decorator(runner) if runner_decorator is not None else runner
             # The current deployment contract has one executing backend process. Any
             # active Run present before this process accepts traffic belonged to a lost
             # executor and must become an immutable, retryable product failure.
             await repository.fail_orphaned_runs()
             service = RunService(
                 repository=repository,
-                runner=runner,
+                runner=active_runner,
                 policy_kernel=policy_kernel,
                 settings=resolved,
             )

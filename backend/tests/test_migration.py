@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
@@ -21,6 +22,15 @@ def migration_config(backend: Path, database_path: Path) -> Config:
     config.set_main_option("script_location", str(backend / "migrations"))
     config.set_main_option("sqlalchemy.url", f"sqlite:///{database_path}")
     return config
+
+
+def test_migration_setup_preserves_existing_application_loggers(tmp_path: Path) -> None:
+    application_logger = logging.getLogger("work_assistant.service")
+    application_logger.disabled = False
+
+    command.upgrade(migration_config(BACKEND, tmp_path / "logging.db"), "head")
+
+    assert application_logger.disabled is False
 
 
 def test_product_migration_is_reversible_and_owns_no_checkpoint_tables(tmp_path: Path) -> None:

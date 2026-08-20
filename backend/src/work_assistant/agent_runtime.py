@@ -32,6 +32,7 @@ from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.checkpoint.serde.jsonplus import JsonPlusSerializer
 from langgraph.errors import GraphRecursionError
+from openai import APIConnectionError
 
 from .agent_definition import ModelProfile
 from .capabilities import TIME_SOURCE, get_current_time, read_current_time
@@ -333,8 +334,11 @@ _FINALIZER_TOOL_BLOCK_TYPES = frozenset(
 )
 _PUBLIC_TEXT_BLOCK_TYPES = frozenset({"output_text", "text"})
 _PUBLIC_DELTA_MAX_CHARS = 8_000
-_STREAM_DELTA_TARGET_CHARS = 64
-_STREAM_DELTA_MAX_WAIT_SECONDS = 0.08
+_STREAM_DELTA_TARGET_CHARS = 24
+_STREAM_DELTA_MIN_PHRASE_CHARS = 3
+_STREAM_DELTA_MAX_WAIT_SECONDS = 0.16
+_STREAM_PHRASE_BOUNDARIES = frozenset("\n\r,.!?;:，。！？；：、")
+_FIRST_DECISION_RETRY_BACKOFF_SECONDS = 0.15
 # Deliberately outside the public Tool ID grammar (double separator), so a
 # registered/downstream capability can never collide with this Host protocol.
 _FINALIZE_CONTROL_TOOL_ID = "host__finalize_answer"
@@ -410,12 +414,35 @@ async def _emit_stream_chunk(context: DeepSeekRuntimeContext, text: str) -> None
     """Frame one live buffered block to the public payload limit without post-hoc splitting."""
 
     for offset in range(0, len(text), _PUBLIC_DELTA_MAX_CHARS):
-        await context.emit(
+        await _emit_public_event(
+            context,
             ProductEvent(
                 "message.delta",
                 {"delta": text[offset : offset + _PUBLIC_DELTA_MAX_CHARS]},
-            )
+            ),
         )
+
+
+async def _emit_public_event(context: DeepSeekRuntimeContext, event: ProductEvent) -> None:
+    context.public_events_emitted += 1
+    await context.emit(event)
+
+
+def _stream_flush_prefix_length(text: str) -> int:
+    """Choose a provider-received phrase prefix without inventing display pacing."""
+
+    if len(text) < _STREAM_DELTA_MIN_PHRASE_CHARS:
+        return 0
+    window = text[:_STREAM_DELTA_TARGET_CHARS]
+    boundary = max(
+        (index + 1 for index, char in enumerate(window) if char in _STREAM_PHRASE_BOUNDARIES),
+        default=0,
+    )
+    if boundary >= _STREAM_DELTA_MIN_PHRASE_CHARS:
+        return boundary
+    if len(text) >= _STREAM_DELTA_TARGET_CHARS:
+        return _STREAM_DELTA_TARGET_CHARS
+    return 0
 
 
 async def _stream_final_response(
@@ -434,7 +461,6 @@ async def _stream_final_response(
     text_parts: list[str] = []
     public_buffer = ""
     has_non_whitespace = False
-    emitted_public_delta = False
     text_chars = 0
     max_answer_chars = context.execution.agent.result_contract.max_answer_chars
     loop = asyncio.get_running_loop()
@@ -452,8 +478,15 @@ async def _stream_final_response(
         try:
             while True:
                 if flush_at is not None and loop.time() >= flush_at:
-                    if not public_buffer or not emitted_public_delta:
+                    if not public_buffer:
                         raise AgentExecutionFailed("finalizer_flush_state_invalid")
+                    if len(public_buffer) < _STREAM_DELTA_MIN_PHRASE_CHARS:
+                        # A lone slow token is exactly the visibly choppy case
+                        # this buffer is meant to avoid. Keep the provider bytes
+                        # private until a short phrase arrives or the real stream
+                        # closes; the terminal tail is still emitted verbatim.
+                        flush_at = None
+                        continue
                     await _emit_stream_chunk(context, public_buffer)
                     public_buffer = ""
                     flush_at = None
@@ -461,8 +494,11 @@ async def _stream_final_response(
                 wait_seconds = None if flush_at is None else max(0.0, flush_at - loop.time())
                 done, _ = await asyncio.wait({next_chunk}, timeout=wait_seconds)
                 if not done:
-                    if not public_buffer or not emitted_public_delta:
+                    if not public_buffer:
                         raise AgentExecutionFailed("finalizer_flush_state_invalid")
+                    if len(public_buffer) < _STREAM_DELTA_MIN_PHRASE_CHARS:
+                        flush_at = None
+                        continue
                     await _emit_stream_chunk(context, public_buffer)
                     public_buffer = ""
                     flush_at = None
@@ -483,26 +519,16 @@ async def _stream_final_response(
                 if text_chars > max_answer_chars:
                     raise ResultSchemaInvalid
                 text_parts.append(delta)
-                buffer_was_empty = not public_buffer
                 public_buffer += delta
                 if not has_non_whitespace and delta.strip():
                     has_non_whitespace = True
                 if not has_non_whitespace:
                     continue
-                if not emitted_public_delta:
-                    # Make the first safe provider text observable before asking
-                    # for another chunk. Later text uses a character-or-time
-                    # threshold to bound both write amplification and UI stalls.
-                    await _emit_stream_chunk(context, public_buffer)
-                    public_buffer = ""
-                    emitted_public_delta = True
-                    flush_at = None
-                    continue
-                if buffer_was_empty:
+                if flush_at is None:
                     flush_at = loop.time() + _STREAM_DELTA_MAX_WAIT_SECONDS
-                while len(public_buffer) >= _STREAM_DELTA_TARGET_CHARS:
-                    public_delta = public_buffer[:_STREAM_DELTA_TARGET_CHARS]
-                    public_buffer = public_buffer[_STREAM_DELTA_TARGET_CHARS:]
+                while (prefix_length := _stream_flush_prefix_length(public_buffer)) > 0:
+                    public_delta = public_buffer[:prefix_length]
+                    public_buffer = public_buffer[prefix_length:]
                     await _emit_stream_chunk(context, public_delta)
                     flush_at = (
                         loop.time() + _STREAM_DELTA_MAX_WAIT_SECONDS if public_buffer else None
@@ -635,6 +661,41 @@ class DeepSeekRuntimeContext:
     finalizer_request: ModelRequest[DeepSeekRuntimeContext] | None = field(default=None, repr=False)
     pending_finalize_call_id: str | None = field(default=None, repr=False)
     completed_finalize_call_id: str | None = field(default=None, repr=False)
+    public_events_emitted: int = field(default=0, repr=False)
+    first_decision_retry_used: bool = field(default=False, repr=False)
+
+
+def _can_retry_initial_decision(context: DeepSeekRuntimeContext) -> bool:
+    usage = context.execution.usage()
+    return (
+        not context.first_decision_retry_used
+        and usage.model_steps == 1
+        and usage.tool_calls_attempted == 0
+        and context.public_events_emitted == 0
+        and context.final_response_text is None
+        and context.pending_finalize_call_id is None
+        and context.completed_finalize_call_id is None
+    )
+
+
+async def _invoke_initial_decision_with_retry(
+    request: ModelRequest[DeepSeekRuntimeContext],
+    handler: Callable[[ModelRequest[DeepSeekRuntimeContext]], Awaitable[ModelResponse[Any]]],
+    context: DeepSeekRuntimeContext,
+) -> ModelResponse[Any]:
+    try:
+        return await handler(request)
+    except APIConnectionError:
+        if (
+            not _can_retry_initial_decision(context)
+            or context.execution.remaining_seconds <= _FIRST_DECISION_RETRY_BACKOFF_SECONDS
+        ):
+            raise
+        context.first_decision_retry_used = True
+        async with asyncio.timeout(context.execution.remaining_seconds):
+            await asyncio.sleep(_FIRST_DECISION_RETRY_BACKOFF_SECONDS)
+            context.execution.before_model_call()
+            return await handler(request)
 
 
 @wrap_model_call
@@ -678,7 +739,7 @@ async def apply_model_policy(
         tool_choice="none",
         system_message=SystemMessage(content=context.built_context.system_prompt),
     )
-    response = await handler(controlled_request)
+    response = await _invoke_initial_decision_with_retry(controlled_request, handler, context)
     terminal_message = response.result[-1] if response.result else None
     if len(response.result) != 1 or not isinstance(terminal_message, AIMessage):
         raise AgentExecutionFailed("model_response_invalid")
@@ -732,10 +793,13 @@ async def apply_model_policy(
     if not terminal_message.tool_calls:
         if _has_tool_signal(terminal_message):
             raise AgentExecutionFailed("terminal_tool_signal_invalid")
-        # Rewriting a complete hidden draft would add latency and create two
-        # conflicting answer authorities. Visible-Tool runs must choose either
-        # an external Tool or the Host-private no-argument finalizer signal.
-        raise AgentExecutionFailed("finalizer_signal_required")
+        if not _content_text(terminal_message.content).strip():
+            raise AgentExecutionFailed("finalizer_signal_required")
+        # Some providers do not honor required Tool choice and return a complete
+        # draft. It is only a private no-Tool decision: discard it at graph exit
+        # and use the one structurally Tool-free provider stream as the answer.
+        context.execution.after_model_response(response.result)
+        return response
 
     context.execution.after_model_response(response.result)
     return response
@@ -768,66 +832,78 @@ async def finalize_after_agent(state: AgentState[Any], runtime: Any) -> dict[str
     ai_index, decision_message = last_ai
     calls = cast(list[dict[str, Any]], decision_message.tool_calls)
     tool_messages = messages[ai_index + 1 :]
-    call_id_list = [call.get("id") for call in calls]
-    if (
-        not calls
-        or any(not isinstance(call_id, str) or not call_id for call_id in call_id_list)
-        or len(call_id_list) != len(set(call_id_list))
-        or len(tool_messages) != len(calls)
-        or any(not isinstance(message, ToolMessage) for message in tool_messages)
-    ):
-        raise AgentExecutionFailed("finalizer_exit_invalid")
-    call_ids = cast(set[str], set(call_id_list))
-    completed_tool_messages = cast(list[ToolMessage], tool_messages)
-    if {message.tool_call_id for message in completed_tool_messages} != call_ids or any(
-        message.status != "success" for message in completed_tool_messages
-    ):
-        raise AgentExecutionFailed("finalizer_exit_invalid")
-
-    control_calls = [call for call in calls if call.get("name") == _FINALIZE_CONTROL_TOOL_ID]
-    external_calls = [call for call in calls if call.get("name") != _FINALIZE_CONTROL_TOOL_ID]
-    terminal_external_batch = bool(external_calls) and all(
-        isinstance((tool_id := call.get("name")), str)
-        and tool_id in context.execution.visible_tool_ids
-        and context.execution.tool_registry.require(tool_id).terminal_after_success
-        for call in external_calls
-    )
-    if not control_calls:
+    if not calls:
         if (
-            not terminal_external_batch
+            tool_messages
+            or _has_tool_signal(decision_message)
+            or not _content_text(decision_message.content).strip()
             or context.completed_finalize_call_id is not None
             or context.pending_finalize_call_id is not None
         ):
             raise AgentExecutionFailed("finalizer_exit_invalid")
-        # A terminal-eligible Tool is only a routing opportunity, never proof
-        # that the user's requested fact set is complete. Ask the model to make
-        # an explicit Host completion declaration in a later decision round.
-        return {"jump_to": "model"}
-
-    if (
-        len(control_calls) != 1
-        or (external_calls and not terminal_external_batch)
-        or context.completed_finalize_call_id != control_calls[0].get("id")
-        or context.pending_finalize_call_id is not None
-    ):
-        raise AgentExecutionFailed("finalizer_exit_invalid")
-
-    # The Host-private control exchange carries no business fact. Strip its
-    # provider metadata and Tool result. Same-batch external Tool calls/results
-    # remain ordinary untrusted finalizer input, preserving their role boundary.
-    if external_calls:
-        external_ids = cast(set[str], {call.get("id") for call in external_calls})
-        sanitized_decision = AIMessage(
-            content="",
-            name=decision_message.name,
-            tool_calls=external_calls,
-        )
-        external_results = [
-            message for message in completed_tool_messages if message.tool_call_id in external_ids
-        ]
-        finalizer_messages = [*messages[:ai_index], sanitized_decision, *external_results]
-    else:
         finalizer_messages = messages[:ai_index]
+    else:
+        call_id_list = [call.get("id") for call in calls]
+        if (
+            any(not isinstance(call_id, str) or not call_id for call_id in call_id_list)
+            or len(call_id_list) != len(set(call_id_list))
+            or len(tool_messages) != len(calls)
+            or any(not isinstance(message, ToolMessage) for message in tool_messages)
+        ):
+            raise AgentExecutionFailed("finalizer_exit_invalid")
+        call_ids = cast(set[str], set(call_id_list))
+        completed_tool_messages = cast(list[ToolMessage], tool_messages)
+        if {message.tool_call_id for message in completed_tool_messages} != call_ids or any(
+            message.status != "success" for message in completed_tool_messages
+        ):
+            raise AgentExecutionFailed("finalizer_exit_invalid")
+
+        control_calls = [call for call in calls if call.get("name") == _FINALIZE_CONTROL_TOOL_ID]
+        external_calls = [call for call in calls if call.get("name") != _FINALIZE_CONTROL_TOOL_ID]
+        terminal_external_batch = bool(external_calls) and all(
+            isinstance((tool_id := call.get("name")), str)
+            and tool_id in context.execution.visible_tool_ids
+            and context.execution.tool_registry.require(tool_id).terminal_after_success
+            for call in external_calls
+        )
+        if not control_calls:
+            if (
+                not terminal_external_batch
+                or context.completed_finalize_call_id is not None
+                or context.pending_finalize_call_id is not None
+            ):
+                raise AgentExecutionFailed("finalizer_exit_invalid")
+            # A terminal-eligible Tool is only a routing opportunity, never proof
+            # that the user's requested fact set is complete. Ask the model to make
+            # an explicit Host completion declaration in a later decision round.
+            return {"jump_to": "model"}
+
+        if (
+            len(control_calls) != 1
+            or (external_calls and not terminal_external_batch)
+            or context.completed_finalize_call_id != control_calls[0].get("id")
+            or context.pending_finalize_call_id is not None
+        ):
+            raise AgentExecutionFailed("finalizer_exit_invalid")
+
+        # The Host-private control exchange carries no business fact. Strip its
+        # provider metadata and Tool result. Same-batch external Tool calls/results
+        # remain ordinary untrusted finalizer input, preserving their role boundary.
+        if external_calls:
+            external_ids = cast(set[str], {call.get("id") for call in external_calls})
+            sanitized_decision = AIMessage(
+                content="",
+                name=decision_message.name,
+                tool_calls=external_calls,
+            )
+            external_results = [
+                message
+                for message in completed_tool_messages
+                if message.tool_call_id in external_ids
+            ]
+            finalizer_messages = [*messages[:ai_index], sanitized_decision, *external_results]
+        else:
+            finalizer_messages = messages[:ai_index]
     context.execution.before_model_call()
     finalizer_request = context.finalizer_request.override(
         messages=cast(Any, finalizer_messages),
@@ -894,7 +970,7 @@ async def apply_tool_policy(
         tool_id=tool_id,
         arguments=arguments,
         handler=invoke,
-        emit=context.emit,
+        emit=lambda event: _emit_public_event(context, event),
     )
 
 

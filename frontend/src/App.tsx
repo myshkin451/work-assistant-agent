@@ -185,6 +185,7 @@ function applyEvent(projection: RunProjection, event: ProductEvent): RunProjecti
     const errorCode = event.data.error_code;
     return {
       ...next,
+      ...(terminalStatus === 'failed' ? { assistantText: '' } : {}),
       connection: 'closed',
       cancelling: false,
       ...(isRunFailureCode(errorCode) ? { failureCode: errorCode } : {}),
@@ -1410,8 +1411,9 @@ function friendlyRunError(failureCode: RunProjection['failureCode']) {
   if (failureCode === 'run_timeout') return '等待时间过长，这次回答没有完成。';
   if (failureCode === 'service_restarted') return '服务刚刚恢复，请重试这条消息。';
   if (failureCode === 'tool_not_allowed') return '当前请求暂时无法处理。';
-  if (failureCode === 'result_schema_invalid') return '这次回答不完整，未予展示。';
-  if (failureCode === 'source_validation_failed') return '来源未通过校验，这次回答未予展示。';
+  if (failureCode === 'result_schema_invalid' || failureCode === 'source_validation_failed') {
+    return '这次回答没有完成，请重试。';
+  }
   return '这次没有生成完整回答，请重试。';
 }
 

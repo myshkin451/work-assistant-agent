@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Protocol
+
+from openai import APIConnectionError
 
 from .agent_runtime import AgentResult, AgentRunner, ProductEvent, RuntimeFatalError
 from .execution_policy import (
@@ -24,6 +27,16 @@ from .schemas import (
     validate_runtime_event,
 )
 from .settings import Settings
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_exception_log_fields(exc: Exception) -> tuple[str, str]:
+    if isinstance(exc, APIConnectionError):
+        return "provider_connection", "APIConnectionError"
+    if isinstance(exc, RuntimeError):
+        return "runtime_error", "RuntimeError"
+    return "unexpected", "UnclassifiedError"
 
 
 class RepositoryCleanupTimeout(RuntimeError):
@@ -481,8 +494,17 @@ class RunService:
                     execution_outcome=outcome,
                 ),
             )
-        except Exception:
+        except Exception as exc:
             # Provider responses and exception text are intentionally not persisted.
+            error_category, exception_type = _safe_exception_log_fields(exc)
+            logger.warning(
+                "run_execution_failed",
+                extra={
+                    "run_id": run_id,
+                    "error_category": error_category,
+                    "exception_type": exception_type,
+                },
+            )
             outcome = execution.outcome(
                 status="failed",
                 stop_reason="agent_execution_failed",

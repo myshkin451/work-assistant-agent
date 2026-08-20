@@ -448,7 +448,7 @@ async def test_create_agent_hooks_share_visibility_budget_tool_and_result_kernel
     assert all(event.type == "message.delta" for event in events[3:])
     deltas = [cast(str, event.data["delta"]) for event in events if event.type == "message.delta"]
     assert len(deltas) >= 3
-    assert any(len(delta) == 64 for delta in deltas[1:])
+    assert all(len(delta) <= 24 for delta in deltas)
     assert False in model.stream_completion_at_delta
     assert model.stream_closed_at is not None
     assert model.public_delta_at[0] < model.stream_closed_at
@@ -536,9 +536,11 @@ async def test_terminal_tool_without_same_batch_control_returns_to_model_safely(
         "tool.finished",
         "source.added",
     ]
-    assert [event.data for event in events if event.type == "message.delta"] == [
-        {"delta": final_text}
-    ]
+    assert "".join(
+        cast(str, event.data["delta"])
+        for event in events
+        if event.type == "message.delta"
+    ) == final_text
     assert preamble not in final_text
     assert cast(AIMessage, state["messages"][-1]).content == final_text
     assert execution.usage().model_steps == 3
@@ -546,25 +548,27 @@ async def test_terminal_tool_without_same_batch_control_returns_to_model_safely(
     assert execution.usage().tool_calls_succeeded == 1
 
 
-async def test_visible_tool_run_rejects_a_complete_hidden_draft_without_control_signal() -> None:
+async def test_visible_tool_run_discards_no_tool_draft_and_streams_one_final_answer() -> None:
     hidden_draft = "COMPLETE_HIDDEN_DRAFT_MUST_NOT_BE_REWRITTEN"
-    model = ScriptedChatModel(responses=(AIMessage(content=hidden_draft),))
-    agent, execution, events, runtime_context, recursion_limit = _build_agent(
+    final_text = "这是另一次无 Tool 的真实流式生成。"
+    model = ScriptedChatModel(
+        responses=(AIMessage(content=hidden_draft),),
+        streamed_responses=((AIMessageChunk(content=final_text),),),
+    )
+
+    execution, events, state = await _invoke_agent(
         model=model,
         policy=NeutralAuthenticatedToolPolicy(),
     )
 
-    with pytest.raises(AgentExecutionFailed, match="finalizer_signal_required"):
-        await agent.ainvoke(
-            {"messages": [{"role": "user", "content": _message().content}]},
-            config={"recursion_limit": recursion_limit},
-            context=runtime_context,
-        )
-
-    assert execution.usage().model_steps == 1
-    assert model.streamed_received_messages == []
-    assert events == []
-    assert runtime_context.final_response_text is None
+    assert execution.usage().model_steps == 2
+    assert len(model.streamed_received_messages) == 1
+    assert hidden_draft not in repr(model.streamed_received_messages[0])
+    assert [event.data for event in events if event.type == "message.delta"] == [
+        {"delta": final_text}
+    ]
+    assert hidden_draft not in repr(events)
+    assert cast(AIMessage, state["messages"][-1]).content == final_text
 
 
 async def test_finalizer_control_signal_cannot_carry_hidden_answer_text() -> None:
@@ -626,17 +630,12 @@ async def test_repeated_finalizer_control_signal_fails_before_tool_execution() -
     assert runtime_context.final_response_text is None
 
 
-async def test_finalizer_flushes_a_short_live_buffer_on_time_before_provider_closes() -> None:
+async def test_finalizer_aggregates_slow_chinese_tokens_into_live_phrases() -> None:
+    final_text = "你好，欢迎使用。"
     model = ScriptedChatModel(
         responses=(AIMessage(content="", tool_calls=[_tool_call(), _finalizer_call()]),),
-        streamed_responses=(
-            (
-                AIMessageChunk(content="A"),
-                AIMessageChunk(content="b"),
-                AIMessageChunk(content="c"),
-            ),
-        ),
-        stream_chunk_delays=(0, 0, 0.3),
+        streamed_responses=(tuple(AIMessageChunk(content=char) for char in final_text),),
+        stream_chunk_delays=(0.03,) * len(final_text),
     )
 
     execution, events, state = await _invoke_agent(
@@ -645,15 +644,66 @@ async def test_finalizer_flushes_a_short_live_buffer_on_time_before_provider_clo
     )
 
     deltas = [cast(str, event.data["delta"]) for event in events if event.type == "message.delta"]
-    assert deltas == ["A", "b", "c"]
-    assert cast(AIMessage, state["messages"][-1]).content == "Abc"
-    assert len(model.stream_chunk_yielded_at) == 3
-    assert len(model.public_delta_at) == 3
-    assert 0.06 <= model.public_delta_at[1] - model.stream_chunk_yielded_at[1] < 0.25
-    assert model.public_delta_at[1] < model.stream_chunk_yielded_at[2]
+    assert deltas == ["你好，", "欢迎使用。"]
+    assert all(len(delta) >= 3 for delta in deltas)
+    assert "".join(deltas) == final_text
+    assert cast(AIMessage, state["messages"][-1]).content == final_text
+    assert len(model.stream_chunk_yielded_at) == len(final_text)
+    assert len(model.public_delta_at) == 2
     assert model.stream_closed_at is not None
-    assert model.public_delta_at[1] < model.stream_closed_at
+    assert model.public_delta_at[0] >= model.stream_chunk_yielded_at[2]
+    assert model.public_delta_at[0] > model.stream_chunk_yielded_at[1]
+    assert model.public_delta_at[0] < model.stream_closed_at
+    assert model.stream_completion_at_delta == [False, False]
     assert execution.usage().model_steps == 2
+
+
+async def test_finalizer_flushes_a_received_phrase_on_the_live_time_cap() -> None:
+    model = ScriptedChatModel(
+        responses=(AIMessage(content="", tool_calls=[_tool_call(), _finalizer_call()]),),
+        streamed_responses=(
+            (
+                AIMessageChunk(content="缓慢响应"),
+                AIMessageChunk(content="继续"),
+            ),
+        ),
+        stream_chunk_delays=(0, 0.3),
+    )
+
+    _, events, state = await _invoke_agent(
+        model=model,
+        policy=NeutralAuthenticatedToolPolicy(),
+    )
+
+    deltas = [cast(str, event.data["delta"]) for event in events if event.type == "message.delta"]
+    assert deltas == ["缓慢响应", "继续"]
+    assert "".join(deltas) == "缓慢响应继续"
+    assert cast(AIMessage, state["messages"][-1]).content == "缓慢响应继续"
+    assert 0.12 <= model.public_delta_at[0] - model.stream_chunk_yielded_at[0] < 0.28
+    assert model.public_delta_at[0] < model.stream_chunk_yielded_at[1]
+    assert model.stream_closed_at is not None
+    assert model.public_delta_at[0] < model.stream_closed_at
+
+
+async def test_finalizer_does_not_publish_one_or_two_slow_chinese_characters() -> None:
+    final_text = "你好，继续"
+    model = ScriptedChatModel(
+        responses=(AIMessage(content="", tool_calls=[_tool_call(), _finalizer_call()]),),
+        streamed_responses=(tuple(AIMessageChunk(content=char) for char in final_text),),
+        stream_chunk_delays=(0, 0, 0.3, 0, 0),
+    )
+
+    _, events, state = await _invoke_agent(
+        model=model,
+        policy=NeutralAuthenticatedToolPolicy(),
+    )
+
+    deltas = [cast(str, event.data["delta"]) for event in events if event.type == "message.delta"]
+    assert deltas == ["你好，", "继续"]
+    assert cast(AIMessage, state["messages"][-1]).content == final_text
+    assert model.public_delta_at[0] >= model.stream_chunk_yielded_at[2]
+    assert model.stream_closed_at is not None
+    assert model.public_delta_at[0] < model.stream_closed_at
 
 
 async def test_create_agent_rejects_blank_terminal_instead_of_reusing_tool_preamble() -> None:
@@ -728,9 +778,13 @@ async def test_finalizer_fails_closed_on_an_impossible_late_tool_chunk() -> None
         "tool.finished",
         "source.added",
     ]
-    assert [event.data for event in events if event.type == "message.delta"] == [
-        {"delta": public_prefix}
-    ]
+    published_prefix = "".join(
+        cast(str, event.data["delta"])
+        for event in events
+        if event.type == "message.delta"
+    )
+    assert published_prefix
+    assert public_prefix.startswith(published_prefix)
     assert private_tool_args not in repr([event.data for event in events])
     assert execution.usage().model_steps == 2
     assert runtime_context.final_response_text is None
@@ -1017,9 +1071,11 @@ async def test_mixed_terminal_and_nonterminal_tool_batch_returns_to_model() -> N
     assert len(model.streamed_received_messages) == 1
     assert sum(event.type == "tool.started" for event in events) == 2
     assert sum(event.type == "tool.finished" for event in events) == 2
-    assert [event.data for event in events if event.type == "message.delta"] == [
-        {"delta": final_text}
-    ]
+    assert "".join(
+        cast(str, event.data["delta"])
+        for event in events
+        if event.type == "message.delta"
+    ) == final_text
     assert cast(AIMessage, state["messages"][-1]).content == final_text
     assert execution.usage().model_steps == 3
     assert execution.usage().tool_calls_attempted == 2

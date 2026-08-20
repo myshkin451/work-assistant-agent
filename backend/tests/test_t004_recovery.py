@@ -6,8 +6,10 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any, cast, get_args
 
+import httpx
 import pytest
 from langchain_core.messages import AIMessage, ToolMessage
+from openai import APIConnectionError
 from policy_fixtures import (
     make_execution,
     make_execution_plan,
@@ -324,7 +326,10 @@ class RaisingRunner:
     ) -> AsyncIterator[ProductEvent | AgentResult]:
         del thread_id, run_id, messages, execution, built_context
         yield ProductEvent("message.delta", {"delta": "safe prefix"})
-        raise RuntimeError("provider-secret-sentinel")
+        raise APIConnectionError(
+            message="provider-secret-sentinel",
+            request=httpx.Request("POST", "https://provider.invalid"),
+        )
 
 
 class CumulativeDeltaOverflowRunner:
@@ -762,7 +767,9 @@ async def test_service_failures_are_bounded_contiguous_and_do_not_persist_except
     timeout_seconds: float,
     expected_code: str,
     expected_types: list[str],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level("WARNING", logger="work_assistant.service")
     repository = recovery_repository
     service = service_for(
         repository,
@@ -804,6 +811,15 @@ async def test_service_failures_are_bounded_contiguous_and_do_not_persist_except
         }
     )
     assert "provider-secret-sentinel" not in serialized
+    assert "provider-secret-sentinel" not in caplog.text
+    if expected_code == "agent_execution_failed":
+        record = next(
+            record for record in caplog.records if record.message == "run_execution_failed"
+        )
+        assert record.run_id == run.run_id
+        assert record.error_category == "provider_connection"
+        assert record.exception_type == "APIConnectionError"
+        assert record.exc_info is None
 
     await service.shutdown()
 

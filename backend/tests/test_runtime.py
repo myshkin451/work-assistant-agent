@@ -5,11 +5,13 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any, cast
 
+import httpx
 import pytest
 from langchain.agents.middleware import ModelRequest, ModelResponse
 from langchain.tools import tool
 from langchain_core.messages import AIMessage, AIMessageChunk, BaseMessage
 from langgraph.runtime import Runtime
+from openai import APIConnectionError
 from policy_fixtures import make_execution, make_settings
 
 from work_assistant.agent_runtime import (
@@ -199,6 +201,87 @@ async def test_model_hook_filters_tools_and_replaces_the_full_system_message() -
     assert model.model_kwargs == []
     assert model.received_messages == []
     assert emitted == []
+    assert execution.usage().model_steps == 1
+
+
+async def test_first_visible_tool_decision_retries_one_connection_error() -> None:
+    execution = make_execution(TEST_PRINCIPAL)
+    built = execution.build_context([message("Answer directly")])
+    emitted: list[ProductEvent] = []
+
+    async def emit(event: ProductEvent) -> None:
+        emitted.append(event)
+
+    context = DeepSeekRuntimeContext(execution=execution, built_context=built, emit=emit)
+    attempts = 0
+
+    async def handler(request: ModelRequest[Any]) -> ModelResponse[Any]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise APIConnectionError(request=httpx.Request("POST", "https://provider.invalid"))
+        return ModelResponse(
+            result=[
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        {
+                            "id": "visible-time",
+                            "name": "get_current_time",
+                            "args": {"timezone": "UTC"},
+                            "type": "tool_call",
+                        }
+                    ],
+                )
+            ]
+        )
+
+    request = ModelRequest(
+        model=cast(Any, ToolFreeStreamingModel()),
+        messages=[],
+        tools=[get_current_time, _request_final_answer],
+        runtime=Runtime(context=context),
+    )
+    await apply_model_policy.awrap_model_call(request, handler)
+
+    assert attempts == 2
+    assert context.first_decision_retry_used is True
+    assert execution.usage().model_steps == 2
+    assert execution.usage().tool_calls_attempted == 1
+    assert emitted == []
+
+
+async def test_connection_error_is_not_retried_after_a_public_event() -> None:
+    execution = make_execution(TEST_PRINCIPAL)
+    built = execution.build_context([message("Answer directly")])
+
+    async def emit(event: ProductEvent) -> None:
+        del event
+
+    context = DeepSeekRuntimeContext(
+        execution=execution,
+        built_context=built,
+        emit=emit,
+        public_events_emitted=1,
+    )
+    attempts = 0
+
+    async def handler(request: ModelRequest[Any]) -> ModelResponse[Any]:
+        nonlocal attempts
+        attempts += 1
+        raise APIConnectionError(request=httpx.Request("POST", "https://provider.invalid"))
+
+    request = ModelRequest(
+        model=cast(Any, ToolFreeStreamingModel()),
+        messages=[],
+        tools=[get_current_time, _request_final_answer],
+        runtime=Runtime(context=context),
+    )
+    with pytest.raises(APIConnectionError):
+        await apply_model_policy.awrap_model_call(request, handler)
+
+    assert attempts == 1
+    assert context.first_decision_retry_used is False
     assert execution.usage().model_steps == 1
 
 

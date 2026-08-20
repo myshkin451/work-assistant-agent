@@ -16,8 +16,11 @@ has a stable `/threads/{thread_id}` URL, a local blank draft is persisted only
 with its first valid question, and the owner can switch, rename, refresh, or use
 browser back/forward navigation. The model uses a read-only time Tool, emits
 validated answer deltas while the final response is being generated, and renders
-safe CommonMark/GFM. PostgreSQL preserves every turn and monotonic SSE sequence
-for reconnect, replay, cancellation, source validation, and failure recovery.
+safe CommonMark/GFM. Live text is coalesced into short provider-received phrases
+instead of repainting isolated Chinese characters; it is never reconstructed
+from a completed answer or a client-side typing animation. PostgreSQL preserves
+every turn and monotonic SSE sequence for reconnect, replay, cancellation,
+source validation, and failure recovery.
 
 ![T-008 live DeepSeek conversation workspace](output/playwright/t008/t008-deepseek-desktop.png)
 

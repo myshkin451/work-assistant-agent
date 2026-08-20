@@ -691,8 +691,8 @@ describe('employee chat vertical slice', () => {
       ['repeated_tool_call', '这次没有生成完整回答，请重试。'],
       ['no_progress', '这次没有生成完整回答，请重试。'],
       ['tool_not_allowed', '当前请求暂时无法处理。'],
-      ['result_schema_invalid', '这次回答不完整，未予展示。'],
-      ['source_validation_failed', '来源未通过校验，这次回答未予展示。'],
+      ['result_schema_invalid', '这次回答没有完成，请重试。'],
+      ['source_validation_failed', '这次回答没有完成，请重试。'],
     ];
     const messages: Message[] = [];
     const runs: RunSnapshot[] = [];
@@ -711,12 +711,13 @@ describe('employee chat vertical slice', () => {
             ...running,
             run_id: runId,
             status: 'failed',
-            last_seq: 2,
+            last_seq: 3,
             completed_at: timestamp,
           },
           [
             event(1, 'run.started', { status: 'running' }, runId),
-            event(2, 'run.failed', { status: 'failed', error_code: failureCode }, runId),
+            event(2, 'message.delta', { delta: `partial answer ${index}` }, runId),
+            event(3, 'run.failed', { status: 'failed', error_code: failureCode }, runId),
           ],
         ),
       );
@@ -744,6 +745,9 @@ describe('employee chat vertical slice', () => {
     for (const [message, count] of expectedCounts) {
       expect(await screen.findAllByText(message)).toHaveLength(count);
     }
+    cases.forEach((_, index) => {
+      expect(screen.queryByText(`partial answer ${index}`)).not.toBeInTheDocument();
+    });
     expect(screen.getAllByRole('button', { name: '重试' })).toHaveLength(cases.length);
   });
 

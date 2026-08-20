@@ -81,19 +81,28 @@ parsing, source registration, public Tool events, budget usage, and result
 validation are never skipped. Raw Tool text is finalizer input and never becomes
 answer text directly.
 
-For a direct answer while external Tools are visible, the model must select a
-Host-private, no-argument finalization signal instead of generating a complete
-hidden draft. That control signal is not an external capability, consumes no
-Tool-call budget, emits no Tool event, and carries no answer text. A direct
-hidden draft, repeated, argument-bearing, text-bearing, or invalidly mixed signal
-fails closed. If no external Tool is visible, the Host starts the structurally
-Tool-free answer stream immediately and does not perform a separate decision
-call.
+For a direct answer while external Tools are visible, the preferred model path
+selects a Host-private, no-argument finalization signal instead of generating a
+complete hidden draft. That control signal is not an external capability,
+consumes no Tool-call budget, emits no Tool event, and carries no answer text.
+If a provider ignores required Tool choice and returns one non-empty answer
+draft with no Tool signal, the Host treats it only as a private no-Tool decision,
+discards its text, and starts the same structurally Tool-free live finalizer at
+graph exit. Blank, repeated, argument-bearing, text-bearing, or invalidly mixed
+signals fail closed. If no external Tool is visible, the Host starts the
+structurally Tool-free answer stream immediately and does not perform a separate
+decision call.
 
 This capability decision can only add denials. The exact Thread owner and Run
 actor checks from the Principal/ownership contract remain a separate,
 non-replaceable authorization boundary. Roles, including an admin-shaped role,
 never grant cross-owner access.
+
+A downstream assembly may install one narrow `AgentRunner` decorator at
+application construction time for domain-specific result admission. The Host
+still owns execution, persistence, event validation, cancellation, ownership,
+and terminal commits; a decorator may only further reject or constrain Runtime
+items and cannot weaken the public policy ledger.
 
 ## Bounded execution
 
@@ -102,6 +111,11 @@ All adapters, including the deterministic Fake, use the same per-Run
 
 - A model step is counted before the provider handler. The attempt beyond the
   limit is rejected before provider execution.
+- A first decision that fails with a provider connection error may be retried
+  exactly once after a 150 ms bounded backoff, but only before any Tool attempt,
+  public Runtime event, or final answer exists. The retry consumes another model
+  step and remains inside the original Run deadline; later or ambiguous failures
+  are never replayed.
 - Tool calls in one model response reserve their attempt budget as one atomic
   batch before any Tool side effect. The batch is rejected if it exceeds the
   remaining limit.
