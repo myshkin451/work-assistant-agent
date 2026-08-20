@@ -136,7 +136,7 @@ def create_app(
 
     app = FastAPI(
         title="Work Assistant Agent API",
-        version="0.2.0",
+        version="0.2.1",
         lifespan=lifespan,
     )
 

@@ -212,11 +212,30 @@ async def test_idempotency_and_single_active_run_hold_under_concurrency(
     run_ids = {response.json()["run_id"] for response in responses}
     assert len(run_ids) == 1
 
+    # The idempotent Run above may legitimately finish before all 20 HTTP
+    # responses are collected. Create an unlaunched Run through the repository
+    # so the API conflict mapping is checked against a deterministically active
+    # product record instead of the fake runner's wall-clock timing.
+    conflict_thread = await create_thread(client, "Active Run conflict")
+    execution_plan = make_execution_plan(TEST_PRINCIPAL)
+    active_run, active_created = await app.state.repository.create_run(
+        principal=TEST_PRINCIPAL,
+        thread_id=conflict_thread,
+        message="Hold this Run active",
+        idempotency_key="active-winner",
+        execution_plan=execution_plan,
+    )
+    assert active_created is True
     conflict = await client.post(
-        f"/api/threads/{thread_id}/runs",
-        json={"message": "Try again", "idempotency_key": "different-request"},
+        f"/api/threads/{conflict_thread}/runs",
+        json={"message": "Try again", "idempotency_key": "active-loser"},
     )
     assert conflict.status_code == 409
+    await app.state.repository.cancel_run(
+        active_run.run_id,
+        principal=TEST_PRINCIPAL,
+        execution_outcome=terminal_outcome(TEST_PRINCIPAL, status="cancelled"),
+    )
     await client.post(f"/api/runs/{run_ids.pop()}/cancel")
 
     second_thread = await create_thread(client, "Concurrent conflict")
@@ -225,7 +244,6 @@ async def test_idempotency_and_single_active_run_hold_under_concurrency(
     # depend on whether the fake Run completed before slower CI requests arrived.
     # The API's 409 mapping is covered above; this phase isolates the repository's
     # atomic one-active-Run invariant under genuinely overlapping creation calls.
-    execution_plan = make_execution_plan(TEST_PRINCIPAL)
     contenders = await asyncio.gather(
         *(
             app.state.repository.create_run(
