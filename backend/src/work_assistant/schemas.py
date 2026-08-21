@@ -6,6 +6,9 @@ from typing import Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
+from .identity import PrincipalDisplayExtensions
+from .usage import RunUsage, UsageMetric, unavailable_run_usage
+
 RunStatus = Literal["created", "running", "completed", "failed", "cancelled"]
 MessageRole = Literal["user", "assistant"]
 RunFailureCode = Literal[
@@ -135,6 +138,9 @@ class RunView(BaseModel):
     last_seq: int
     created_at: datetime
     completed_at: datetime | None
+    usage: RunUsage = Field(
+        default_factory=lambda: unavailable_run_usage(state="unknown")
+    )
 
 
 class InitialRunResponse(BaseModel):
@@ -182,15 +188,18 @@ class MessageCompletedPayload(_StrictPayload):
 
 class RunCompletedPayload(_StrictPayload):
     status: Literal["completed"]
+    usage: RunUsage | None = None
 
 
 class RunFailedPayload(_StrictPayload):
     status: Literal["failed"]
     error_code: RunFailureCode
+    usage: RunUsage | None = None
 
 
 class RunCancelledPayload(_StrictPayload):
     status: Literal["cancelled"]
+    usage: RunUsage | None = None
 
 
 EVENT_PAYLOAD_MODELS: dict[str, type[_StrictPayload]] = {
@@ -214,6 +223,14 @@ def validate_product_event(event_type: str, data: dict[str, Any]) -> dict[str, A
         payload = payload_model.model_validate(data)
     except ValidationError as exc:
         raise ProductEventValidationError("invalid_product_event_payload") from exc
+    if event_type in {"run.completed", "run.failed", "run.cancelled"}:
+        # Current terminal events preserve the exact REST usage shape, including
+        # explicit nulls for fields the provider did not return. Legacy terminal
+        # events remain valid and simply omit the optional usage object.
+        terminal_payload = payload.model_dump(mode="json")
+        if terminal_payload.get("usage") is None:
+            terminal_payload.pop("usage", None)
+        return terminal_payload
     return payload.model_dump(mode="json", exclude_none=True)
 
 
@@ -235,6 +252,53 @@ def normalize_stored_product_event(event_type: str, data: dict[str, Any]) -> dic
 
 class ThreadList(BaseModel):
     items: list[ThreadSummary]
+
+
+UsageRange = Literal["7d", "30d", "all"]
+
+
+class AccountView(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    display_name: str = Field(min_length=1, max_length=200)
+    organization: str | None = Field(default=None, max_length=200)
+    extensions: PrincipalDisplayExtensions = Field(
+        default_factory=PrincipalDisplayExtensions
+    )
+
+
+class AccountUsageScope(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    range: UsageRange
+    from_at: datetime | None
+    to_at: datetime
+    thread_id: str | None
+
+
+class AccountRunCounts(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total: int = Field(ge=0)
+    completed: int = Field(ge=0)
+    failed: int = Field(ge=0)
+    cancelled: int = Field(ge=0)
+    active: int = Field(ge=0)
+
+
+class AccountUsageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    account: AccountView
+    scope: AccountUsageScope
+    runs: AccountRunCounts
+    model_calls: UsageMetric
+    retries: UsageMetric
+    input_tokens: UsageMetric
+    output_tokens: UsageMetric
+    cached_tokens: UsageMetric
+    reasoning_tokens: UsageMetric
+    total_tokens: UsageMetric
 
 
 class EventEnvelope(BaseModel):

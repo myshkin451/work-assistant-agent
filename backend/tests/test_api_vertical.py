@@ -283,6 +283,20 @@ async def test_cancel_is_terminal_and_late_agent_results_are_discarded(
     cancelled = await client.post(f"/api/runs/{run_id}/cancel")
     assert cancelled.status_code == 200
     assert cancelled.json()["status"] == "cancelled"
+    cancelled_usage = cancelled.json()["usage"]
+    assert cancelled_usage["state"] == "final"
+    assert cancelled_usage["model_call_count"] == 1
+    assert cancelled_usage["retry_count"] == 0
+    assert cancelled_usage["input_tokens"] == {
+        "value": 96,
+        "availability": "complete",
+    }
+    assert cancelled_usage["output_tokens"] == {
+        "value": 12,
+        "availability": "complete",
+    }
+    assert cancelled_usage["generation_duration_ms"] is None
+    assert cancelled_usage["error_category"] == "cancelled"
     await asyncio.sleep(0.25)
     await app.state.run_service.wait_for_idle()
 
@@ -292,12 +306,14 @@ async def test_cancel_is_terminal_and_late_agent_results_are_discarded(
     assert "message.completed" not in types
     assert "run.completed" not in types
     assert "run.failed" not in types
+    assert events[-1]["data"]["usage"] == cancelled_usage
 
     second_cancel = await client.post(f"/api/runs/{run_id}/cancel")
     assert second_cancel.json()["status"] == "cancelled"
     assert len(await read_events(client, run_id)) == len(events)
     snapshot = (await client.get(f"/api/threads/{thread_id}")).json()
     assert [message["role"] for message in snapshot["messages"]] == ["user"]
+    assert snapshot["runs"][0]["usage"] == cancelled_usage
 
 
 async def test_cancel_and_event_append_reserve_distinct_sequences(

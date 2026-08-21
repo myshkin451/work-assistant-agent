@@ -2,6 +2,8 @@ import {
   productEventTypes,
   type ProductEvent,
   type ProductEventType,
+  type AccountUsageRange,
+  type AccountUsageResponse,
   type InitialRunResponse,
   type RunView,
   type ThreadSnapshot,
@@ -55,6 +57,15 @@ function publicErrorMessage(status: number) {
 export const listThreads = async () => {
   const response = await requestJson<{ items: ThreadSummary[] }>('/api/threads');
   return response.items;
+};
+
+export const getAccountUsage = (
+  range: AccountUsageRange,
+  threadId?: string,
+) => {
+  const params = new URLSearchParams({ range });
+  if (threadId) params.set('thread_id', threadId);
+  return requestJson<AccountUsageResponse>(`/api/account/usage?${params.toString()}`);
 };
 
 export const createThread = (title?: string) =>

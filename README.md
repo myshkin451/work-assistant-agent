@@ -25,11 +25,23 @@ PostgreSQL preserves every turn and
 monotonic SSE sequence for reconnect, replay, cancellation, source validation,
 and failure recovery.
 
+Each new Run also records provider attempts, the Token fields the provider
+actually returned, first-visible/generation/total timing, and a bounded error
+category. Missing provider fields stay visibly unavailable, including across a
+retry. The current Principal can open **My usage** from the desktop sidebar or
+mobile drawer to see only their safe account display and owner-scoped aggregate.
+See the
+[`current account and provider usage contract`](docs/contracts/account-and-usage.md).
+
 ![T-008 live DeepSeek conversation workspace](output/playwright/t008/t008-deepseek-desktop.png)
 
-The screenshot above is a loopback-only browser E4 capture from the locked
-DeepSeek provider. Additional desktop scrolling and 390×844 mobile evidence is
-catalogued in [`output/playwright/README.md`](output/playwright/README.md).
+![T-010 owner-scoped account and usage view](output/playwright/t010/account-desktop-1440x900.png)
+
+The screenshots above are loopback-only browser captures. The conversation is
+from the locked DeepSeek provider; the account view shows only safe current-user
+facts and provider-reported usage. Additional desktop and 390×844 mobile
+evidence is catalogued in
+[`output/playwright/README.md`](output/playwright/README.md).
 
 ## Stack
 
@@ -102,6 +114,15 @@ For a live provider, add `--minimum-deltas 3` and use a redacted model label.
 The output contains only event counts, character counts, timings, booleans, and
 bounded identifiers; it never prints the prompt, answer, Tool result, or Secret.
 
+T-010 has a narrower live-provider lane that creates one owner-scoped Run,
+compares its terminal SSE usage with REST, idempotent replay, and the same
+Thread's account aggregate, and prints only Token counts, timings, availability,
+and bounded labels:
+
+```bash
+python3 scripts/t010_usage_smoke.py --model deepseek-v4-flash
+```
+
 For the two-Principal ownership lane, start an isolated Compose project with the
 development header provider and a deliberately slow fake Run so cancellation is
 observable, then run the bounded identity smoke:
@@ -169,6 +190,12 @@ Migration `0002_principal_ownership` requires a live database connection but an
 exclusive application downtime window. It preserves v0.2 rows under an
 unclaimable internal quarantine subject; it does not support offline `--sql`
 generation or a non-empty downgrade to the unauthenticated schema.
+
+Migration `0004_run_usage_metering` leaves every historical Run explicitly
+unmetered and adds an attempt ledger for new provider calls. Its downgrade takes
+an exclusive lock and refuses to discard any metering version or attempt row.
+Application rollback must therefore retain this evidence or use an explicit
+offline archival procedure; it must not silently drop usage facts.
 
 The phase-2 smoke uses one Thread for Shanghai, London, and New York, deliberately
 disconnects and resumes the first SSE stream, checks idempotent replay, and then

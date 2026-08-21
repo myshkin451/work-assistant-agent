@@ -1,4 +1,4 @@
-# Principal and ownership contract v0.3
+# Principal and ownership contract v0.4
 
 This contract defines the public core's identity seam and subject-scoped product
 ownership. It is deliberately neutral: authentication credentials, login UI,
@@ -22,6 +22,14 @@ Optional display, organization, role, and session metadata may be supplied by a
 downstream provider, but T-005 does not interpret it for authorization. A
 Principal never contains a password, bearer token, cookie, API key, or raw
 provider assertion.
+
+T-010 adds a separate safe account projection. It may expose only normalized
+`display_name`, optional `organization`, and the strict display extensions
+`session_expires_at` and `permission_summary`. The projection is constructed
+field by field; it never serializes Principal `subject`, roles, or `session_id`.
+The optional extensions are display facts supplied by a neutral downstream
+adapter and never grant ownership or capabilities. Built-in providers leave
+them empty, and the public core has no company-session implementation.
 
 The Agent capability policy introduced by T-006 is a separate narrowing filter.
 It may deny a Tool for the current Principal, but it cannot grant Thread/Run
@@ -69,6 +77,10 @@ production identity system.
   is inherited from those parent records.
 - Public Thread, Run, Message, Event, REST, and SSE representations do not expose
   owner or actor subjects.
+- Current-account aggregation filters both Thread owner and Run actor in SQL.
+  A foreign and an absent optional Thread scope both return
+  `404 usage_scope_not_found`, so the aggregate cannot reveal another subject's
+  resource existence or usage.
 - The default ownership authorizer accepts only exact subject equality. Reserved
   internal subjects are denied to every Principal. There is no admin, role,
   wildcard, sharing, delegation, transfer, or claim bypass in this contract.

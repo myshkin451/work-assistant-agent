@@ -49,6 +49,23 @@ from work_assistant.service import RunService
 TEST_PRINCIPAL = Principal(subject="neutral-test-principal")
 
 
+def assert_metered_failure_event(
+    data: dict[str, Any],
+    *,
+    error_code: str,
+) -> None:
+    assert set(data) == {"status", "error_code", "usage"}
+    assert data["status"] == "failed"
+    assert data["error_code"] == error_code
+    usage = data["usage"]
+    assert isinstance(usage, dict)
+    assert usage["schema_version"] == "1.0.0"
+    assert usage["state"] == "final"
+    assert usage["model_call_count"] == 0
+    assert usage["retry_count"] == 0
+    assert usage["error_category"] is not None
+
+
 @pytest.fixture
 async def recovery_repository(tmp_path: Path) -> AsyncIterator[ProductRepository]:
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 't004-recovery.db'}")
@@ -555,10 +572,7 @@ async def test_invalid_runtime_events_fail_without_persisting_or_skipping_sequen
     assert failed.last_seq == 2
     assert [event.seq for event in events] == [1, 2]
     assert [event.type for event in events] == ["run.started", "run.failed"]
-    assert events[-1].data == {
-        "status": "failed",
-        "error_code": expected_code,
-    }
+    assert_metered_failure_event(events[-1].data, error_code=expected_code)
     plan, outcome = await repository.get_run_evidence(
         run.run_id,
         principal=TEST_PRINCIPAL,
@@ -792,7 +806,7 @@ async def test_service_failures_are_bounded_contiguous_and_do_not_persist_except
     assert failed.status == "failed"
     assert [event.seq for event in events] == list(range(1, len(events) + 1))
     assert [event.type for event in events] == expected_types
-    assert events[-1].data == {"status": "failed", "error_code": expected_code}
+    assert_metered_failure_event(events[-1].data, error_code=expected_code)
     plan, outcome = await repository.get_run_evidence(
         run.run_id,
         principal=TEST_PRINCIPAL,
@@ -894,10 +908,10 @@ async def test_invalid_stream_results_fail_stably_without_assistant_commit(
         "run.failed",
     ]
     assert events[1].data == {"delta": "safe prefix"}
-    assert events[-1].data == {
-        "status": "failed",
-        "error_code": "result_schema_invalid",
-    }
+    assert_metered_failure_event(
+        events[-1].data,
+        error_code="result_schema_invalid",
+    )
     assert "message.completed" not in {event.type for event in events}
     assert "run.completed" not in {event.type for event in events}
 
@@ -939,10 +953,10 @@ async def test_terminal_result_without_live_deltas_fails_instead_of_being_chunke
     assert failed.status == "failed"
     events = await repository.get_events(run.run_id, 0, principal=TEST_PRINCIPAL)
     assert [event.type for event in events] == ["run.started", "run.failed"]
-    assert events[-1].data == {
-        "status": "failed",
-        "error_code": "result_schema_invalid",
-    }
+    assert_metered_failure_event(
+        events[-1].data,
+        error_code="result_schema_invalid",
+    )
     snapshot = await repository.get_thread(thread.thread_id, principal=TEST_PRINCIPAL)
     assert [message.role for message in snapshot.messages] == ["user"]
 
@@ -1096,10 +1110,10 @@ async def test_orphan_sweep_is_idempotent_preserves_terminals_and_allows_new_run
         assert orphan.status == "failed"
         assert [event.seq for event in events] == list(range(1, orphan.last_seq + 1))
         assert events[-1].type == "run.failed"
-        assert events[-1].data == {
-            "status": "failed",
-            "error_code": "service_restarted",
-        }
+        assert_metered_failure_event(
+            events[-1].data,
+            error_code="service_restarted",
+        )
         plan, outcome = await repository.get_run_evidence(
             orphan_id,
             principal=TEST_PRINCIPAL,
@@ -1126,10 +1140,10 @@ async def test_orphan_sweep_is_idempotent_preserves_terminals_and_allows_new_run
     )
     assert legacy.status == "failed"
     assert [event.type for event in legacy_events] == ["run.failed"]
-    assert legacy_events[0].data == {
-        "status": "failed",
-        "error_code": "service_restarted",
-    }
+    assert_metered_failure_event(
+        legacy_events[0].data,
+        error_code="service_restarted",
+    )
     assert await repository.get_run_evidence(
         legacy_orphan.run_id,
         principal=TEST_PRINCIPAL,
@@ -1382,6 +1396,7 @@ async def test_v01_result_missing_is_normalized_only_for_stored_event_reads(
         stored_run = await session.get(RunRecord, run.run_id)
         assert stored_run is not None
         stored_run.status = "failed"
+        stored_run.metering_version = None
         stored_run.last_seq = 2
         stored_run.completed_at = now
         session.add(

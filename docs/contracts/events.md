@@ -1,4 +1,4 @@
-# Product API and event contract v0.5
+# Product API and event contract v0.6
 
 The frontend uses the product contract below. It does not consume raw model,
 LangChain, LangGraph, or provider events.
@@ -17,6 +17,7 @@ ownership rules in
 - `POST /api/threads/{thread_id}/runs`
 - `GET /api/runs/{run_id}/events?after_seq={last_seen_seq}`
 - `POST /api/runs/{run_id}/cancel`
+- `GET /api/account/usage?range={7d|30d|all}&thread_id={optional}`
 
 Run creation accepts a user message and an idempotency key. Reusing the same
 key in one thread returns the existing Run. A different key while that thread
@@ -49,6 +50,7 @@ type RunView = {
   last_seq: number;
   created_at: string;
   completed_at: string | null;
+  usage: RunUsage;
 };
 
 type InitialRunResponse = {
@@ -88,6 +90,11 @@ type ThreadSnapshot = ThreadSummary & {
 };
 ```
 
+`RunUsage`, its explicit availability states, provider-attempt semantics, timing
+boundaries, and current-account response are defined in
+[`account-and-usage.md`](account-and-usage.md). Missing provider fields remain
+explicit `null / unavailable`; they are never inferred from another metric.
+
 `runs` is ordered by creation time. Each entry includes all persisted product
 events for that Run in ascending `seq` order, including its terminal event.
 Clients rebuild historical Tool, source, message, failure, and cancellation
@@ -115,6 +122,10 @@ Request and response bodies:
   `{ "message": string, "idempotency_key": string }` and returns `RunView`.
 - `POST /api/runs/{run_id}/cancel` returns the current `RunView` after recording
   the cancellation request or terminal cancellation.
+- `GET /api/account/usage` returns only the current Principal's safe display
+  projection and owner-filtered aggregate for a fixed `7d`, `30d`, or `all`
+  range. An optional foreign or absent Thread scope returns the same
+  `404 usage_scope_not_found` response.
 
 Thread creation, initial Run, rename, and ordinary Run bodies are strict. Unknown
 fields, including a client-supplied Agent ID, budget, Principal role, or Tool
@@ -196,9 +207,15 @@ Initial public event data:
 - `message.delta`: `{ "delta": string }`
 - `source.added`: `{ "source_id", "label", "description" }`
 - `message.completed`: `{ "message": Message }`
-- `run.completed`: `{ "status": "completed" }`
-- `run.failed`: `{ "status": "failed", "error_code": RunFailureCode }`
-- `run.cancelled`: `{ "status": "cancelled" }`
+- `run.completed`: `{ "status": "completed", "usage": RunUsage? }`
+- `run.failed`: `{ "status": "failed", "error_code": RunFailureCode, "usage": RunUsage? }`
+- `run.cancelled`: `{ "status": "cancelled", "usage": RunUsage? }`
+
+New metered Runs always persist the same final normalized `usage` in their
+terminal SSE event and REST `RunView`, including explicit null values. The field
+is optional only so historical stored terminal events remain readable. Replay
+does not recompute or increment it, and no non-terminal event contains attempt
+or Token details.
 
 The public failure codes are:
 

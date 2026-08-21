@@ -13,6 +13,21 @@ import type {
 } from './types';
 
 const timestamp = '2026-08-12T12:00:00Z';
+const pendingUsage: RunView['usage'] = {
+  schema_version: null,
+  state: 'pending',
+  model_call_count: null,
+  retry_count: null,
+  input_tokens: { value: null, availability: 'pending' },
+  output_tokens: { value: null, availability: 'pending' },
+  cached_tokens: { value: null, availability: 'pending' },
+  reasoning_tokens: { value: null, availability: 'pending' },
+  total_tokens: { value: null, availability: 'pending' },
+  time_to_first_visible_ms: null,
+  generation_duration_ms: null,
+  run_duration_ms: null,
+  error_category: null,
+};
 
 function jsonResponse(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -72,6 +87,7 @@ const running: RunView = {
   last_seq: 0,
   created_at: timestamp,
   completed_at: null,
+  usage: pendingUsage,
 };
 
 const userMessage = {

@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import unicodedata
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import uuid4
 
-from sqlalchemy import Select, or_, select, update
+from sqlalchemy import Select, case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -19,8 +19,19 @@ from .execution_policy import (
     validate_execution_plan,
 )
 from .identity import INTERNAL_SUBJECT_PREFIX, Principal
-from .models import EventRecord, MessageRecord, RunRecord, ThreadRecord, utc_now
+from .models import (
+    EventRecord,
+    MessageRecord,
+    ModelAttemptRecord,
+    RunRecord,
+    ThreadRecord,
+    utc_now,
+)
 from .schemas import (
+    AccountRunCounts,
+    AccountUsageResponse,
+    AccountUsageScope,
+    AccountView,
     EventEnvelope,
     Message,
     MessageRole,
@@ -32,9 +43,22 @@ from .schemas import (
     RunView,
     ThreadSnapshot,
     ThreadSummary,
+    UsageRange,
     normalize_stored_product_event,
     validate_product_event,
     validate_runtime_event,
+)
+from .usage import (
+    METERING_SCHEMA_VERSION,
+    ModelAttemptFinish,
+    ModelAttemptStart,
+    ModelAttemptUsage,
+    RunErrorCategory,
+    RunUsage,
+    UsageMeteringError,
+    UsageMetric,
+    aggregate_usage_metrics,
+    unavailable_run_usage,
 )
 
 ACTIVE_STATUSES = ("created", "running")
@@ -110,6 +134,17 @@ def _message_view(record: MessageRecord) -> Message:
 
 
 def _run_view(record: RunRecord) -> RunView:
+    if record.metering_version is None:
+        usage = unavailable_run_usage(state="unknown")
+    elif record.usage_metrics is None:
+        if record.status not in ACTIVE_STATUSES:
+            raise UsageMeteringError("terminal_run_usage_missing")
+        usage = unavailable_run_usage(state="pending")
+    else:
+        try:
+            usage = RunUsage.model_validate(record.usage_metrics)
+        except ValueError as exc:
+            raise UsageMeteringError("run_usage_invalid") from exc
     return RunView(
         run_id=record.id,
         thread_id=record.thread_id,
@@ -117,6 +152,7 @@ def _run_view(record: RunRecord) -> RunView:
         last_seq=record.last_seq,
         created_at=_aware(record.created_at),
         completed_at=_aware(record.completed_at) if record.completed_at else None,
+        usage=usage,
     )
 
 
@@ -134,6 +170,72 @@ def _event_view(record: EventRecord) -> EventEnvelope:
 
 def _run_snapshot(record: RunRecord, events: list[EventEnvelope]) -> RunSnapshot:
     return RunSnapshot(**_run_view(record).model_dump(), events=events)
+
+
+def _elapsed_ms(start: datetime, end: datetime | None) -> int | None:
+    if end is None:
+        return None
+    return max(0, int((_aware(end) - _aware(start)).total_seconds() * 1_000))
+
+
+def _attempt_token_metric(
+    attempts: list[ModelAttemptRecord], field_name: str
+) -> UsageMetric:
+    if not attempts:
+        return UsageMetric(value=0, availability="complete")
+    values = [cast(int | None, getattr(attempt, field_name)) for attempt in attempts]
+    known = [value for value in values if value is not None]
+    if len(known) == len(values):
+        return UsageMetric(value=sum(known), availability="complete")
+    if known:
+        return UsageMetric(value=None, availability="partial")
+    return UsageMetric(value=None, availability="unavailable")
+
+
+def _terminal_run_usage(
+    run: RunRecord,
+    attempts: list[ModelAttemptRecord],
+    *,
+    completed_at: datetime,
+    error_category: RunErrorCategory | None,
+) -> RunUsage:
+    answer_attempts = [
+        attempt for attempt in attempts if attempt.call_kind in {"direct", "finalizer"}
+    ]
+    generation_duration_ms: int | None = None
+    if (
+        len(answer_attempts) == 1
+        and answer_attempts[0].status == "succeeded"
+        and answer_attempts[0].completed_at is not None
+    ):
+        generation_duration_ms = _elapsed_ms(
+            answer_attempts[0].started_at,
+            answer_attempts[0].completed_at,
+        )
+    return RunUsage(
+        schema_version=METERING_SCHEMA_VERSION,
+        state="final",
+        model_call_count=len(attempts),
+        retry_count=sum(attempt.attempt_index > 1 for attempt in attempts),
+        input_tokens=_attempt_token_metric(attempts, "input_tokens"),
+        output_tokens=_attempt_token_metric(attempts, "output_tokens"),
+        cached_tokens=_attempt_token_metric(attempts, "cached_tokens"),
+        reasoning_tokens=_attempt_token_metric(attempts, "reasoning_tokens"),
+        total_tokens=_attempt_token_metric(attempts, "total_tokens"),
+        time_to_first_visible_ms=_elapsed_ms(run.created_at, run.first_visible_at),
+        generation_duration_ms=generation_duration_ms,
+        run_duration_ms=_elapsed_ms(run.created_at, completed_at),
+        error_category=error_category,
+    )
+
+
+def _usage_count_metric(usage: RunUsage, field_name: str) -> UsageMetric:
+    if usage.state == "final":
+        value = cast(int | None, getattr(usage, field_name))
+        if value is None:
+            raise UsageMeteringError("final_usage_count_missing")
+        return UsageMetric(value=value, availability="complete")
+    return UsageMetric(value=None, availability=usage.state)
 
 
 class ProductRepository:
@@ -204,6 +306,9 @@ class ProductRepository:
             last_seq=0,
             execution_plan=validated_plan,
             execution_outcome=None,
+            metering_version=METERING_SCHEMA_VERSION,
+            first_visible_at=None,
+            usage_metrics=None,
             created_at=now,
         )
         user_message = MessageRecord(
@@ -288,6 +393,89 @@ class ProductRepository:
                 )
             ).all()
         return [_thread_summary(record) for record in records]
+
+    async def get_account_usage(
+        self,
+        *,
+        principal: Principal,
+        usage_range: UsageRange,
+        thread_id: str | None,
+    ) -> AccountUsageResponse:
+        """Read only the current Principal's aggregate product facts."""
+
+        self._require_available()
+        now = utc_now()
+        cutoff = {
+            "7d": now - timedelta(days=7),
+            "30d": now - timedelta(days=30),
+            "all": None,
+        }[usage_range]
+        async with self._sessions() as session:
+            if thread_id is not None:
+                owned_thread = await session.scalar(
+                    select(ThreadRecord.id).where(
+                        ThreadRecord.id == thread_id,
+                        ThreadRecord.owner_subject == principal.subject,
+                    )
+                )
+                if owned_thread is None:
+                    # Foreign and absent scopes deliberately share one response.
+                    raise ResourceNotFoundError("usage_scope")
+            conditions = [
+                ThreadRecord.owner_subject == principal.subject,
+                RunRecord.actor_subject == principal.subject,
+                RunRecord.created_at <= now,
+            ]
+            if cutoff is not None:
+                conditions.append(RunRecord.created_at >= cutoff)
+            if thread_id is not None:
+                conditions.append(RunRecord.thread_id == thread_id)
+            records = list(
+                (
+                    await session.scalars(
+                        select(RunRecord)
+                        .join(ThreadRecord, ThreadRecord.id == RunRecord.thread_id)
+                        .where(*conditions)
+                        .order_by(RunRecord.created_at, RunRecord.id)
+                    )
+                ).all()
+            )
+
+        usages = [_run_view(record).usage for record in records]
+        statuses = [record.status for record in records]
+        return AccountUsageResponse(
+            account=AccountView(
+                display_name=(principal.display_name or "当前用户"),
+                organization=principal.organization,
+                extensions=principal.display_extensions,
+            ),
+            scope=AccountUsageScope(
+                range=usage_range,
+                from_at=cutoff,
+                to_at=now,
+                thread_id=thread_id,
+            ),
+            runs=AccountRunCounts(
+                total=len(records),
+                completed=statuses.count("completed"),
+                failed=statuses.count("failed"),
+                cancelled=statuses.count("cancelled"),
+                active=sum(status in ACTIVE_STATUSES for status in statuses),
+            ),
+            model_calls=aggregate_usage_metrics(
+                _usage_count_metric(usage, "model_call_count") for usage in usages
+            ),
+            retries=aggregate_usage_metrics(
+                _usage_count_metric(usage, "retry_count") for usage in usages
+            ),
+            input_tokens=aggregate_usage_metrics(usage.input_tokens for usage in usages),
+            output_tokens=aggregate_usage_metrics(usage.output_tokens for usage in usages),
+            cached_tokens=aggregate_usage_metrics(usage.cached_tokens for usage in usages),
+            reasoning_tokens=aggregate_usage_metrics(
+                usage.reasoning_tokens for usage in usages
+            ),
+            total_tokens=aggregate_usage_metrics(usage.total_tokens for usage in usages),
+        )
 
     async def _resolve_initial_run_replay(
         self,
@@ -395,6 +583,9 @@ class ProductRepository:
             last_seq=0,
             execution_plan=validated_plan,
             execution_outcome=None,
+            metering_version=METERING_SCHEMA_VERSION,
+            first_visible_at=None,
+            usage_metrics=None,
             created_at=utc_now(),
         )
         user_message = MessageRecord(
@@ -540,16 +731,193 @@ class ProductRepository:
             session.add(self._event_record(run, "run.started", {"status": "running"}))
         return True
 
+    async def start_model_attempt(self, run_id: str, start: ModelAttemptStart) -> None:
+        """Persist the auditable attempt before crossing the provider boundary."""
+
+        self._require_available()
+        async with self._sessions() as session, session.begin():
+            run = await session.scalar(
+                select(RunRecord).where(RunRecord.id == run_id).with_for_update()
+            )
+            if run is None:
+                raise ResourceNotFoundError("run")
+            await self._require_internal_run_consistency(session, run)
+            if run.status != "running" or run.metering_version != METERING_SCHEMA_VERSION:
+                raise UsageMeteringError("model_attempt_run_not_meterable")
+            existing = await session.scalar(
+                select(ModelAttemptRecord).where(
+                    or_(
+                        ModelAttemptRecord.id == start.attempt_id,
+                        (
+                            (ModelAttemptRecord.run_id == run_id)
+                            & (ModelAttemptRecord.call_index == start.call_index)
+                            & (ModelAttemptRecord.attempt_index == start.attempt_index)
+                        ),
+                    )
+                )
+            )
+            if existing is not None:
+                if (
+                    existing.id == start.attempt_id
+                    and existing.run_id == run_id
+                    and existing.call_index == start.call_index
+                    and existing.attempt_index == start.attempt_index
+                    and existing.call_kind == start.call_kind
+                    and existing.status == "started"
+                ):
+                    return
+                raise UsageMeteringError("model_attempt_start_conflict")
+            session.add(
+                ModelAttemptRecord(
+                    id=start.attempt_id,
+                    run_id=run_id,
+                    thread_id=run.thread_id,
+                    call_index=start.call_index,
+                    attempt_index=start.attempt_index,
+                    call_kind=start.call_kind,
+                    status="started",
+                    started_at=utc_now(),
+                )
+            )
+
+    async def finish_model_attempt(self, run_id: str, finish: ModelAttemptFinish) -> bool:
+        """Close one attempt once; a winning Run terminal prevents late mutation."""
+
+        self._require_available()
+        usage = finish.usage
+        token_values = {
+            "input_tokens": usage.input_tokens if usage is not None else None,
+            "output_tokens": usage.output_tokens if usage is not None else None,
+            "cached_tokens": usage.cached_tokens if usage is not None else None,
+            "reasoning_tokens": usage.reasoning_tokens if usage is not None else None,
+            "total_tokens": usage.total_tokens if usage is not None else None,
+        }
+        async with self._sessions() as session, session.begin():
+            run = await session.scalar(
+                select(RunRecord).where(RunRecord.id == run_id).with_for_update()
+            )
+            if run is None:
+                raise ResourceNotFoundError("run")
+            await self._require_internal_run_consistency(session, run)
+            attempt = await session.get(ModelAttemptRecord, finish.attempt_id)
+            if attempt is None or attempt.run_id != run_id:
+                raise UsageMeteringError("model_attempt_finish_unknown")
+            if run.status not in ACTIVE_STATUSES:
+                return False
+            if attempt.status != "started":
+                if attempt.status == finish.status and all(
+                    getattr(attempt, field_name) == value
+                    for field_name, value in token_values.items()
+                ):
+                    return True
+                raise UsageMeteringError("model_attempt_finish_conflict")
+            attempt.status = finish.status
+            attempt.completed_at = utc_now()
+            for field_name, value in token_values.items():
+                setattr(attempt, field_name, value)
+        return True
+
+    async def record_model_attempt_usage(
+        self,
+        run_id: str,
+        observed: ModelAttemptUsage,
+    ) -> bool:
+        """Persist an observed terminal usage object before Run cancellation."""
+
+        self._require_available()
+        usage = observed.usage
+        token_values = {
+            "input_tokens": usage.input_tokens,
+            "output_tokens": usage.output_tokens,
+            "cached_tokens": usage.cached_tokens,
+            "reasoning_tokens": usage.reasoning_tokens,
+            "total_tokens": usage.total_tokens,
+        }
+        async with self._sessions() as session, session.begin():
+            run = await session.scalar(
+                select(RunRecord).where(RunRecord.id == run_id).with_for_update()
+            )
+            if run is None:
+                raise ResourceNotFoundError("run")
+            await self._require_internal_run_consistency(session, run)
+            attempt = await session.get(ModelAttemptRecord, observed.attempt_id)
+            if attempt is None or attempt.run_id != run_id:
+                raise UsageMeteringError("model_attempt_usage_unknown")
+            if run.status not in ACTIVE_STATUSES:
+                return False
+            existing = {
+                field_name: getattr(attempt, field_name)
+                for field_name in token_values
+            }
+            if any(value is not None for value in existing.values()):
+                if existing == token_values:
+                    return True
+                raise UsageMeteringError("model_attempt_usage_conflict")
+            if attempt.status != "started":
+                raise UsageMeteringError("model_attempt_usage_terminal")
+            for field_name, value in token_values.items():
+                setattr(attempt, field_name, value)
+        return True
+
+    async def _write_terminal_usage(
+        self,
+        session: AsyncSession,
+        run: RunRecord,
+        *,
+        completed_at: datetime,
+        open_attempt_status: str,
+        error_category: RunErrorCategory | None,
+    ) -> None:
+        if run.metering_version is None:
+            return
+        if run.metering_version != METERING_SCHEMA_VERSION:
+            raise UsageMeteringError("run_metering_version_unsupported")
+        await session.execute(
+            update(ModelAttemptRecord)
+            .where(
+                ModelAttemptRecord.run_id == run.id,
+                ModelAttemptRecord.status == "started",
+            )
+            .values(status=open_attempt_status, completed_at=completed_at)
+        )
+        attempts = list(
+            (
+                await session.scalars(
+                    select(ModelAttemptRecord)
+                    .where(ModelAttemptRecord.run_id == run.id)
+                    .order_by(
+                        ModelAttemptRecord.call_index,
+                        ModelAttemptRecord.attempt_index,
+                    )
+                )
+            ).all()
+        )
+        run.usage_metrics = _terminal_run_usage(
+            run,
+            attempts,
+            completed_at=completed_at,
+            error_category=error_category,
+        ).model_dump(mode="json")
+
     async def append_active_event(
         self, run_id: str, event_type: RuntimeEventType, data: dict[str, Any]
     ) -> EventEnvelope | None:
         self._require_available()
         event_type, validated = validate_runtime_event(event_type, data)
+        now = utc_now()
+        values: dict[str, Any] = {"last_seq": RunRecord.last_seq + 1}
+        if event_type == "message.delta":
+            # The atomic CASE makes the first persisted public delta the only
+            # clock writer. SSE replay never touches this product-visible fact.
+            values["first_visible_at"] = case(
+                (RunRecord.first_visible_at.is_(None), now),
+                else_=RunRecord.first_visible_at,
+            )
         async with self._sessions() as session, session.begin():
             run = await session.scalar(
                 update(RunRecord)
                 .where(RunRecord.id == run_id, RunRecord.status == "running")
-                .values(last_seq=RunRecord.last_seq + 1)
+                .values(**values)
                 .returning(RunRecord)
             )
             if run is None:
@@ -557,7 +925,7 @@ class ProductRepository:
                     raise ResourceNotFoundError("run")
                 return None
             await self._require_internal_run_consistency(session, run)
-            event = self._event_record(run, event_type, validated)
+            event = self._event_record(run, event_type, validated, occurred_at=now)
             session.add(event)
         return _event_view(event)
 
@@ -567,6 +935,7 @@ class ProductRepository:
         content: str,
         *,
         execution_outcome: ExecutionOutcomeEvidence,
+        error_category: RunErrorCategory | None = None,
     ) -> RunView:
         self._require_available()
         validated_outcome = _validated_terminal_outcome(
@@ -591,6 +960,14 @@ class ProductRepository:
                 if existing is None:
                     raise ResourceNotFoundError("run")
                 return _run_view(existing)
+            await self._write_terminal_usage(
+                session,
+                run,
+                completed_at=now,
+                open_attempt_status="interrupted",
+                error_category=error_category,
+            )
+            terminal_usage = _run_view(run).usage.model_dump(mode="json")
             thread = await self._require_internal_run_consistency(session, run)
             message = MessageRecord(
                 id=str(uuid4()),
@@ -615,7 +992,7 @@ class ProductRepository:
                 self._event_record(
                     run,
                     "run.completed",
-                    {"status": "completed"},
+                    {"status": "completed", "usage": terminal_usage},
                     occurred_at=now,
                 )
             )
@@ -628,6 +1005,7 @@ class ProductRepository:
         error_code: RunFailureCode,
         *,
         execution_outcome: ExecutionOutcomeEvidence,
+        error_category: RunErrorCategory = "internal",
     ) -> RunView:
         self._require_available()
         validated_outcome = _validated_terminal_outcome(
@@ -653,12 +1031,24 @@ class ProductRepository:
                 if existing is None:
                     raise ResourceNotFoundError("run")
                 return _run_view(existing)
+            await self._write_terminal_usage(
+                session,
+                run,
+                completed_at=now,
+                open_attempt_status="failed",
+                error_category=error_category,
+            )
+            terminal_usage = _run_view(run).usage.model_dump(mode="json")
             thread = await self._require_internal_run_consistency(session, run)
             session.add(
                 self._event_record(
                     run,
                     "run.failed",
-                    {"status": "failed", "error_code": error_code},
+                    {
+                        "status": "failed",
+                        "error_code": error_code,
+                        "usage": terminal_usage,
+                    },
                     occurred_at=now,
                 )
             )
@@ -671,6 +1061,7 @@ class ProductRepository:
         *,
         principal: Principal,
         execution_outcome: ExecutionOutcomeEvidence,
+        error_category: RunErrorCategory = "cancelled",
     ) -> RunView:
         self._require_available()
         validated_outcome = _validated_terminal_outcome(
@@ -717,11 +1108,19 @@ class ProductRepository:
                 if current is None:
                     raise ResourceNotFoundError("run")
                 return _run_view(current)
+            await self._write_terminal_usage(
+                session,
+                run,
+                completed_at=now,
+                open_attempt_status="cancelled",
+                error_category=error_category,
+            )
+            terminal_usage = _run_view(run).usage.model_dump(mode="json")
             session.add(
                 self._event_record(
                     run,
                     "run.cancelled",
-                    {"status": "cancelled"},
+                    {"status": "cancelled", "usage": terminal_usage},
                     occurred_at=now,
                 )
             )
@@ -793,6 +1192,14 @@ class ProductRepository:
                 )
                 if run is None:
                     continue
+                await self._write_terminal_usage(
+                    session,
+                    run,
+                    completed_at=now,
+                    open_attempt_status="interrupted",
+                    error_category="service",
+                )
+                terminal_usage = _run_view(run).usage.model_dump(mode="json")
                 thread = await self._require_internal_run_consistency(
                     session, run, allow_internal=True
                 )
@@ -800,7 +1207,11 @@ class ProductRepository:
                     self._event_record(
                         run,
                         "run.failed",
-                        {"status": "failed", "error_code": "service_restarted"},
+                        {
+                            "status": "failed",
+                            "error_code": "service_restarted",
+                            "usage": terminal_usage,
+                        },
                         occurred_at=now,
                     )
                 )

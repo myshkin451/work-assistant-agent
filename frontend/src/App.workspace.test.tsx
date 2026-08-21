@@ -2,9 +2,32 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import userEvent from '@testing-library/user-event';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
-import type { Message, ProductEvent, RunSnapshot, RunView, ThreadSnapshot, ThreadSummary } from './types';
+import type {
+  AccountUsageResponse,
+  Message,
+  ProductEvent,
+  RunSnapshot,
+  RunView,
+  ThreadSnapshot,
+  ThreadSummary,
+} from './types';
 
 const timestamp = '2026-08-20T12:00:00Z';
+const pendingUsage: RunView['usage'] = {
+  schema_version: null,
+  state: 'pending',
+  model_call_count: null,
+  retry_count: null,
+  input_tokens: { value: null, availability: 'pending' },
+  output_tokens: { value: null, availability: 'pending' },
+  cached_tokens: { value: null, availability: 'pending' },
+  reasoning_tokens: { value: null, availability: 'pending' },
+  total_tokens: { value: null, availability: 'pending' },
+  time_to_first_visible_ms: null,
+  generation_duration_ms: null,
+  run_duration_ms: null,
+  error_category: null,
+};
 
 function jsonResponse(value: unknown, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -24,6 +47,28 @@ const threadB: ThreadSummary = {
   ...threadA,
   thread_id: 'thread-2',
   title: '会话二',
+};
+
+const accountUsage: AccountUsageResponse = {
+  account: {
+    display_name: '程心',
+    organization: '示例工作空间',
+    extensions: { session_expires_at: null, permission_summary: null },
+  },
+  scope: {
+    range: '30d',
+    from_at: '2026-07-21T12:00:00Z',
+    to_at: timestamp,
+    thread_id: null,
+  },
+  runs: { total: 12, completed: 9, failed: 1, cancelled: 1, active: 1 },
+  model_calls: { value: 18, availability: 'complete' },
+  retries: { value: 1, availability: 'complete' },
+  input_tokens: { value: 18642, availability: 'complete' },
+  output_tokens: { value: 5291, availability: 'complete' },
+  cached_tokens: { value: 0, availability: 'complete' },
+  reasoning_tokens: { value: null, availability: 'unavailable' },
+  total_tokens: { value: null, availability: 'partial' },
 };
 
 function snapshotFor(thread: ThreadSummary, content: string): ThreadSnapshot {
@@ -92,6 +137,46 @@ describe('conversation workspace navigation', () => {
     ).toBe(false);
   });
 
+  it('opens the restrained personal usage view from desktop and the mobile drawer', async () => {
+    const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      const method = init?.method ?? 'GET';
+      if (url === '/api/threads' && method === 'GET') return jsonResponse({ items: [threadA] });
+      if (url === '/api/account/usage?range=30d' && method === 'GET') {
+        return jsonResponse(accountUsage);
+      }
+      if (url === '/api/account/usage?range=7d' && method === 'GET') {
+        return jsonResponse({
+          ...accountUsage,
+          scope: { ...accountUsage.scope, range: '7d' },
+          runs: { total: 3, completed: 3, failed: 0, cancelled: 0, active: 0 },
+        });
+      }
+      throw new Error(`Unexpected request: ${method} ${url}`);
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const user = userEvent.setup();
+    render(<App />);
+
+    await screen.findByText('今天想处理什么？');
+    await user.click(screen.getByRole('button', { name: '我的使用情况' }));
+    expect(await screen.findByRole('heading', { name: '程心' })).toBeInTheDocument();
+    expect(screen.getByText('示例工作空间')).toBeInTheDocument();
+    expect(screen.getByText('12')).toBeInTheDocument();
+    expect(screen.getByText('18,642')).toBeInTheDocument();
+    expect(screen.getAllByText('暂不可用')).toHaveLength(2);
+    expect(screen.queryByText(/Policy|来源校验|内部错误码/)).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '近 7 天' }));
+    expect(await screen.findByText('3')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '打开对话导航' }));
+    const drawer = screen.getByRole('dialog', { name: '对话导航' });
+    expect(within(drawer).getByRole('button', { name: '我的使用情况' })).toBeInTheDocument();
+    await user.click(within(drawer).getByRole('button', { name: '我的使用情况' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).not.toBeInTheDocument());
+  });
+
   it('locks navigation during initial admission and refreshes history if location changes', async () => {
     const initialKey = '33333333-3333-4333-8333-333333333333';
     const initialThreadId = '44444444-4444-4444-8444-444444444444';
@@ -115,6 +200,7 @@ describe('conversation workspace navigation', () => {
       last_seq: 0,
       created_at: timestamp,
       completed_at: null,
+      usage: pendingUsage,
     };
     const fetchMock = vi.fn<typeof fetch>(async (input, init) => {
       const url = String(input);
@@ -258,6 +344,7 @@ describe('conversation workspace navigation', () => {
       last_seq: 1,
       created_at: timestamp,
       completed_at: null,
+      usage: pendingUsage,
     };
     const question: Message = {
       message_id: 'stream-question',
